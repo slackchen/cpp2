@@ -1,0 +1,7 @@
+# 统一换行符:仓库内一律 LF;bash 脚本工作区也保持 LF
+* text=auto
+*.sh text eol=lf
+*.md text
+*.cpp text
+*.hpp text
+*.cppm text

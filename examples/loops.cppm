@@ -1,0 +1,42 @@
+// loops.cppm — for 范围循环、while、if/else-if/else、复合赋值
+module loops;
+import std;
+
+sum_to: (n: int) -> int = {
+    total: int = 0;
+    for i in 1..=n {
+        total += i;
+    }
+    return total;
+}
+
+classify: (n: int) -> string = {
+    if n < 0 {
+        return "negative";
+    } else if n == 0 {
+        return "zero";
+    } else {
+        return "positive";
+    }
+}
+
+main: () -> int = {
+    std::print("sum 1..=100 = ");
+    std::print(sum_to(100));
+    std::print("\n");
+
+    i: int := 3;
+    while i > 0 {
+        std::print(i);
+        std::print(" ");
+        i -= 1;
+    }
+    std::print("\n");
+
+    for k in 0..3 {
+        std::print(classify(k - 2));
+        std::print(" ");
+    }
+    std::print("\n");
+    return 0;
+}

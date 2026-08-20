@@ -1,0 +1,29 @@
+// funcs.cppm — 函数声明、简短体、参数模式、调用
+module funcs;
+import std;
+
+square: (x: int) -> int = x * x;
+
+hypot2: (a: int, b: int) -> int = square(a) + square(b);
+
+greet: (name: string) = {
+    std::print("hi, ");
+    std::print(name);
+    std::print("\n");
+}
+
+bump: (inout n: int) = { n += 1; }
+
+main: () -> int = {
+    a: int := 3;
+    b: int := 4;
+    std::print("hypot2 = ");
+    std::print(hypot2(a, b));
+    std::print("\n");
+    greet("cpp2");
+    bump(a);
+    std::print("a bumped = ");
+    std::print(a);
+    std::print("\n");
+    return 0;
+}

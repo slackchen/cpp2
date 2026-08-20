@@ -1,0 +1,8 @@
+// hello.cppm — M2a 验收用例
+module hello;
+import std;
+
+main: () -> int = {
+    std::print("Hello, C++2!\n");
+    return 0;
+}
