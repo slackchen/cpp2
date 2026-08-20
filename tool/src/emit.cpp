@@ -400,7 +400,13 @@ private:
             sema::Type b = type_of(*x.base);
             std::string s = expr(*x.base);
             if (expr_prec(*x.base) < 8) s = "(" + s + ")";
-            return s + (b.is_smart() ? "->" : ".") + x.name;
+            if (b.is_smart()) {
+                // '.' 自动解引用经空检查(DESIGN §6.4):deref(p)->member
+                if (checks_on_)
+                    return "cpp2::deref(" + s + check_loc(x.line) + ")->" + x.name;
+                return s + "->" + x.name;
+            }
+            return s + "." + x.name;
         }
         case ast::Expr::StructLit: {
             auto& l = static_cast<ast::StructLitExpr&>(e);

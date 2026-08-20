@@ -141,10 +141,10 @@ if (!text) { return cpp2::unexpected(std::move(text).error()); }
 |---|---|
 | 下标 | `v[cpp2::index(v, i, "app.cppm:42")]`;`index()` 内联比较 `size()`,失败 trap |
 | 有符号算术 | `cpp2::checked_add(a, b)` 等;gcc/clang 用 `__builtin_*_overflow`,MSVC 用可移植预检 |
-| `n as i32` | `cpp2::narrow_cast<i32>(n)`,溢出 trap |
+| `n as i32` | `cpp2::narrow_cast<i32>(n)`,溢出 trap;浮点→整型经 2^N 边界重载(NaN/越界 trap) |
 | pre / post | 入口/出口 `if (!(...)) cpp2::trap(...)`;`old()` 入口求值缓存 |
 | invariant | 注入公开成员函数出入口(M4) |
-| 空安全 | `T?` 解包经 `has_value()` 显式路径;legacy 指针解引用 → 空检 trap |
+| 空安全 | 智能指针解引用 → `cpp2::deref(p)->m` 空检 trap(M4 已接入);`T?` 解包经 `has_value()` 显式路径(M2d);legacy 指针解引用 → 空检 trap(M6) |
 
 `@unchecked` 块内不注入;`@unsafe` 块内容逐字转译并登记 audit。
 
@@ -155,7 +155,7 @@ if (!text) { return cpp2::unexpected(std::move(text).error()); }
 ### 4.6 UFCS 与智能指针
 
 - 解析顺序:`x.f(a)` 先查成员,未命中查可见自由函数 → 发射 `f(x, a)`
-- 接收者类型为 `unique`/`shared` → 发射 `x->f(a)`(`.` 自动解引用)
+- 接收者类型为 `unique`/`shared` → 发射 `cpp2::deref(x)->f(a)`(`.` 自动解引用 + 空检查,M4)
 - `w.lock()` → `std::weak_ptr::lock`
 
 ### 4.7 模块与可见性
@@ -258,8 +258,8 @@ load(cpp2::in<std::string> path)
 1. **用例驱动**:每个 `tests/cases/*.cppm` 附 `expected/*.txt`(stdout)与可选 `errors.txt`(诊断);runner:转译 → 三编译器矩阵编译 → 运行 → diff
 2. **规范即测试**:DESIGN.md 每个示例进 `examples/`;文档改动必须过测试(doc-driven,规范与实现不漂移)
 3. **降低快照**:代表性用例的生成码快照,PR 中审查降低规则变化
-4. **故障注入(M4)**:注入越界/溢出/空解引用的用例必须 trap——验证检查存在且生效
-5. **模糊测试**:词法/语法 fuzzing(libFuzzer,M4 起)
+4. **故障注入(M4,已落地)**:注入越界/溢出/空解引用/浮点转换的用例必须 trap,且断言 trap 消息携带 `.cppm` 源位置——验证检查存在且生效
+5. **模糊测试(M4,已落地)**:内置 `cpp2 fuzz` 确定性变异 fuzzer(seed 可复现,CI 友好);libFuzzer harness 备于 `tool/fuzz/`(支持该 sanitizer 的平台使用)
 
 ---
 
@@ -293,13 +293,24 @@ M3 实现偏差(相对本章早先的设想,均待后续里程碑消除):
 | 偏差 | 现状 | 计划 |
 |---|---|---|
 | `.c2i` 格式 | 文本键值 + 接口文本(哈希为双种子 FNV-128,非 SHA-256) | M2e/M4 冻结格式时升级二进制 + SHA-256 |
-| 模块编译参数 | 仅 clang 族(`-x c++-module` + `-fmodule-file=name=file`);GCC/MSVC 路径未接 | M4 起编译器矩阵,按家族分派参数 |
+| 模块编译参数 | ~~仅 clang 族~~ M4 起按家族分派(toolchain.cpp;clang 实测,gcc/msvc 为文档形态参数) | 有 gcc/MSVC 的环境实测并修正 |
 | `export-headers` | 摊平式桥接(导出实体落在全局命名空间);限制:导出函数体不得引用跨模块未导出名 | 模块附着(attachment)语义研究后再决定是否包 `import` 式桥接 |
 | 并行编译 | 拓扑分层 + 每层线程池 | 千单元级压测后引入就绪队列调度 |
 | M4 | 检查器完备 + 故障注入 + 模糊测试 | 全部检查项验收 |
 | M5 | 生存期 Lite L1–L6 | 悬垂测试集编译期捕获率报告 |
 | M6 | `cxx_legacy` 增强、`gc<T>`(保守式) | 与 zlib 双向互操作 |
 | M7+ | 自举实验、原生后端评估 | — |
+
+**M4 完成记录(2026-08-20)**:检查器补齐空安全(智能指针 `.` 自动解引用 → `cpp2::deref(p)->m` 空检 trap,`@unsafe`/`@unchecked` 可退出,块形式语法落地——DESIGN §6.2/§6.6 原样)与浮点→整型转换越界检查(`narrow_cast` 浮点重载,2^N 精确边界,NaN 一并捕获);`cpp2 audit` 输出每模块检查注入点计数(arith/index/deref/narrow,谓词与发射侧一致)与全部 `@unsafe`/`@unchecked` 位置(含行号);故障注入套件扩至 5 例(溢出/越界/除零/空解引用/浮点转换),全部断言 trap 消息**与 `.cppm` 源位置**;模糊测试:`cpp2 fuzz` 内置确定性变异 fuzzer(seed 可复现,regression 内置 10000 次迭代零崩溃),parser 增加递归深度防护(3000 层嵌套 → 干净诊断而非爆栈);编译器矩阵:`toolchain.cpp` 按 `--version` 输出探测家族(本机 `g++` 为 clang 别名,仅看名字会误判),模块编译参数按 clang/gcc/msvc 分派;生成码缓存键混入工具版本,emit 演进不再被旧缓存掩盖。
+
+M4 实现偏差:
+
+| 偏差 | 现状 | 计划 |
+|---|---|---|
+| 契约检查项 | audit 不含 pre/post/invariant——语法属 M2c,尚未实现 | M2c 落地后:注入 + 计入 audit + 故障注入用例 |
+| gcc/msvc 模块参数 | 文档形态,未实测(本机无对应编译器) | 取得环境后跑 `tests/run.sh` 修正 |
+| libFuzzer | llvm-mingw(windows-gnu)不支持 `-fsanitize=fuzzer`(实测报错);harness 已备(`tool/fuzz/`),内置变异 fuzzer 承担本机与 CI 职责 | Linux/MSVC CI 接入 |
+| fuzz 覆盖 | 词法/语法/sema;emit 未入 fuzz(其崩溃面小且有快照测试) | M5 起纳入 emit 与模块图加载 |
 
 ---
 

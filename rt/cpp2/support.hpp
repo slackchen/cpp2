@@ -88,12 +88,34 @@ inline T checked_mul(T a, T b, char const* file = "", int line = 0)
     return r;
 }
 
+// 整型 → 整型:边界用 To 的 min/max 精确比较
 template <class To, class From>
+    requires std::integral<From>
 inline To narrow_cast(From v, char const* file = "", int line = 0)
 {
     if (v < static_cast<From>(std::numeric_limits<To>::min())
      || v > static_cast<From>(std::numeric_limits<To>::max()))
     { trap("narrowing conversion out of range", file, line); }
+    return static_cast<To>(v);
+}
+
+// 浮点 → 整型(DESIGN §6.3"浮点到整型的越界转换"):边界取 2^N,
+// 该值可被浮点精确表示,截断后落在 [min, max] 内;NaN 不满足任何比较 → trap。
+template <class To, class From>
+    requires std::floating_point<From>
+inline To narrow_cast(From v, char const* file = "", int line = 0)
+{
+    long double lo;
+    long double hi;
+    if constexpr (std::is_signed_v<To>) {
+        lo = static_cast<long double>(std::numeric_limits<To>::min());  // -2^(N-1)
+        hi = -lo;                                                       //  2^(N-1)
+    } else {
+        lo = 0.0L;
+        hi = static_cast<long double>(std::numeric_limits<To>::max()) + 1.0L;  // 2^N
+    }
+    if (!(v >= lo && v < hi))
+    { trap("float-to-integer conversion out of range", file, line); }
     return static_cast<To>(v);
 }
 
@@ -135,6 +157,23 @@ inline decltype(auto) index(C&& c, I i, char const* file = "", int line = 0)
     if (i < I{} || static_cast<decltype(c.size())>(i) >= c.size())
     { trap("index out of bounds", file, line); }
     return c[static_cast<decltype(c.size())>(i)];
+}
+
+// ── 空检查解引用(DESIGN §6.4;M4 起接入发射)───────────────────────
+// p.member 降为 deref(p)->member;空指针 → trap(可 @unchecked 退出)。
+// 左值按引用透传(零开销);右值(v[i] 等)按移动返回,仅在调用点立即使用。
+template <class P>
+inline P& deref(P& p, char const* file = "", int line = 0)
+{
+    if (!p) { trap("null dereference", file, line); }
+    return p;
+}
+
+template <class P>
+inline P deref(P&& p, char const* file = "", int line = 0)
+{
+    if (!p) { trap("null dereference", file, line); }
+    return std::move(p);
 }
 
 // ── stdx:标准库名字桥(IMPLEMENTATION.md §4.7)─────────────────────

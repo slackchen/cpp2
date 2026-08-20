@@ -1,10 +1,13 @@
-// cpp2 命令行工具(M3:build / run / transpile / export-headers)
+// cpp2 命令行工具(M4:build / run / transpile / export-headers / audit / fuzz)
 #include "ast.hpp"
+#include "audit.hpp"
 #include "emit.hpp"
+#include "fuzz.hpp"
 #include "lexer.hpp"
 #include "modules.hpp"
 #include "parser.hpp"
 #include "sema.hpp"
+#include "toolchain.hpp"
 #include "util.hpp"
 
 #include <atomic>
@@ -29,10 +32,13 @@ namespace sema  = cpp2::sema;
 namespace emit  = cpp2::emit;
 namespace mods  = cpp2::mods;
 namespace util  = cpp2::util;
+namespace tc    = cpp2::toolchain;
+namespace audit = cpp2::audit;
+namespace fuzz  = cpp2::fuzz;
 
 namespace {
 
-constexpr char const* kVersion = "cpp2 0.1.0-m3 (modules + parallel build + bridge)";
+constexpr char const* kVersion = "cpp2 0.1.0-m4 (checker complete + audit + fuzz)";
 
 std::optional<std::string> read_file(fs::path const& p)
 {
@@ -303,7 +309,9 @@ int cmd_build(std::vector<std::string> const& args)
 
     for (auto const& name : g.order) {
         auto const& u = g.units.at(name);
-        std::string src_hash = util::hash128(u.source);
+        // 源哈希混入工具版本:代码生成器变更后旧缓存自然失效,
+        // 避免 emit 演进(如 M4 的空检查注入)被缓存掩盖
+        std::string src_hash = util::hash128(u.source + "|codegen:" + kVersion);
 
         emit::ModuleEntry e;
         for (auto const& en : p->entries())
@@ -358,6 +366,12 @@ int cmd_build(std::vector<std::string> const& args)
     std::atomic<int> compiled{0};
     std::vector<std::string> remaining = g.order;
 
+    // 编译器矩阵(M4):按家族分派模块编译参数;BMI 扩展名随之
+    tc::Family fam = tc::detect(cxx);
+    std::string bmi_ext = tc::bmi_extension(fam);
+    std::cerr << "[cpp2] compiler: " << cxx << " (" << tc::family_name(fam)
+              << " family)\n";
+
     while (!remaining.empty()) {
         std::vector<std::string> level;
         for (auto it = remaining.begin(); it != remaining.end();) {
@@ -381,17 +395,15 @@ int cmd_build(std::vector<std::string> const& args)
                 fs::path gen = build_dir / (util::safe_name(name) + ".cpp");
                 fs::path obj = obj_dir / (util::safe_name(name) + ".o");
 
-                std::string cc = cxx + " -std=c++23 -O1 -I" + quote(native(*rt));
-                // C++20 named module:显式映射依赖 BMI(clang 形式 name=file)
+                std::vector<std::pair<std::string, std::string>> deps;
                 for (auto const& dep : u.imports)
-                    cc += " -fmodule-file=" + dep + "="
-                        + quote(native(bmi_dir / (util::safe_name(dep) + ".pcm")));
-                if (name != g.root_name) {
-                    // clang 按扩展名判定 TU 类型:.cpp 需显式声明为模块接口
-                    cc += std::string(" -x c++-module -fmodule-output=")
-                        + quote(native(bmi_dir / (util::safe_name(name) + ".pcm")));
-                }
-                cc += " -c " + quote(native(gen)) + " -o " + quote(native(obj));
+                    deps.push_back({dep,
+                        native(bmi_dir / (util::safe_name(dep) + bmi_ext))});
+
+                std::string cc = tc::compile_command(
+                    cxx, fam, native(*rt), deps, native(gen), native(obj),
+                    /*is_interface*/ name != g.root_name,
+                    native(bmi_dir / (util::safe_name(name) + bmi_ext)));
 
                 std::cerr << "[cpp2] " << cc << "\n";
                 if (std::system(cc.c_str()) != 0) {
@@ -414,11 +426,11 @@ int cmd_build(std::vector<std::string> const& args)
     }
 
     // 链接
-    std::string objs;
+    std::vector<std::string> objs;
     for (auto const& name : g.order)
-        objs += " " + quote(native(obj_dir / (util::safe_name(name) + ".o")));
+        objs.push_back(native(obj_dir / (util::safe_name(name) + ".o")));
     fs::path exe = in.parent_path() / ".cpp2build" / in.stem();
-    std::string link = cxx + objs + " -o " + quote(native(exe));
+    std::string link = tc::link_command(cxx, fam, objs, native(exe));
     std::cerr << "[cpp2] " << link << "\n";
     if (std::system(link.c_str()) != 0) {
         std::cerr << "error: link failed\n";
@@ -467,6 +479,67 @@ int cmd_export_headers(std::vector<std::string> const& args)
     return 0;
 }
 
+// ── cpp2 audit:安全审计报告(DESIGN §6.6 白纸黑字)───────────────
+// 检查注入点计数 + 全部 @unsafe/@unchecked 位置;有诊断错误时退出非零
+int cmd_audit(std::vector<std::string> const& args)
+{
+    if (args.empty() || (!args[0].empty() && args[0][0] == '-')) {
+        std::cerr << "usage: cpp2 audit <root.cppm>\n";
+        return 1;
+    }
+    fs::path in = args[0];
+    auto p = prepare(in);
+    if (!p) return 1;
+
+    int arith = 0, index = 0, deref = 0, narrow = 0;
+    int unchecked = 0, unsafe = 0;
+    for (auto const& name : p->graph.order) {
+        auto const& u = p->graph.units.at(name);
+        auto rep = audit::report_for(const_cast<ast::Module&>(u.ast), p->sema.at(name));
+        std::cout << audit::format_section(name, u.file.string(), rep);
+        arith += rep.checked_arith; index += rep.checked_index;
+        deref += rep.checked_deref; narrow += rep.checked_narrow;
+        unchecked += rep.unchecked(); unsafe += rep.unsafe();
+    }
+    std::cout << "audit: " << p->graph.order.size() << " module(s), checks: arith "
+              << arith << " / index " << index << " / deref " << deref
+              << " / narrow " << narrow << "; opt-outs: @unchecked x" << unchecked
+              << ", @unsafe x" << unsafe << "\n";
+    return 0;
+}
+
+// ── cpp2 fuzz:词法/语法/语义模糊测试(固定 seed 可复现)───────────
+int cmd_fuzz(std::vector<std::string> const& args)
+{
+    std::vector<std::string> files;
+    unsigned seed = 1;
+    int iters = 2000;
+    std::string crash_dir = ".cpp2build/fuzz";
+    for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i] == "--seed" && i + 1 < args.size()) {
+            seed = static_cast<unsigned>(std::stoul(args[++i]));
+        } else if (args[i] == "--iters" && i + 1 < args.size()) {
+            iters = std::stoi(args[++i]);
+        } else if (args[i] == "--crash-dir" && i + 1 < args.size()) {
+            crash_dir = args[++i];
+        } else if (!args[i].empty() && args[i][0] == '-') {
+            std::cerr << "error: unknown option '" << args[i] << "'\n";
+            return 1;
+        } else {
+            files.push_back(args[i]);
+        }
+    }
+    if (files.empty()) {
+        std::cerr << "usage: cpp2 fuzz <corpus.cppm...> [--seed N] [--iters N]"
+                     " [--crash-dir dir]\n";
+        return 1;
+    }
+    auto out = fuzz::run(files, seed, iters, crash_dir);
+    std::cout << "fuzz: " << out.iterations << " iterations (seed " << seed
+              << "), " << out.crashes << " crashes\n";
+    return out.crashes == 0 ? 0 : 1;
+}
+
 void usage()
 {
     std::cerr
@@ -475,6 +548,8 @@ void usage()
         << "  cpp2 build [root.cppm]                      # C++20 模块模式:并行增量构建\n"
         << "  cpp2 transpile <root.cppm> [-o out.cpp]     # 摊平转译查看生成码\n"
         << "  cpp2 export-headers <root.cppm> [-o dir]    # 生成 Cpp1 消费者 .h/.cpp\n"
+        << "  cpp2 audit <root.cppm>                      # 安全审计:检查点 + 退出点\n"
+        << "  cpp2 fuzz <corpus...> [--seed N --iters N]  # 前端模糊测试\n"
         << "  cpp2 version\n";
 }
 
@@ -490,6 +565,8 @@ int main(int argc, char** argv)
     if (cmd == "run")             return cmd_run(args);
     if (cmd == "build")           return cmd_build(args);
     if (cmd == "export-headers")  return cmd_export_headers(args);
+    if (cmd == "audit")           return cmd_audit(args);
+    if (cmd == "fuzz")            return cmd_fuzz(args);
     if (cmd == "version")         { std::cout << kVersion << "\n"; return 0; }
     if (cmd == "help" || cmd == "--help" || cmd == "-h") { usage(); return 0; }
 

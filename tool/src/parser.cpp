@@ -46,6 +46,21 @@ private:
     // 条件/迭代位置守卫:禁止 `Ident{}` 解析为空 struct 字面量,
     // 否则 `if x { }` / `for e in items { }` 会被吞掉块括号
     bool cond_like_ = false;
+    // 递归深度防护:fuzz/畸形输入下递归下降会爆栈(M4);
+    // 超限按语法错误报告,而不是进程崩溃
+    static constexpr int kMaxDepth = 200;
+    int depth_ = 0;
+
+    struct DepthGuard {
+        Parser& p;
+        explicit DepthGuard(Parser& parser) : p(parser) {
+            if (++p.depth_ > kMaxDepth) {
+                --p.depth_;
+                p.err("expression or statement nesting too deep");
+            }
+        }
+        ~DepthGuard() { --p.depth_; }
+    };
 
     // ── 基础设施 ────────────────────────────────────────────────────
     lex::Token const& peek(size_t ahead = 0) const
@@ -371,6 +386,7 @@ private:
     // ── 类型 ────────────────────────────────────────────────────────
     ast::TypeUse parse_type()
     {
+        DepthGuard g{*this};
         ast::TypeUse t;
         t.line = peek().line;
         if (accept(lex::Tok::Const)) t.is_const = true;
@@ -406,15 +422,19 @@ private:
 
     ast::StmtP statement()
     {
+        DepthGuard g{*this};
+
         // @unchecked / @unsafe 注解:作用于其后的一条语句(递归进入其块)
         if (check(lex::Tok::At)) {
             advance();
             if (!check(lex::Tok::Ident)
                 || (peek().text != "unchecked" && peek().text != "unsafe"))
                 err("expected 'unchecked' or 'unsafe' after '@'");
+            bool unsafe = peek().text == "unsafe";
             advance();
             auto s = statement();
             s->no_check = true;
+            s->is_unsafe = unsafe;
             return s;
         }
 
@@ -436,6 +456,7 @@ private:
             return s;
         }
         case lex::Tok::Match:    unsupported("match expression", "M2d");
+        case lex::Tok::LBrace:   return block();   // 裸块:@unsafe/@unchecked 块形式(DESIGN §6.2/§6.6)
         default: break;
         }
 
@@ -575,7 +596,11 @@ private:
     }
 
     // ── 表达式(优先级爬升)────────────────────────────────────────
-    ast::ExprP expression() { return logical_or(); }
+    ast::ExprP expression()
+    {
+        DepthGuard g{*this};
+        return logical_or();
+    }
 
     ast::ExprP logical_or()
     {
@@ -666,6 +691,7 @@ private:
     {
         if (check(lex::Tok::Bang) || check(lex::Tok::Minus) || check(lex::Tok::Plus)
             || check(lex::Tok::Tilde)) {
+            DepthGuard g{*this};                // `- - - ...` 前缀链同样可能爆栈
             std::string op = advance().text;
             auto u = std::make_unique<ast::UnaryExpr>();
             u->line = peek().line; u->col = peek().col;

@@ -115,6 +115,7 @@ struct Stmt : Node {
     enum Kind { ExprStmt, Return, Var, If, While, For, Break, Continue, Block };
     virtual Kind kind() const = 0;
     bool no_check = false;                   // @unchecked / @unsafe 注解
+    bool is_unsafe = false;                  // 注解具体是 @unsafe(audit 区分两者)
 };
 
 struct ExprStmt : Stmt {
