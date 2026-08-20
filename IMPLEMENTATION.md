@@ -285,6 +285,17 @@ load(cpp2::in<std::string> path)
 | M2d | 泛型 + concept、UFCS、variant/optional、模式匹配 | DESIGN §4.5–§5.6 示例全绿 |
 | M2e | `.c2i` 产出、`cpp2 audit`、`cpp2 run` / `check` CLI | `.c2i` 格式冻结 v1 |
 | M3 | C++20 模块发射、`cpp2 build` 并行增量、`export-headers` | 千单元项目增量构建正确 |
+
+**M3 完成记录(2026-08-20)**:模块图加载(import 点分名解析、拓扑、环检测)、跨模块 sema 可见性(直接 import 的导出符号,非传递)、三种发射模式(摊平命名空间 / C++20 named module / 桥接头)、`cpp2 build`(拓扑分层 `std::thread` 并行、源哈希跳过转译、接口哈希控制下游重编)、`export-headers` 生成 `.h`/`.cpp` 并经 Cpp1 消费者实测互操作。增量语义三场景实测:no-op 零编译、实现变更仅重编本模块、接口变更传播至依赖者。
+
+M3 实现偏差(相对本章早先的设想,均待后续里程碑消除):
+
+| 偏差 | 现状 | 计划 |
+|---|---|---|
+| `.c2i` 格式 | 文本键值 + 接口文本(哈希为双种子 FNV-128,非 SHA-256) | M2e/M4 冻结格式时升级二进制 + SHA-256 |
+| 模块编译参数 | 仅 clang 族(`-x c++-module` + `-fmodule-file=name=file`);GCC/MSVC 路径未接 | M4 起编译器矩阵,按家族分派参数 |
+| `export-headers` | 摊平式桥接(导出实体落在全局命名空间);限制:导出函数体不得引用跨模块未导出名 | 模块附着(attachment)语义研究后再决定是否包 `import` 式桥接 |
+| 并行编译 | 拓扑分层 + 每层线程池 | 千单元级压测后引入就绪队列调度 |
 | M4 | 检查器完备 + 故障注入 + 模糊测试 | 全部检查项验收 |
 | M5 | 生存期 Lite L1–L6 | 悬垂测试集编译期捕获率报告 |
 | M6 | `cxx_legacy` 增强、`gc<T>`(保守式) | 与 zlib 双向互操作 |

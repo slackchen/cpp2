@@ -102,6 +102,8 @@ struct Result {
     }
 };
 
-Result check(ast::Module& m);
+// 检查单个模块。imported = 直接 import 的模块(非传递),其导出符号可见;
+// 导入的声明只读使用(参数不加 const:符号表持有非 const 声明指针)。
+Result check(ast::Module& m, std::vector<ast::Module*> const& imported = {});
 
 } // namespace cpp2::sema

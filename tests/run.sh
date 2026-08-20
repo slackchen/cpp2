@@ -43,6 +43,37 @@ run_case tests/cases/overflow_trap.cppm "integer overflow"     trap
 run_case tests/cases/bounds_trap.cppm   "index out of bounds"  trap
 run_case tests/cases/div_trap.cppm      "division by zero"     trap
 
+# ── M3:多模块 ─────────────────────────────────────────────────
+# 摊平模式 run(跨模块符号解析)
+run_case examples/multimod/app.cppm "norm2 = 25"        ok
+run_case examples/multimod/app.cppm "doubled_add(2,3) = 10" ok
+
+# 模块模式 build + 运行产物
+if "$CPP2" build examples/multimod/app.cppm >/dev/null 2>&1 \
+   && ./examples/multimod/.cpp2build/app 2>/dev/null | grep -q "norm2 = 25"; then
+    echo "PASS m3/module-build"; pass=$((pass+1))
+else
+    echo "FAIL m3/module-build"; fail=$((fail+1))
+fi
+
+# no-op 增量:重建必须零转译零编译
+if "$CPP2" build examples/multimod/app.cppm 2>&1 | grep -q "0 transpiled.*0 compiled"; then
+    echo "PASS m3/incremental-noop"; pass=$((pass+1))
+else
+    echo "FAIL m3/incremental-noop"; fail=$((fail+1))
+fi
+
+# export-headers:Cpp1 消费者互操作
+if "$CPP2" export-headers tests/cases/exportlib.cppm -o tests/cases/bridge >/dev/null 2>&1 \
+   && g++ -std=c++23 -I"$(pwd)/rt" -I tests/cases/bridge \
+        tests/cases/bridge/app_lib.cpp tests/cases/consumer.cpp \
+        -o tests/cases/bridge/consumer.exe 2>/dev/null \
+   && ./tests/cases/bridge/consumer.exe 2>/dev/null | grep -q "42"; then
+    echo "PASS m3/cpp1-interop"; pass=$((pass+1))
+else
+    echo "FAIL m3/cpp1-interop"; fail=$((fail+1))
+fi
+
 echo
 echo "passed $pass, failed $fail"
 [[ $fail -eq 0 ]]

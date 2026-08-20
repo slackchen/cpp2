@@ -19,10 +19,39 @@ struct Sym {
 
 class Checker {
 public:
-    explicit Checker(ast::Module& m) : m_(m) {}
+    Checker(ast::Module& m, std::vector<ast::Module*> imported)
+        : m_(m), imported_(std::move(imported)) {}
 
     Result run()
     {
+        // 0. 类型表:自身全部 + 直接 import 的导出(DESIGN §3.3:import 非传递)
+        for (auto& s : m_.structs) {
+            if (!structs_.emplace(s.name, &s).second)
+                err(s.line, 0, "duplicate type name '" + s.name + "'");
+        }
+        for (auto& e : m_.enums) {
+            if (!enums_.emplace(e.name, &e).second)
+                err(e.line, 0, "duplicate enum name '" + e.name + "'");
+        }
+        for (auto* im : imported_) {
+            for (auto& s : im->structs)
+                if (s.exported) structs_.emplace(s.name, &s);
+            for (auto& e : im->enums)
+                if (e.exported) enums_.emplace(e.name, &e);
+            for (auto& f : im->funcs) {
+                if (!f.exported) continue;
+                Sym s; s.kind = SymKind::Func; s.func = &f;
+                top_.emplace(f.name, s);
+            }
+            for (auto& g : im->globals) {
+                if (!g.exported) continue;
+                Sym s; s.kind = SymKind::Global;
+                s.type = type_from_use(g.type);
+                s.is_const = g.is_const;
+                top_.emplace(g.name, s);
+            }
+        }
+
         register_top();
 
         for (auto& s : m_.structs) check_struct(s);
@@ -39,11 +68,23 @@ public:
 
 private:
     ast::Module& m_;
+    std::vector<ast::Module*> imported_;
+    std::unordered_map<std::string, ast::StructDecl*> structs_;   // 自身 + 导入导出
+    std::unordered_map<std::string, ast::EnumDecl*> enums_;
     Result res_;
     std::unordered_map<std::string, Sym> top_;
     std::vector<std::unordered_map<std::string, Sym>> scopes_;
     ast::StructDecl* cur_struct_ = nullptr;
     ast::MethodDecl* cur_method_ = nullptr;
+
+    ast::StructDecl* find_struct(std::string const& n) {
+        auto it = structs_.find(n);
+        return it != structs_.end() ? it->second : nullptr;
+    }
+    ast::EnumDecl* find_enum(std::string const& n) {
+        auto it = enums_.find(n);
+        return it != enums_.end() ? it->second : nullptr;
+    }
 
     void err(int line, int col, std::string msg)  { res_.errors.push_back({line, col, std::move(msg)}); }
     void warn(int line, int col, std::string msg) { res_.warnings.push_back({line, col, std::move(msg)}); }
@@ -55,8 +96,6 @@ private:
             if (!top_.emplace(n, s).second)
                 err(line, 0, "duplicate top-level name '" + n + "'");
         };
-        for (auto& s : m_.structs) add(s.name, Sym{}, s.line);
-        for (auto& e : m_.enums)   add(e.name, Sym{}, e.line);
         for (auto& f : m_.funcs) {
             Sym s; s.kind = SymKind::Func; s.func = &f;
             add(f.name, s, f.line);
@@ -122,11 +161,11 @@ private:
                 || last == "span" || last == "map" || last == "set")
             { t = container(); t.is_const = tu.is_const; return t; }
             if (last == "void") return t;      // Unknown
-            if (m_.find_struct(last)) {
+            if (find_struct(last)) {
                 t.kind = Type::NamedStruct; t.name = last;
                 return t;
             }
-            if (m_.find_enum(last)) {
+            if (find_enum(last)) {
                 t.kind = Type::NamedEnum; t.name = last;
                 return t;
             }
@@ -169,7 +208,7 @@ private:
     void gather_fields(ast::StructDecl& s, std::vector<ast::FieldDecl*>& out)
     {
         if (s.base && s.base->parts.size() == 1) {
-            if (auto* b = m_.find_struct(s.base->parts[0])) gather_fields(*b, out);
+            if (auto* b = find_struct(s.base->parts[0])) gather_fields(*b, out);
         }
         for (auto& f : s.fields) out.push_back(&f);
     }
@@ -257,8 +296,10 @@ private:
         case ast::Stmt::Var: {
             auto& v = static_cast<ast::VarStmt&>(s);
             Type init_t = v.init ? infer(*v.init) : Type{};
-            if (v.init && v.init->kind() == ast::Expr::ListLit && !v.has_type)
-                err(v.line, v.col, "list literals need an explicit type or ':='");
+            if (!v.has_type && v.init
+                && v.init->kind() == ast::Expr::ListLit
+                && static_cast<ast::ListLitExpr&>(*v.init).elements.empty())
+                err(v.line, v.col, "empty list literal '{}' needs an explicit type");
             Type t = v.has_type ? type_from_use(v.type) : init_t;
             t.is_const = v.is_const;
             if (v.has_type && v.init && v.init->kind() == ast::Expr::ListLit) {
@@ -394,8 +435,11 @@ private:
         case ast::Expr::ListLit: {
             auto& l = static_cast<ast::ListLitExpr&>(e);
             if (l.elements.empty()) {
-                err(l.line, l.col, "cannot infer element type of an empty list literal");
-                return {};
+                // 空 {}:元素类型由声明侧决定(list<int> x = {})
+                Type c;
+                c.kind = Type::Container;
+                c.name = "list";
+                return c;
             }
             Type first = infer(*l.elements[0]);
             for (size_t i = 1; i < l.elements.size(); ++i) {
@@ -425,7 +469,7 @@ private:
     {
         if (n.qualified()) {
             // Color::green / Color::red
-            if (auto* ed = m_.find_enum(n.parts[0])) {
+            if (auto* ed = find_enum(n.parts[0])) {
                 for (auto& mem : ed->members)
                     if (mem == n.parts[1]) {
                         Type t = Type::of(Type::NamedEnum);
@@ -443,7 +487,7 @@ private:
             note_member_use(*sym);
             return sym->type;
         }
-        if (m_.find_struct(n.parts[0]) || m_.find_enum(n.parts[0]))
+        if (find_struct(n.parts[0]) || find_enum(n.parts[0]))
             err(n.line, n.col, "use of type '" + n.parts[0] + "' where a value is expected");
         else
             err(n.line, n.col, "use of undeclared name '" + n.parts[0] + "'");
@@ -499,7 +543,7 @@ private:
         Type obj = base;
         if (obj.is_smart()) obj = obj.deref();      // 智能指针自动解引用
         if (obj.kind == Type::NamedStruct) {
-            if (auto* sd = m_.find_struct(obj.name)) {
+            if (auto* sd = find_struct(obj.name)) {
                 if (auto* fd = sd->find_field(mem.name)) {
                     Type t = type_from_use(fd->type);
                     t.is_const = t.is_const || base.is_const;   // const 传播
@@ -540,7 +584,7 @@ private:
 
         if (lit.type_parts.size() != 1) return {};  // std 聚合:放行
         std::string const& tn = lit.type_parts[0];
-        auto* sd = m_.find_struct(tn);
+        auto* sd = find_struct(tn);
         if (!sd) {
             err(lit.line, lit.col, "unknown type '" + tn + "' in struct literal");
             return {};
@@ -618,9 +662,9 @@ private:
 
 } // namespace
 
-Result check(ast::Module& m)
+Result check(ast::Module& m, std::vector<ast::Module*> const& imported)
 {
-    return Checker(m).run();
+    return Checker(m, imported).run();
 }
 
 } // namespace cpp2::sema

@@ -18,17 +18,17 @@ public:
         if (peek().tok == lex::Tok::Module) {
             m.name_line = peek().line;
             advance();
-            m.name = qualified_name("module name");
+            m.name = dotted_name("module name");
             expect(lex::Tok::Semi, "';' after module declaration");
         }
         while (peek().tok == lex::Tok::Import) {
             ast::ImportDecl im;
             im.line = peek().line;
             advance();
-            im.module_parts = qualified_name_parts("import module name");
+            im.module_parts = dotted_name_parts("import module name");
             if (peek().tok == lex::Tok::Ident && peek().text == "as") {
                 advance();
-                qualified_name("import alias");   // M2a:记录但不使用
+                dotted_name("import alias");        // M3:记录但不使用
             }
             expect(lex::Tok::Semi, "';' after import");
             m.imports.push_back(std::move(im));
@@ -120,6 +120,27 @@ private:
     {
         if (!check(lex::Tok::Ident)) err("expected identifier after '::'");
         return advance().text;
+    }
+
+    // 模块名是点分的:app.util
+    std::vector<std::string> dotted_name_parts(char const* what)
+    {
+        if (!check(lex::Tok::Ident)) err(std::string("expected ") + what);
+        std::vector<std::string> parts;
+        parts.push_back(advance().text);
+        while (check(lex::Tok::Dot) && peek(1).tok == lex::Tok::Ident) {
+            advance();
+            parts.push_back(advance().text);
+        }
+        return parts;
+    }
+
+    std::string dotted_name(char const* what)
+    {
+        auto parts = dotted_name_parts(what);
+        std::string s = parts[0];
+        for (size_t k = 1; k < parts.size(); ++k) s += "." + parts[k];
+        return s;
     }
 
     // ── 顶层声明 ────────────────────────────────────────────────────
@@ -780,17 +801,25 @@ private:
             expect(lex::Tok::RParen, "')'");
             return p;
         }
-        case lex::Tok::LBracket: {
+        case lex::Tok::LBracket:
+        case lex::Tok::LBrace: {
+            // 列表字面量:[1, 2, 3] 或 {1, 2, 3};空 {} 常用作容器默认值。
+            // (struct 字面量在 Ident 分支以 Name{.field 形式处理,不冲突;
+            //  语句/条件位置的块括号不会进入 primary)
+            lex::Tok closer = peek().tok == lex::Tok::LBracket ? lex::Tok::RBracket
+                                                               : lex::Tok::RBrace;
+            lex::Tok opener = advance().tok;
+            (void)opener;
             auto l = std::make_unique<ast::ListLitExpr>();
             l->line = peek().line; l->col = peek().col;
-            advance();
-            if (!check(lex::Tok::RBracket)) {
+            if (!check(closer)) {
                 for (;;) {
                     l->elements.push_back(expression());
                     if (!accept(lex::Tok::Comma)) break;
                 }
             }
-            expect(lex::Tok::RBracket, "']' to close list literal");
+            expect(closer, closer == lex::Tok::RBracket ? "']' to close list literal"
+                                                        : "'}' to close list literal");
             return l;
         }
         case lex::Tok::At:       unsupported("@unsafe/@unchecked annotation", "M2b");
