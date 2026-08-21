@@ -53,19 +53,37 @@ run_case tests/cases/optout.cppm        "sum = 11"                            ok
 run_case examples/multimod/app.cppm "norm2 = 25"        ok
 run_case examples/multimod/app.cppm "doubled_add(2,3) = 10" ok
 
-# 模块模式 build + 运行产物
+# headers 后端(默认,不依赖 C++20 modules):build + 运行产物
 if "$CPP2" build examples/multimod/app.cppm >/dev/null 2>&1 \
    && ./examples/multimod/.cpp2build/app 2>/dev/null | grep -q "norm2 = 25"; then
-    echo "PASS m3/module-build"; pass=$((pass+1))
+    echo "PASS m3/headers-build"; pass=$((pass+1))
 else
-    echo "FAIL m3/module-build"; fail=$((fail+1))
+    echo "FAIL m3/headers-build"; fail=$((fail+1))
 fi
 
-# no-op 增量:重建必须零转译零编译
+# no-op 增量:重建必须零转译零编译(内容寻址:生成码字节不变即免编译)
 if "$CPP2" build examples/multimod/app.cppm 2>&1 | grep -q "0 transpiled.*0 compiled"; then
     echo "PASS m3/incremental-noop"; pass=$((pass+1))
 else
     echo "FAIL m3/incremental-noop"; fail=$((fail+1))
+fi
+
+# 装箱:--max-tu-size=1 强制每模块独立 TU(尽可能少文件 ↔ 预算约束的两端)
+if "$CPP2" build examples/multimod/app.cppm --max-tu-size=1 >/dev/null 2>&1 \
+   && ls examples/multimod/.cpp2build/hdr/c2_part0.cpp >/dev/null 2>&1 \
+   && ls examples/multimod/.cpp2build/hdr/c2_part1.cpp >/dev/null 2>&1 \
+   && ./examples/multimod/.cpp2build/app 2>/dev/null | grep -q "doubled_add(2,3) = 10"; then
+    echo "PASS m3/headers-multipack"; pass=$((pass+1))
+else
+    echo "FAIL m3/headers-multipack"; fail=$((fail+1))
+fi
+
+# cxx20-modules 后端(opt-in):named module + BMI 路径保持可用
+if "$CPP2" build examples/multimod/app.cppm --backend=cxx20-modules >/dev/null 2>&1 \
+   && ./examples/multimod/.cpp2build/app 2>/dev/null | grep -q "norm2 = 25"; then
+    echo "PASS m3/modules-build"; pass=$((pass+1))
+else
+    echo "FAIL m3/modules-build"; fail=$((fail+1))
 fi
 
 # export-headers:Cpp1 消费者互操作
@@ -320,7 +338,7 @@ else
 fi
 
 # .c2i v1:二进制容器(magic C2IF + version 1)
-c2i="examples/multimod/.cpp2build/mods/cpp2cache/app.c2i"
+c2i="examples/multimod/.cpp2build/hdr/cpp2cache/app.c2i"
 if "$CPP2" build examples/multimod/app.cppm >/dev/null 2>&1 \
    && head -c 4 "$c2i" 2>/dev/null | grep -q "C2IF"; then
     echo "PASS m2e/c2if-magic"; pass=$((pass+1))

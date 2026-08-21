@@ -28,6 +28,11 @@ std::string compile_command(std::string const& cxx, Family f,
                             std::string const& gen, std::string const& obj,
                             bool is_interface, std::string const& bmi_out);
 
+// 普通 TU 编译命令(headers 后端):无任何模块/BMI 旗标
+std::string plain_compile_command(std::string const& cxx, Family f,
+                                  std::string const& rt_include,
+                                  std::string const& gen, std::string const& obj);
+
 // 链接命令(objs → exe)
 std::string link_command(std::string const& cxx, Family f,
                          std::vector<std::string> const& objs, std::string const& exe);

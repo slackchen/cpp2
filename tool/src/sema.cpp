@@ -1075,7 +1075,15 @@ private:
                     note_member_use(*sym);
                     if (sym->kind == SymKind::Func && sym->func)
                         return infer_func_call(*sym->func, c);
+                    if (sym->type.kind == Type::Generic)
+                        return {};                 // 泛型值实参(如 lambda)可调用,C++ 判定
+                    err(c.line, c.col,
+                        "'" + name.parts[0] + "' is not a function");
+                    return {};
                 }
+                // 限定名(std::…)交给 C++ 解析;非限定未知名 = 拼写/作用域错误
+                err(c.line, c.col,
+                    "call to undeclared function '" + name.parts[0] + "'");
                 return {};
             }
             return {};

@@ -1,4 +1,4 @@
-// C++2 → C++23 发射器(M3:摊平模式 / C++20 模块模式 / 桥接模式)
+// C++2 → C++23 发射器(M3:摊平模式 / C++20 模块模式 / 桥接模式;M3b:headers 模式)
 #pragma once
 
 #include "ast.hpp"
@@ -27,5 +27,11 @@ std::string emit_module_unit(ModuleEntry const& e);
 // 桥接模式(export-headers):生成 .h / .cpp 对,供 Cpp1 消费者使用
 std::pair<std::string, std::string> emit_bridge(std::vector<ModuleEntry> const& units,
                                                 std::string const& libname);
+
+// headers 模式(M3b):每模块 .h(导出接口)+ 实现片段(.cpp 文本)。
+// 不依赖 C++20 modules。方法/函数体全部线外 → 改实现不触碰 .h。
+// 实现片段由构建层按 TU 大小预算装箱合并(平衡 TU 数量与单 TU 编译时间),
+// 片段自带 #include 自身 .h,拼接即自包含。
+std::pair<std::string, std::string> emit_headers(ModuleEntry const& e);
 
 } // namespace cpp2::emit

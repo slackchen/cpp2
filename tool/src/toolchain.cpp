@@ -121,6 +121,21 @@ std::string compile_command(std::string const& cxx, Family f,
     return {};
 }
 
+std::string plain_compile_command(std::string const& cxx, Family f,
+                                  std::string const& rt_include,
+                                  std::string const& gen, std::string const& obj)
+{
+    auto q = [](std::string const& s) { return "\"" + s + "\""; };
+    switch (f) {
+    case Family::Msvc:
+        return cxx + " /nologo /std:c++23 /EHsc /I" + q(rt_include)
+             + " /c " + q(gen) + " /Fo" + q(obj);
+    default:  // clang / gcc
+        return cxx + " -std=c++23 -O1 -I" + q(rt_include)
+             + " -c " + q(gen) + " -o " + q(obj);
+    }
+}
+
 std::string link_command(std::string const& cxx, Family f,
                          std::vector<std::string> const& objs, std::string const& exe)
 {

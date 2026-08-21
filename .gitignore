@@ -1,2 +1,3 @@
 .cpp2build/
 tests/cases/bridge/
+tests/bench/

@@ -17,6 +17,7 @@
 #include <cstring>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <optional>
 #include <sstream>
@@ -42,7 +43,7 @@ namespace fuzz  = cpp2::fuzz;
 
 namespace {
 
-constexpr char const* kVersion = "cpp2 0.1.0-m2e (check CLI, .c2i v1 frozen: binary + sha256)";
+constexpr char const* kVersion = "cpp2 0.1.0-m3b (headers backend default, no C++20 modules; cxx20-modules opt-in)";
 
 std::optional<std::string> read_file(fs::path const& p)
 {
@@ -330,16 +331,28 @@ int cmd_run(std::vector<std::string> const& args)
     return std::system(quote(exe_s).c_str());
 }
 
-// ── cpp2 build:C++20 模块模式 + 拓扑分层并行 + 增量 ────────────────
+// ── cpp2 build:并行增量构建 ───────────────────────────────────────
+// backend=headers(默认):每模块 .h 接口 + 实现片段按 TU 大小预算装箱,
+//   普通 TU 并行编译,不依赖 C++20 modules;
+// backend=cxx20-modules:每模块 named module + BMI(M3 原路径)。
 int cmd_build(std::vector<std::string> const& args)
 {
+    std::string backend = "headers";
+    long long max_tu = 1024 * 1024;   // 单 TU 生成码预算(字节);横向实测最优,见 IMPL M3b
     fs::path in;
     for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i].rfind("--backend=", 0) == 0)     { backend = args[i].substr(10); continue; }
+        if (args[i].rfind("--max-tu-size=", 0) == 0) { max_tu = std::stoll(args[i].substr(14)); continue; }
         if (!args[i].empty() && args[i][0] == '-') {
             std::cerr << "error: unknown option '" << args[i] << "'\n";
             return 1;
         }
         in = args[i];
+    }
+    if (backend != "headers" && backend != "cxx20-modules") {
+        std::cerr << "error: unknown backend '" << backend
+                  << "' (headers | cxx20-modules)\n";
+        return 1;
     }
     if (in.empty()) {
         for (char const* cand : {"main.cppm", "app.cppm"}) {
@@ -347,7 +360,8 @@ int cmd_build(std::vector<std::string> const& args)
         }
     }
     if (in.empty()) {
-        std::cerr << "usage: cpp2 build <root.cppm>\n";
+        std::cerr << "usage: cpp2 build <root.cppm> [--backend=headers|cxx20-modules]"
+                     " [--max-tu-size=N]\n";
         return 1;
     }
 
@@ -364,19 +378,24 @@ int cmd_build(std::vector<std::string> const& args)
     auto p = prepare(in);
     if (!p) return 1;
 
-    // 转译(带源哈希缓存)+ 接口哈希
+    // 转译(内容寻址落盘)+ 哈希缓存;两后端构建目录隔离,互不污染
     auto& g = p->graph;
-    fs::path build_dir = in.parent_path() / ".cpp2build" / "mods";
+    bool headers_backend = backend == "headers";
+    fs::path build_dir = in.parent_path() / ".cpp2build" / (headers_backend ? "hdr" : "mods");
     fs::path bmi_dir = build_dir / "bmi";
     fs::path obj_dir = build_dir / "obj";
     fs::create_directories(build_dir);
-    fs::create_directories(bmi_dir);
     fs::create_directories(obj_dir);
+    if (!headers_backend) fs::create_directories(bmi_dir);
 
     std::unordered_map<std::string, CacheRec> recs;
-    std::unordered_map<std::string, bool> fresh;          // 本轮是否重转译
+    std::unordered_map<std::string, bool> h_changed;      // 接口头(.h)是否重写
+    std::unordered_map<std::string, bool> f_changed;      // 实现片段是否变化
     int transpiled = 0, cached = 0;
-    std::unordered_map<std::string, std::string> iface;   // name → 当前 iface hash
+    std::unordered_map<std::string, std::string> iface;   // name → 接口哈希
+
+    // headers 后端:模块名 → 实现片段(内存持有,装箱阶段使用)
+    std::unordered_map<std::string, std::string> frags;
 
     for (auto const& name : g.order) {
         auto const& u = g.units.at(name);
@@ -389,13 +408,34 @@ int cmd_build(std::vector<std::string> const& args)
             if (en.m->name == name) { e = en; break; }
 
         auto old = read_cache(build_dir, name);
-        fs::path gen = build_dir / (util::safe_name(name) + ".cpp");
-        if (old && old->src_hash == src_hash && fs::exists(gen)) {
-            recs[name] = *old;
-            fresh[name] = false;
-            iface[name] = old->iface_hash;
-            ++cached;
+
+        if (headers_backend) {
+            auto [h_str, frag] = emit::emit_headers(e);
+            std::string h_hash = sha256::hex_of(h_str);
+            std::string gen_hash = sha256::hex_of(frag);
+            fs::path h_path = build_dir / (util::safe_name(name) + ".h");
+            bool hc = !old || old->iface_hash != h_hash || !fs::exists(h_path);
+            bool fc = !old || old->gen_hash != gen_hash;
+            if (hc) write_file(h_path, h_str);            // 内容寻址:字节不变不落盘
+            CacheRec r;
+            r.src_hash = src_hash;
+            r.iface_hash = h_hash;
+            r.gen_hash = gen_hash;
+            recs[name] = r;
+            h_changed[name] = hc;
+            f_changed[name] = fc;
+            iface[name] = h_hash;
+            frags[name] = std::move(frag);
         } else {
+            fs::path gen = build_dir / (util::safe_name(name) + ".cpp");
+            if (old && old->src_hash == src_hash && fs::exists(gen)) {
+                recs[name] = *old;
+                h_changed[name] = false;
+                f_changed[name] = false;
+                iface[name] = old->iface_hash;
+                ++cached;
+                continue;
+            }
             auto code = emit::emit_module_unit(e);
             write_file(gen, code);
             CacheRec r;
@@ -403,108 +443,202 @@ int cmd_build(std::vector<std::string> const& args)
             r.iface_hash = sha256::hex_of(mods::interface_text(u.ast));
             r.gen_hash = sha256::hex_of(code);
             recs[name] = r;
-            fresh[name] = true;
+            h_changed[name] = true;
+            f_changed[name] = true;
             iface[name] = r.iface_hash;
             ++transpiled;
+            continue;
         }
+        if (h_changed[name] || f_changed[name]) ++transpiled; else ++cached;
     }
 
-    // 依赖组合哈希 + 是否需要编译:
-    //   obj 缺失 / 本轮源变化(重转译)/ 直接依赖的接口哈希变化
+    // 依赖组合哈希(.c2i 记录;headers 后端的编译判定用内容寻址,此为记录性)
     // 组合串先归约为 SHA-256 hex 再入缓存:.c2i 中哈希存原始字节,
     // 只有合法 64 位 hex 能无损往返(空串/任意文本会失真为全零摘要)
-    std::unordered_map<std::string, bool> need_compile;
     for (auto const& name : g.order) {
         std::string joined = "deps1";
         for (auto const& dep : g.units.at(name).imports) joined += "|" + iface.at(dep);
-        std::string dh = sha256::hex_of(joined);
-        auto& r = recs[name];
-        bool dh_changed = r.deps_hash != dh;
-        r.deps_hash = dh;
-
-        fs::path obj = obj_dir / (util::safe_name(name) + ".o");
-        need_compile[name] = !fs::exists(obj) || fresh[name] || dh_changed;
-        if (need_compile[name]) fs::remove(obj);
-    }
-
-    // 分层并行编译(Kahn:依赖已编译即可入层)
-    std::unordered_map<std::string, int> indeg;
-    for (auto const& name : g.order) {
-        int n = 0;
-        for (auto const& dep : g.units.at(name).imports)
-            if (need_compile.at(dep)) ++n;
-        indeg[name] = n;
+        recs[name].deps_hash = sha256::hex_of(joined);
     }
 
     std::atomic<int> failures{0};
     std::atomic<int> compiled{0};
-    std::vector<std::string> remaining = g.order;
 
-    // 编译器矩阵(M4):按家族分派模块编译参数;BMI 扩展名随之
+    // 编译器矩阵(M4):按家族分派编译参数
     tc::Family fam = tc::detect(cxx);
     std::string bmi_ext = tc::bmi_extension(fam);
     std::cerr << "[cpp2] compiler: " << cxx << " (" << tc::family_name(fam)
-              << " family)\n";
+              << " family), backend: " << backend << "\n";
 
-    while (!remaining.empty()) {
-        std::vector<std::string> level;
-        for (auto it = remaining.begin(); it != remaining.end();) {
-            if (!need_compile.at(*it) || indeg.at(*it) == 0) {
-                level.push_back(*it);
-                it = remaining.erase(it);
+    std::vector<std::string> obj_files;                   // 链接输入(两后端各自填充)
+
+    if (headers_backend) {
+        // ── 装箱:实现片段按 TU 预算贪心合并(拓扑序,确定性划分)──
+        // 尽可能少的 TU,但绝不成单个巨型文件;超大模块独占 TU。
+        struct Part { std::vector<std::string> mods; size_t bytes = 0; };
+        std::vector<Part> parts;
+        for (auto const& name : g.order) {
+            if (!parts.empty() && parts.back().bytes + frags[name].size() <= (size_t)max_tu) {
+                parts.back().mods.push_back(name);
+                parts.back().bytes += frags[name].size();
             } else {
-                ++it;
+                parts.push_back({{name}, frags[name].size()});
             }
         }
-        if (level.empty()) {
-            std::cerr << "error: internal: compilation scheduling stalled\n";
-            return 2;
+
+        // 头依赖闭包:part 依赖成员 .h 及其传递 import 的 .h
+        std::function<void(std::string const&, std::unordered_set<std::string>&)> collect =
+            [&](std::string const& m, std::unordered_set<std::string>& out) {
+                if (!out.insert(m).second) return;
+                for (auto const& dep : g.units.at(m).imports) collect(dep, out);
+            };
+
+        struct PartJob { std::string name; fs::path obj; };
+        std::vector<PartJob> jobs;
+        int idx = 0;
+        for (auto const& part : parts) {
+            std::string text = "// Generated by cpp2c (headers backend). DO NOT EDIT.\n";
+            std::unordered_set<std::string> closure;
+            bool any_h_changed = false;
+            for (auto const& m : part.mods) {
+                text += "#include \"" + util::safe_name(m) + ".h\"\n";
+                collect(m, closure);
+            }
+            for (auto const& m : closure) any_h_changed |= h_changed[m];
+            text += "\n";
+            for (auto const& m : part.mods) text += frags[m];
+
+            std::string pname = "c2_part" + std::to_string(idx++);
+            fs::path cpp = build_dir / (pname + ".cpp");
+            fs::path obj = obj_dir / (pname + ".o");
+            auto old_txt = read_file(cpp);
+            bool text_changed = !old_txt || *old_txt != text;
+            if (text_changed) write_file(cpp, text);
+
+            bool needed = !fs::exists(obj) || text_changed || any_h_changed;
+            if (needed) fs::remove(obj);
+            jobs.push_back({pname, obj});
         }
 
+        // part 间无编译依赖(接口全在 .h)→ 全量并行
         std::vector<std::thread> workers;
-        for (auto const& name : level) {
-            if (!need_compile.at(name)) continue;
+        for (size_t i = 0; i < jobs.size(); ++i) {
+            if (fs::exists(jobs[i].obj)) continue;    // 未被判定为 needed
+            workers.emplace_back([&, i] {
+                fs::path cpp = build_dir / (jobs[i].name + ".cpp");
+                std::string cc = tc::plain_compile_command(
+                    cxx, fam, native(*rt), native(cpp), native(jobs[i].obj));
+                std::cerr << "[cpp2] " << cc << "\n";
+                if (std::system(cc.c_str()) != 0) { ++failures; return; }
+                ++compiled;
+            });
+        }
+        for (auto& w : workers) w.join();
+
+        for (auto const& j : jobs) obj_files.push_back(native(j.obj));
+        if (failures > 0) {
+            std::cerr << "error: compilation failed\n";
+            return 2;
+        }
+    } else {
+        // ── C++20 模块后端(M3 原路径):分层并行 + BMI ──────────────
+        std::unordered_map<std::string, bool> need_compile;
+        for (auto const& name : g.order) {
+            fs::path obj = obj_dir / (util::safe_name(name) + ".o");
+            need_compile[name] = !fs::exists(obj) || f_changed[name] || h_changed[name];
+            if (need_compile[name]) fs::remove(obj);
+        }
+
+        // 分层并行编译(Kahn:依赖已编译即可入层)
+        std::unordered_map<std::string, int> indeg;
+        for (auto const& name : g.order) {
+            int n = 0;
+            for (auto const& dep : g.units.at(name).imports)
+                if (need_compile.at(dep)) ++n;
+            indeg[name] = n;
+        }
+
+        std::vector<std::string> remaining = g.order;
+        while (!remaining.empty()) {
+            std::vector<std::string> level;
+            for (auto it = remaining.begin(); it != remaining.end();) {
+                if (!need_compile.at(*it) || indeg.at(*it) == 0) {
+                    level.push_back(*it);
+                    it = remaining.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+            if (level.empty()) {
+                std::cerr << "error: internal: compilation scheduling stalled\n";
+                return 2;
+            }
+
+            std::vector<std::thread> workers;
+            for (auto const& name : level) {
+                if (!need_compile.at(name)) continue;
             workers.emplace_back([&, name] {
-                auto const& u = g.units.at(name);
                 fs::path gen = build_dir / (util::safe_name(name) + ".cpp");
                 fs::path obj = obj_dir / (util::safe_name(name) + ".o");
 
+                // BMI 映射需传递闭包:加载本模块 PCM 时,clang 还要解析其
+                // 传递 import 的 PCM(深层链式图只给直接依赖会找不到模块)
+                std::unordered_set<std::string> closure;
+                std::function<void(std::string const&)> collect =
+                    [&](std::string const& m) {
+                        if (!closure.insert(m).second) return;
+                        for (auto const& d : g.units.at(m).imports) collect(d);
+                    };
+                collect(name);
                 std::vector<std::pair<std::string, std::string>> deps;
-                for (auto const& dep : u.imports)
-                    deps.push_back({dep,
-                        native(bmi_dir / (util::safe_name(dep) + bmi_ext))});
+                for (auto const& dep : g.order)
+                    if (dep != name && closure.count(dep))
+                        deps.push_back({dep,
+                            native(bmi_dir / (util::safe_name(dep) + bmi_ext))});
 
                 std::string cc = tc::compile_command(
                     cxx, fam, native(*rt), deps, native(gen), native(obj),
                     /*is_interface*/ name != g.root_name,
                     native(bmi_dir / (util::safe_name(name) + bmi_ext)));
 
-                std::cerr << "[cpp2] " << cc << "\n";
-                if (std::system(cc.c_str()) != 0) {
-                    ++failures;
-                    return;
+                // Windows 命令行长度上限:std::system 经 cmd.exe 仅 8191 字符,
+                // BMI 闭包随模块数增长,超限改走响应文件(clang/gcc/msvc 均支持 @file;
+                // 响应文件中反斜杠是转义符,路径一律用正斜杠)
+                if (cc.size() > 7000) {
+                    fs::path rsp = build_dir / (util::safe_name(name) + ".rsp");
+                    std::string args = cc.substr(cxx.size() + 1);
+                    for (auto& c : args) if (c == '\\') c = '/';
+                    write_file(rsp, args);
+                    cc = cxx + " @" + quote(native(rsp));
                 }
-                ++compiled;
-            });
+
+                std::cerr << "[cpp2] " << cc << "\n";
+                    if (std::system(cc.c_str()) != 0) {
+                        ++failures;
+                        return;
+                    }
+                    ++compiled;
+                });
+            }
+            for (auto& w : workers) w.join();
+            if (failures > 0) {
+                std::cerr << "error: compilation failed\n";
+                return 2;
+            }
+            // 层完成:从剩余节点的入度中扣除本层
+            for (auto const& done : level)
+                for (auto const& [n, u] : g.units)
+                    for (auto const& dep : u.imports)
+                        if (dep == done && need_compile.at(n)) indeg[n] = std::max(0, indeg[n] - 1);
         }
-        for (auto& w : workers) w.join();
-        if (failures > 0) {
-            std::cerr << "error: compilation failed\n";
-            return 2;
-        }
-        // 层完成:从剩余节点的入度中扣除本层
-        for (auto const& done : level)
-            for (auto const& [n, u] : g.units)
-                for (auto const& dep : u.imports)
-                    if (dep == done && need_compile.at(n)) indeg[n] = std::max(0, indeg[n] - 1);
+
+        for (auto const& name : g.order)
+            obj_files.push_back(native(obj_dir / (util::safe_name(name) + ".o")));
     }
 
     // 链接
-    std::vector<std::string> objs;
-    for (auto const& name : g.order)
-        objs.push_back(native(obj_dir / (util::safe_name(name) + ".o")));
     fs::path exe = in.parent_path() / ".cpp2build" / in.stem();
-    std::string link = tc::link_command(cxx, fam, objs, native(exe));
+    std::string link = tc::link_command(cxx, fam, obj_files, native(exe));
     std::cerr << "[cpp2] " << link << "\n";
     if (std::system(link.c_str()) != 0) {
         std::cerr << "error: link failed\n";
@@ -622,7 +756,8 @@ void usage()
         << "usage:\n"
         << "  cpp2 run <root.cppm>                        # 摊平转译 + 编译 + 执行\n"
         << "  cpp2 check <root.cppm>                      # 快速语义检查,不生成代码\n"
-        << "  cpp2 build [root.cppm]                      # C++20 模块模式:并行增量构建\n"
+        << "  cpp2 build [root.cppm]                      # 并行增量构建(默认 headers 后端)\n"
+        << "      [--backend=headers|cxx20-modules] [--max-tu-size=N]\n"
         << "  cpp2 transpile <root.cppm> [-o out.cpp]     # 摊平转译查看生成码\n"
         << "  cpp2 export-headers <root.cppm> [-o dir]    # 生成 Cpp1 消费者 .h/.cpp\n"
         << "  cpp2 audit <root.cppm>                      # 安全审计:检查点 + 退出点\n"
