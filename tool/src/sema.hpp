@@ -1,4 +1,4 @@
-// C++2 语义分析(M2c:错误通道类型 + 强制处理 + 契约检查)
+// C++2 语义分析(M2d:泛型/concept、variant、optional、模式匹配、UFCS)
 #pragma once
 
 #include "ast.hpp"
@@ -10,7 +10,8 @@
 
 namespace cpp2::sema {
 
-// 表达式类型(M2c 子集:标量、字符串、结构体、枚举、容器、智能指针、错误通道)
+// 表达式类型(M2d 子集:标量、字符串、结构体、枚举、variant、容器、智能指针、
+// 错误通道、optional、泛型参数)
 struct Type {
     enum Kind {
         Unknown, Bool, Char,
@@ -21,22 +22,27 @@ struct Type {
         Container,                        // vector/list/map/... 有下标
         SmartPtr,                         // unique/shared/weak → pointee
         Error,                            // cpp2::error 值(match err 臂 / else 绑定)
-        ErrVal                            // err("msg") 的构造值(return 时转 unexpected)
+        ErrVal,                           // err("msg") 的构造值(return 时转 unexpected)
+        Variant,                          // variant 声明(name 定位 alternatives)
+        Generic,                          // 泛型类型参数 T(name 即参数名)
+        NoneVal                           // none 字面量 → std::nullopt
     };
 
     Kind kind = Unknown;
-    std::string name;                     // 结构体/枚举名,或容器名
+    std::string name;                     // 结构体/枚举/variant 名,或容器名
     std::shared_ptr<Type> pointee;        // SmartPtr 指向类型(间接:避免自包含)
     std::shared_ptr<Type> element;        // Container 元素类型
     bool is_const = false;
     bool is_expected = false;             // 错误通道值:expected<value, error>(throws 调用结果)
     std::shared_ptr<Type> value;          // expected 的值类型(is_expected 时有效)
+    bool is_optional = false;             // T? → optional<value>(M2d,DESIGN §6.4)
 
     Type deref() const { return pointee ? *pointee : Type{}; }
     Type elem()  const { return element ? *element : Type{}; }
     Type val()   const { return value ? *value : Type{}; }
 
     bool known()     const { return kind != Unknown; }
+    bool wrapped()  const { return is_expected || is_optional; }
     bool is_signed() const {
         return kind == Int || kind == I8 || kind == I16 || kind == I32 || kind == I64;
     }
@@ -66,6 +72,7 @@ struct Type {
 
     std::string display() const {
         if (is_expected) return "expected<" + val().display() + ">";
+        if (is_optional) return val().display() + "?";
         switch (kind) {
         case Unknown: return "unknown";
         case Bool: return "bool";
@@ -85,6 +92,9 @@ struct Type {
         case SmartPtr: return "unique<" + deref().display() + ">";
         case Error: return "error";
         case ErrVal: return "err-value";
+        case Variant: return name;
+        case Generic: return name;
+        case NoneVal: return "none";
         }
         return "?";
     }
@@ -102,11 +112,18 @@ struct Result {
     std::vector<Diagnostic> errors;
     std::vector<Diagnostic> warnings;
     std::unordered_map<ast::Expr*, Type> expr_types;   // 推断结果,发射器消费
+    // UFCS 定向(DESIGN §4.7):CallExpr(成员调用形式)→ 自由函数名;
+    // "std::to_string" 为标量成员调用的标准库桥接目标
+    std::unordered_map<ast::Expr*, std::string> ufcs;
 
     bool ok() const { return errors.empty(); }
     Type type_of(ast::Expr& e) const {
         auto it = expr_types.find(&e);
         return it != expr_types.end() ? it->second : Type{};
+    }
+    std::string ufcs_of(ast::Expr& e) const {
+        auto it = ufcs.find(&e);
+        return it != ufcs.end() ? it->second : "";
     }
 };
 

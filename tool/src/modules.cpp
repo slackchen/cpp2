@@ -199,6 +199,7 @@ std::string interface_text(ast::Module const& m)
             }
             s += ">";
         }
+        if (t.is_optional) s += "?";
         return s;
     };
     auto ret_sig = [&](std::optional<ast::TypeUse> const& r) {
@@ -229,13 +230,64 @@ std::string interface_text(ast::Module const& m)
         }
         o << "}\n";
     }
+    for (auto const& v : m.variants) {
+        if (!v.exported) continue;
+        o << "variant " << v.name << "{";
+        for (size_t i = 0; i < v.alternatives.size(); ++i) {
+            if (i) o << ",";
+            o << type_sig(v.alternatives[i], type_sig);
+        }
+        o << "}\n";
+    }
+    for (auto const& c : m.concepts) {
+        if (!c.exported) continue;
+        o << "concept " << c.name << "{";
+        for (auto const& req : c.reqs) {
+            o << req.name << "(";
+            for (size_t i = 0; i < req.params.size(); ++i) {
+                if (i) o << ",";
+                o << type_sig(req.params[i].type, type_sig);
+            }
+            o << ")" << ret_sig(req.ret) << ";";
+        }
+        o << "}\n";
+    }
     for (auto const& g : m.globals) {
         if (!g.exported) continue;
         o << "var " << g.name << ":" << type_sig(g.type, type_sig) << "\n";
     }
     for (auto const& f : m.funcs) {
         if (!f.exported) continue;
-        o << "fn " << f.name << "(";
+        o << "fn ";
+        if (!f.type_params.empty()) {
+            o << "<";
+            for (size_t i = 0; i < f.type_params.size(); ++i) {
+                if (i) o << ",";
+                o << f.type_params[i].name;
+                if (!f.type_params[i].concept_parts.empty()) {
+                    o << ":";
+                    for (size_t j = 0; j < f.type_params[i].concept_parts.size(); ++j)
+                        o << (j ? "::" : "") + f.type_params[i].concept_parts[j];
+                }
+            }
+            o << ">";
+        }
+        for (auto const& r : f.requires_list) {
+            std::string joined;
+            for (auto const& p : r.name_parts)
+                joined += (joined.empty() ? "" : "::") + p;
+            o << "requires " << joined;
+            if (!r.args.empty()) {
+                o << "<";
+                for (size_t i = 0; i < r.args.size(); ++i) {
+                    if (i) o << ",";
+                    o << r.args[i];
+                }
+                o << ">";
+            }
+            o << " ";
+        }
+        o << f.name << "(";
         for (size_t i = 0; i < f.params.size(); ++i) {
             if (i) o << ",";
             o << f.params[i].name << ":" << type_sig(f.params[i].type, type_sig);

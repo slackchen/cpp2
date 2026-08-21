@@ -1,0 +1,48 @@
+// types.cppm — M2d 收尾:继承(DESIGN §5.1)、命名工厂与析构器(DESIGN §5.3)
+module types;
+import std;
+
+Animal: type = {
+    name: string = "";
+
+    speak: () -> string = "...";
+}
+
+// 继承(仅公有):Dog 携带 Animal 的字段与方法;方法体内可直接用基类字段
+Dog: type: Animal = {
+    tricks: int = 0;
+
+    // 同名方法隐藏基类版本(C++ 静态语义;虚分发挂账 M5+)
+    speak: () -> string = "woof";
+
+    rename: (n: string) mutates = { name = n; }
+
+    // 析构器:作用域结束确定性调用,顺序与构造相反(DESIGN §5.3)
+    destructor: () mutates = {
+        std::println("cleanup {0}", name);
+    }
+}
+
+// 命名工厂(make_ 前缀惯例):对象要么完整、要么不存在
+make_dog: (n: string) -> Dog = {
+    d: Dog := Dog{};
+    d.rename(n);
+    return d;
+}
+
+main: () -> int = {
+    a: Animal := Animal{.name = "generic"};
+    std::println("animal says {0}", a.speak());
+
+    d: Dog := make_dog("rex");
+    d.tricks = 2;
+    std::println("{0} says {1} ({2} tricks)", d.name, d.speak(), d.tricks);
+
+    {
+        b: Dog := make_dog("buddy");
+        std::println("buddy scoped");
+    }                                   // b 的析构器在此触发(块出口)
+
+    std::println("end of main");        // d 的析构在其后(main 出口)
+    return 0;
+}

@@ -174,6 +174,160 @@ else
     echo "FAIL m2c/prop-requires-throws"; fail=$((fail+1))
 fi
 
+# ── M2d:泛型/concept、variant、optional、模式匹配、UFCS ─────────
+# 正向(DESIGN §4.5–§5.6 示例全绿)
+run_case examples/shapes.cppm   "circle area = 12.56636"   ok
+run_case examples/shapes.cppm   "rect area = 12"           ok
+run_case examples/shapes.cppm   "neg area = 0"             ok     # 守卫失败落入同模式后续臂
+run_case examples/shapes.cppm   "z is rectangle"           ok
+run_case examples/shapes.cppm   "go"                       ok
+run_case examples/optional.cppm "found ada"                ok     # if-let 绑定解包值
+run_case examples/optional.cppm "9 missing"                ok     # if-let else 分支
+run_case examples/optional.cppm "hello, grace"             ok     # match some/none 表达式
+run_case examples/generics.cppm "n to_string = 42"         ok     # UFCS 桥接 std::to_string
+run_case examples/generics.cppm "clamp -3 = 0"             ok     # 泛型 + concept 约束
+run_case examples/generics.cppm "clamp 2.5 = 2"            ok     # 同一泛型多类型实例化
+run_case examples/generics.cppm "mid3 = 3"                 ok     # requires 子句
+run_case examples/generics.cppm "squares sum = 30"         ok     # lambda 实参
+run_case examples/types.cppm    "rex says woof (2 tricks)" ok     # 继承:基类字段经派生访问
+run_case examples/types.cppm    "cleanup buddy"            ok     # 析构器:块出口确定性调用
+run_case examples/types.cppm    "cleanup rex"              ok     # 析构顺序与构造相反
+
+# 负例:variant 非穷尽 → 干净诊断(match 是唯一合法访问,穷尽性编译器保证)
+cat > .cpp2build/nonexhaustive.cppm <<'EOF'
+module nonexhaustive;
+import std;
+Circle: type = { r: double = 0; }
+Rect: type = { w: double = 0; h: double = 0; }
+Shape: variant = { Circle, Rect }
+area: (s: Shape) -> double = match s {
+    Circle(r) => r * r;
+}
+main: () -> int = { return 0; }
+EOF
+if "$CPP2" transpile .cpp2build/nonexhaustive.cppm 2>&1 | grep -q "match arms must be exhaustive"; then
+    echo "PASS m2d/variant-exhaustive"; pass=$((pass+1))
+else
+    echo "FAIL m2d/variant-exhaustive"; fail=$((fail+1))
+fi
+
+# 负例:'_' 通配不在末尾
+cat > .cpp2build/wildpos.cppm <<'EOF'
+module wildpos;
+import std;
+Signal: enum = { red, green }
+f: (s: Signal) -> int = match s {
+    _      => 0;
+    .red   => 1;
+}
+main: () -> int = { return 0; }
+EOF
+if "$CPP2" transpile .cpp2build/wildpos.cppm 2>&1 | grep -q "'_' must be the last match arm"; then
+    echo "PASS m2d/wildcard-last"; pass=$((pass+1))
+else
+    echo "FAIL m2d/wildcard-last"; fail=$((fail+1))
+fi
+
+# 负例:未声明的 concept 约束
+cat > .cpp2build/badconcept.cppm <<'EOF'
+module badconcept;
+import std;
+f: <T: NoSuch> (v: T) -> T = v;
+main: () -> int = { return 0; }
+EOF
+if "$CPP2" transpile .cpp2build/badconcept.cppm 2>&1 | grep -q "unknown concept 'NoSuch'"; then
+    echo "PASS m2d/unknown-concept"; pass=$((pass+1))
+else
+    echo "FAIL m2d/unknown-concept"; fail=$((fail+1))
+fi
+
+# 负例:concept 用作值类型(concept 是约束,不是类型)
+cat > .cpp2build/conceptval.cppm <<'EOF'
+module conceptval;
+import std;
+Ordered: concept = {
+    operator<: (that: self) -> bool;
+}
+main: () -> int = {
+    x: Ordered := 3;
+    return 0;
+}
+EOF
+if "$CPP2" transpile .cpp2build/conceptval.cppm 2>&1 | grep -q "is a constraint, not a value type"; then
+    echo "PASS m2d/concept-not-type"; pass=$((pass+1))
+else
+    echo "FAIL m2d/concept-not-type"; fail=$((fail+1))
+fi
+
+# 负例:枚举成员模式用于非 enum scrutinee
+cat > .cpp2build/enumpat.cppm <<'EOF'
+module enumpat;
+import std;
+main: () -> int = {
+    n: int := 5;
+    match n {
+        .red => std::println("x");
+    }
+    return 0;
+}
+EOF
+if "$CPP2" transpile .cpp2build/enumpat.cppm 2>&1 | grep -q "match scrutinee must be an error-channel value, enum, variant"; then
+    echo "PASS m2d/enum-pat-scrutinee"; pass=$((pass+1))
+else
+    echo "FAIL m2d/enum-pat-scrutinee"; fail=$((fail+1))
+fi
+
+# 负例:解构非 struct 的 variant 候选(int/string 无字段可解构)
+cat > .cpp2build/destructalt.cppm <<'EOF'
+module destructalt;
+import std;
+Value: variant = { int, string }
+describe: (v: Value) -> string = match v {
+    int(x)    => "i";
+    string(s) => "s";
+}
+main: () -> int = { return 0; }
+EOF
+if "$CPP2" transpile .cpp2build/destructalt.cppm 2>&1 | grep -q "only struct alternatives can be destructured"; then
+    echo "PASS m2d/destruct-nonstruct"; pass=$((pass+1))
+else
+    echo "FAIL m2d/destruct-nonstruct"; fail=$((fail+1))
+fi
+
+# 负例:main 不能是泛型(入口单态化无意义)
+cat > .cpp2build/genmain.cppm <<'EOF'
+module genmain;
+import std;
+main: <T> () -> int = { return 0; }
+EOF
+if "$CPP2" transpile .cpp2build/genmain.cppm 2>&1 | grep -q "main cannot be generic"; then
+    echo "PASS m2d/main-nongeneric"; pass=$((pass+1))
+else
+    echo "FAIL m2d/main-nongeneric"; fail=$((fail+1))
+fi
+
+# ── M2e:cpp2 check + .c2i 格式 v1(冻结)─────────────────────────
+# check:快速语义检查,不生成代码
+if "$CPP2" check examples/multimod/app.cppm 2>/dev/null | grep -q "2 module(s) ok"; then
+    echo "PASS m2e/check-ok"; pass=$((pass+1))
+else
+    echo "FAIL m2e/check-ok"; fail=$((fail+1))
+fi
+if "$CPP2" check .cpp2build/unhandled.cppm 2>&1 | grep -q "unhandled error-channel"; then
+    echo "PASS m2e/check-diag"; pass=$((pass+1))
+else
+    echo "FAIL m2e/check-diag"; fail=$((fail+1))
+fi
+
+# .c2i v1:二进制容器(magic C2IF + version 1)
+c2i="examples/multimod/.cpp2build/mods/cpp2cache/app.c2i"
+if "$CPP2" build examples/multimod/app.cppm >/dev/null 2>&1 \
+   && head -c 4 "$c2i" 2>/dev/null | grep -q "C2IF"; then
+    echo "PASS m2e/c2if-magic"; pass=$((pass+1))
+else
+    echo "FAIL m2e/c2if-magic"; fail=$((fail+1))
+fi
+
 echo
 echo "passed $pass, failed $fail"
 [[ $fail -eq 0 ]]

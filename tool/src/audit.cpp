@@ -111,7 +111,11 @@ private:
         }
         case ast::Stmt::If: {
             auto& i = static_cast<ast::IfStmt&>(s);
-            expr(*i.cond);
+            if (i.is_let()) {
+                expr(*i.let_init);
+            } else {
+                expr(*i.cond);
+            }
             stmt(*i.then_block);
             if (i.else_block) stmt(*i.else_block);
             break;
@@ -139,7 +143,10 @@ private:
         case ast::Stmt::Match: {
             auto& x = static_cast<ast::MatchStmt&>(s);
             expr(*x.scrutinee);
-            for (auto& arm : x.arms) stmt(*arm.body);
+            for (auto& arm : x.arms) {
+                if (arm.guard) expr(*arm.guard);
+                stmt(*arm.body);
+            }
             break;
         }
         }
@@ -225,6 +232,23 @@ private:
         case ast::Expr::Must:
             expr(*static_cast<ast::MustExpr&>(e).operand);
             break;
+        case ast::Expr::Match: {
+            auto& x = static_cast<ast::MatchExpr&>(e);
+            expr(*x.scrutinee);
+            for (auto& arm : x.arms) {
+                if (arm.guard) expr(*arm.guard);
+                stmt(*arm.body);
+            }
+            break;
+        }
+        case ast::Expr::Lambda: {
+            auto& l = static_cast<ast::LambdaExpr&>(e);
+            for (auto& p : l.params)
+                if (p.default_value) expr(*p.default_value);
+            if (l.has_block_body && l.block_body) stmt(*l.block_body);
+            if (l.expr_body) expr(*l.expr_body);
+            break;
+        }
         }
     }
 };

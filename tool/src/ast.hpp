@@ -1,4 +1,4 @@
-// C++2 AST(M2c:错误通道 ?/!/or/match/if-let、契约 pre/post)
+// C++2 AST(M2d:泛型/concept、variant、T?、模式匹配扩展、lambda、UFCS)
 // 节点带源位置;dispatch 用 kind() + static_cast,不依赖 RTTI。
 #pragma once
 
@@ -20,6 +20,7 @@ struct Node {
 struct TypeUse {
     int line = 0;
     bool is_const = false;
+    bool is_optional = false;                // T? → std::optional<T>(M2d,DESIGN §6.4)
     std::vector<std::string> parts;          // 限定名,如 {std, string}
     std::vector<TypeUse> args;               // 泛型实参
 
@@ -29,11 +30,14 @@ struct TypeUse {
 // ── 表达式 ──────────────────────────────────────────────────────────
 struct Expr;
 using ExprP = std::unique_ptr<Expr>;
+struct Stmt;
+using StmtP = std::unique_ptr<Stmt>;
 
 struct Expr : Node {
     enum Kind { Literal, Name, Call, Binary, Unary, Assign, Index, Member, Paren,
                 StructLit, AsCast, ListLit,
-                Try, OrDefault, Must };
+                Try, OrDefault, Must,
+                Match, Lambda };
     virtual Kind kind() const = 0;
 };
 
@@ -123,9 +127,24 @@ struct MustExpr : Expr {                     // f()! — 确信必成功,失败�
     Kind kind() const override { return Kind::Must; }
 };
 
-// ── 语句 ────────────────────────────────────────────────────────────
-struct Stmt;
-using StmtP = std::unique_ptr<Stmt>;
+// match 臂:模式 + 可选守卫 + 体(表达式臂在解析层包成 ExprStmt)
+struct MatchArm {
+    enum class Pat { Ok, Err, Wildcard, EnumMember, TypePat, Some, None };
+    int line = 0;
+    Pat pat = Pat::Wildcard;
+    std::string enum_member;                 // Pat::EnumMember:.red
+    TypeUse type_pattern;                    // Pat::TypePat:int n / Circle / vector<Value>
+    std::string binding;                     // 绑定名("_" = 忽略;空 = 无绑定)
+    std::vector<std::string> sub;            // 解构子模式:".field" / 名字(按位)/ "_"
+    ExprP guard;                             // 可空:pattern if guard => body
+    StmtP body;                              // 块或单条语句 / 表达式(ExprStmt 包装)
+};
+
+struct MatchExpr : Expr {                    // match v { pat => expr; ... } — 产值(DESIGN §5.5)
+    ExprP scrutinee;
+    std::vector<MatchArm> arms;
+    Kind kind() const override { return Kind::Match; }
+};
 
 struct Stmt : Node {
     enum Kind { ExprStmt, Return, Var, If, While, For, Break, Continue, Block, Match };
@@ -188,15 +207,10 @@ struct BlockStmt : Stmt {
     Kind kind() const override { return Kind::Block; }
 };
 
-struct MatchArm {                            // ok NAME => / err NAME =>(M2c 子集)
-    int line = 0;
-    bool is_ok = false;
-    std::string binding;                     // 绑定名("_" = 忽略)
-    StmtP body;                              // 块或单条语句
-};
+// MatchArm 定义在表达式区(match 表达式与语句共用)
 
-struct MatchStmt : Stmt {                    // match f() { ok x => ...; err e => ...; }
-    ExprP scrutinee;                         // 必须是错误通道值(sema 检查)
+struct MatchStmt : Stmt {                    // match v { pattern [if guard] => body; ... }
+    ExprP scrutinee;                         // 错误通道 / enum / variant / optional / struct
     std::vector<MatchArm> arms;
     Kind kind() const override { return Kind::Match; }
 };
@@ -212,10 +226,35 @@ struct Param {
     ExprP default_value;                     // 可空
 };
 
+struct LambdaExpr : Expr {                   // (x: int) -> int = x * x(DESIGN §4.6)
+    std::vector<std::string> captures;       // 显式捕获:"=" / "&" / "x" / "&x"(空 = 无捕获)
+    std::vector<Param> params;
+    std::optional<TypeUse> ret;
+    bool has_block_body = false;
+    StmtP block_body;
+    ExprP expr_body;
+    Kind kind() const override { return Kind::Lambda; }
+};
+
+// 泛型参数:<T: Concept>(DESIGN §5.6)
+struct TypeParam {
+    int line = 0;
+    std::string name;
+    std::vector<std::string> concept_parts;  // 约束概念(限定名;空 = 无约束)
+};
+
+// requires 子句项:Ordered<T> && Printable<T>
+struct RequiresItem {
+    std::vector<std::string> name_parts;
+    std::vector<std::string> args;           // 类型参数名
+};
+
 struct FuncDecl {
     int line = 0;
     bool exported = false;
     std::string name;
+    std::vector<TypeParam> type_params;      // <T: Concept>(M2d)
+    std::vector<RequiresItem> requires_list; // requires A<T> && B<T>(M2d)
     std::vector<Param> params;
     std::optional<TypeUse> ret;
     bool throws = false;
@@ -275,6 +314,20 @@ struct EnumDecl {
     std::vector<std::string> members;
 };
 
+struct VariantDecl {                         // Value: variant = { int, string }(DESIGN §5.5)
+    int line = 0;
+    bool exported = false;
+    std::string name;
+    std::vector<TypeUse> alternatives;       // 候选类型;match 是唯一合法访问方式
+};
+
+struct ConceptDecl {                         // Ordered: concept = { ... }(DESIGN §5.6)
+    int line = 0;
+    bool exported = false;
+    std::string name;
+    std::vector<MethodDecl> reqs;            // 接口要求(签名,无体)
+};
+
 struct GlobalVar {
     int line = 0;
     bool exported = false;
@@ -296,6 +349,8 @@ struct Module {
     std::vector<ImportDecl> imports;
     std::vector<StructDecl> structs;
     std::vector<EnumDecl> enums;
+    std::vector<VariantDecl> variants;
+    std::vector<ConceptDecl> concepts;
     std::vector<GlobalVar> globals;
     std::vector<FuncDecl> funcs;
 
@@ -305,6 +360,14 @@ struct Module {
     }
     EnumDecl* find_enum(std::string const& n) {
         for (auto& e : enums) if (e.name == n) return &e;
+        return nullptr;
+    }
+    VariantDecl* find_variant(std::string const& n) {
+        for (auto& v : variants) if (v.name == n) return &v;
+        return nullptr;
+    }
+    ConceptDecl* find_concept(std::string const& n) {
+        for (auto& c : concepts) if (c.name == n) return &c;
         return nullptr;
     }
     FuncDecl* find_func(std::string const& n) {

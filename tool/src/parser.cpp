@@ -137,6 +137,20 @@ private:
         return advance().text;
     }
 
+    // operator 后缀 token(operator< / operator== / ...;concept 需求与方法名共用)
+    static bool is_operator_token(lex::Tok t)
+    {
+        switch (t) {
+        case lex::Tok::Lt: case lex::Tok::Gt: case lex::Tok::Le: case lex::Tok::Ge:
+        case lex::Tok::Eq: case lex::Tok::Ne: case lex::Tok::Plus: case lex::Tok::Minus:
+        case lex::Tok::Star: case lex::Tok::Slash: case lex::Tok::Percent:
+        case lex::Tok::AndAnd: case lex::Tok::OrOr: case lex::Tok::Bang:
+            return true;
+        default:
+            return false;
+        }
+    }
+
     // 模块名是点分的:app.util
     std::vector<std::string> dotted_name_parts(char const* what)
     {
@@ -174,13 +188,14 @@ private:
             err("expected ':' after declaration name");
         }
 
-        // name ':' ... — 看第三个 token 分派 type / enum / 函数 / 变量
+        // name ':' ... — 看第三个 token 分派 type / enum / variant / concept / 函数 / 变量
         lex::Tok after_colon = peek(2).tok;
         if (after_colon == lex::Tok::Type)             type_decl(m, exported);
         else if (after_colon == lex::Tok::Enum)        enum_decl(m, exported);
-        else if (after_colon == lex::Tok::Variant)     unsupported("variant", "M2d");
-        else if (after_colon == lex::Tok::Concept)     unsupported("concept", "M2d");
+        else if (after_colon == lex::Tok::Variant)     variant_decl(m, exported);
+        else if (after_colon == lex::Tok::Concept)     concept_decl(m, exported);
         else if (after_colon == lex::Tok::LParen)      func_decl(m, exported);
+        else if (after_colon == lex::Tok::Lt)          func_decl(m, exported); // 泛型 <T: C>
         else                                           var_decl(m, exported);
     }
 
@@ -213,6 +228,13 @@ private:
     void struct_member(ast::StructDecl& s)
     {
         if (!check(lex::Tok::Ident)) err("expected a field or method declaration");
+
+        // operator 方法:operator<: (that: T) -> bool = ...(运算符成员,M2d)
+        if (peek().text == "operator" && is_operator_token(peek(1).tok)
+            && peek(2).tok == lex::Tok::Colon) {
+            method_decl(s);
+            return;
+        }
         if (peek(1).tok == lex::Tok::LParen)
             err("unexpected '(' — method declarations look like 'name: (params) ...'");
         if (peek(1).tok != lex::Tok::Colon) err("expected ':' after member name");
@@ -240,6 +262,8 @@ private:
         ast::MethodDecl md;
         md.line = peek().line;
         md.name = advance().text;
+        if (md.name == "operator" && is_operator_token(peek().tok))
+            md.name += advance().text;           // operator< / operator== / ...
         expect(lex::Tok::Colon, "':' after method name");
         expect(lex::Tok::LParen, "'(' to start parameter list");
         md.params = param_list();
@@ -260,7 +284,10 @@ private:
             md.block_body = block();
         } else {
             md.expr_body = expression();
-            expect(lex::Tok::Semi, "';' after short method body");
+            // match 表达式以 '}' 结尾,分号可省(与 func_decl 一致)
+            if (md.expr_body->kind() != ast::Expr::Match)
+                expect(lex::Tok::Semi, "';' after short method body");
+            else accept(lex::Tok::Semi);
         }
         if (md.name == "destructor" && (!md.params.empty() || md.ret))
             err("destructor takes no parameters and returns nothing");
@@ -289,6 +316,61 @@ private:
         m.enums.push_back(std::move(e));
     }
 
+    // Value: variant = { int, string, vector<Value> }(DESIGN §5.5)
+    void variant_decl(ast::Module& m, bool exported)
+    {
+        ast::VariantDecl v;
+        v.exported = exported;
+        v.line = peek().line;
+        v.name = advance().text;
+        expect(lex::Tok::Colon, "':' after variant name");
+        expect(lex::Tok::Variant, "'variant'");
+        expect(lex::Tok::Assign, "'=' before variant body");
+        expect(lex::Tok::LBrace, "'{' to start variant alternatives");
+        if (check(lex::Tok::RBrace)) err("variant needs at least one alternative type");
+        for (;;) {
+            v.alternatives.push_back(parse_type());
+            if (!accept(lex::Tok::Comma)) break;
+            if (check(lex::Tok::RBrace)) break;       // 允许尾逗号
+        }
+        expect(lex::Tok::RBrace, "'}' to end variant");
+        m.variants.push_back(std::move(v));
+    }
+
+    // Ordered: concept = { operator<: (that: self) -> bool; ... }(DESIGN §5.6)
+    // 接口块:成员是签名(无体),self 指代满足概念的类型。
+    void concept_decl(ast::Module& m, bool exported)
+    {
+        ast::ConceptDecl c;
+        c.exported = exported;
+        c.line = peek().line;
+        c.name = advance().text;
+        expect(lex::Tok::Colon, "':' after concept name");
+        expect(lex::Tok::Concept, "'concept'");
+        expect(lex::Tok::Assign, "'=' before concept body");
+        expect(lex::Tok::LBrace, "'{' to start concept requirements");
+        while (!check(lex::Tok::RBrace)) {
+            if (check(lex::Tok::Eof)) err("expected '}' before end of file");
+            if (accept(lex::Tok::Semi)) continue;
+            if (!check(lex::Tok::Ident)) err("expected a requirement 'name: (params) -> ret;'");
+            ast::MethodDecl req;
+            req.line = peek().line;
+            req.name = advance().text;
+            if (req.name == "operator" && is_operator_token(peek().tok))
+                req.name += advance().text;      // operator< / operator== / ...
+            expect(lex::Tok::Colon, "':' after requirement name");
+            expect(lex::Tok::LParen, "'(' to start parameter list");
+            req.params = param_list();
+            expect(lex::Tok::RParen, "')' to end parameter list");
+            if (accept(lex::Tok::Arrow)) req.ret = parse_type();
+            expect(lex::Tok::Semi, "';' after requirement (concepts have no bodies)");
+            c.reqs.push_back(std::move(req));
+        }
+        expect(lex::Tok::RBrace, "'}' to end concept");
+        if (c.reqs.empty()) err("concept needs at least one requirement");
+        m.concepts.push_back(std::move(c));
+    }
+
     void func_decl(ast::Module& m, bool exported)
     {
         ast::FuncDecl f;
@@ -296,6 +378,22 @@ private:
         f.line = peek().line;
         f.name = advance().text;
         expect(lex::Tok::Colon, "':' after function name");
+
+        // 泛型参数:<T: Concept>(DESIGN §5.6)
+        if (accept(lex::Tok::Lt)) {
+            for (;;) {
+                ast::TypeParam tp;
+                tp.line = peek().line;
+                if (!check(lex::Tok::Ident)) err("expected type parameter name");
+                tp.name = advance().text;
+                if (accept(lex::Tok::Colon))
+                    tp.concept_parts = qualified_name_parts("concept name");
+                f.type_params.push_back(std::move(tp));
+                if (!accept(lex::Tok::Comma)) break;
+            }
+            expect(lex::Tok::Gt, "'>' to close type parameters");
+        }
+
         expect(lex::Tok::LParen, "'(' to start parameter list");
         f.params = param_list();
         expect(lex::Tok::RParen, "')' to end parameter list");
@@ -309,6 +407,7 @@ private:
         if (accept(lex::Tok::Mutates))
             err("'mutates' is only valid on type member methods");
         parse_contracts(f.pre, f.post);
+        parse_requires(f.requires_list);
 
         expect(lex::Tok::Assign, "'=' before function body");
         if (check(lex::Tok::LBrace)) {
@@ -316,9 +415,35 @@ private:
             f.block_body = block();
         } else {
             f.expr_body = expression();
-            expect(lex::Tok::Semi, "';' after short function body");
+            // match 表达式以 '}' 结尾,分号可省(DESIGN §5.5 形式)
+            if (f.expr_body->kind() != ast::Expr::Match)
+                expect(lex::Tok::Semi, "';' after short function body");
+            else accept(lex::Tok::Semi);
         }
         m.funcs.push_back(std::move(f));
+    }
+
+    // requires Ordered<T> && Printable<T>(DESIGN §5.6;位于 '=' 之前)
+    void parse_requires(std::vector<ast::RequiresItem>& out)
+    {
+        if (!(check(lex::Tok::Ident) && peek().text == "requires"
+              && (peek(1).tok == lex::Tok::Ident || peek(1).tok == lex::Tok::Lt)))
+            return;
+        advance(); // requires
+        for (;;) {
+            ast::RequiresItem r;
+            r.name_parts = qualified_name_parts("concept name in requires");
+            if (accept(lex::Tok::Lt)) {
+                for (;;) {
+                    if (!check(lex::Tok::Ident)) err("expected type parameter name");
+                    r.args.push_back(advance().text);
+                    if (!accept(lex::Tok::Comma)) break;
+                }
+                expect(lex::Tok::Gt, "'>' to close requires arguments");
+            }
+            out.push_back(std::move(r));
+            if (!accept(lex::Tok::AndAnd)) break;
+        }
     }
 
     // throws E 的错误类别:v0.1 解析后丢弃(§8.4 错误类型体系 v0.3 落地);
@@ -426,6 +551,7 @@ private:
             }
             expect(lex::Tok::Gt, "'>' to close type arguments");
         }
+        if (accept(lex::Tok::Question)) t.is_optional = true;   // T?(DESIGN §6.4)
         return t;
     }
 
@@ -551,7 +677,8 @@ private:
         cond_like_ = true;
 
         // if-let:x := f() { ... } else e := it { ... }(DESIGN §8.3;':=' 不出现在普通表达式)
-        if (check(lex::Tok::Ident) && peek(1).tok == lex::Tok::Walrus) {
+        if ((check(lex::Tok::Ident) || check(lex::Tok::Underscore))
+            && peek(1).tok == lex::Tok::Walrus) {
             s->let_name = advance().text;
             advance(); // :=
             s->let_init = expression();
@@ -580,7 +707,9 @@ private:
         return s;
     }
 
-    // match f() { ok x => ...; err e => ...; }(M2c 子集:错误通道两臂)
+    // match v { pattern [if guard] => body; ... } — 语句形式(臂体 = 块/语句)
+    // 模式(M2d,DESIGN §4.5/§5.4/§5.5):_ / .member / ok|err [name] / some|none /
+    //   Type [name] / Type(bind|​.field, ...) — 按 scrutinee 类型分派合法集合
     ast::StmtP match_stmt()
     {
         auto s = std::make_unique<ast::MatchStmt>();
@@ -595,22 +724,90 @@ private:
         while (!check(lex::Tok::RBrace)) {
             if (check(lex::Tok::Eof)) err("expected '}' before end of file");
             if (accept(lex::Tok::Semi)) continue;           // 臂之间空行残留分号
-            ast::MatchArm arm;
-            arm.line = peek().line;
-            if (!check(lex::Tok::Ident)
-                || (peek().text != "ok" && peek().text != "err"))
-                err("match arm must start with 'ok' or 'err' (M2c subset)");
-            arm.is_ok = peek().text == "ok";
-            advance();
-            if (!check(lex::Tok::Ident) && !check(lex::Tok::Underscore))
-                err("expected binding name after 'ok'/'err'");
-            arm.binding = advance().text;
-            expect(lex::Tok::FatArrow, "'=>' after match arm pattern");
-            arm.body = check(lex::Tok::LBrace) ? block() : statement();
-            s->arms.push_back(std::move(arm));
+            parse_arm(s->arms, /*expr_form*/false);
         }
         expect(lex::Tok::RBrace, "'}' to end match");
         return s;
+    }
+
+    // 一条 match 臂;expr_form = 表达式 match(臂体是表达式,包成 ExprStmt)
+    void parse_arm(std::vector<ast::MatchArm>& arms, bool expr_form)
+    {
+        ast::MatchArm arm;
+        arm.line = peek().line;
+
+        if (accept(lex::Tok::Underscore)) {
+            arm.pat = ast::MatchArm::Pat::Wildcard;
+        } else if (check(lex::Tok::Dot)) {
+            advance();
+            if (!check(lex::Tok::Ident)) err("expected enum member after '.'");
+            arm.pat = ast::MatchArm::Pat::EnumMember;
+            arm.enum_member = advance().text;
+        } else if (check(lex::Tok::Ident)
+                   && (peek().text == "ok" || peek().text == "err"
+                       || peek().text == "some" || peek().text == "none")
+                   && (peek(1).tok == lex::Tok::Ident
+                       || peek(1).tok == lex::Tok::Underscore
+                       || peek(1).tok == lex::Tok::FatArrow
+                       || peek(1).tok == lex::Tok::If)) {
+            std::string kw = advance().text;
+            arm.pat = kw == "ok"   ? ast::MatchArm::Pat::Ok
+                    : kw == "err"  ? ast::MatchArm::Pat::Err
+                    : kw == "some" ? ast::MatchArm::Pat::Some
+                                   : ast::MatchArm::Pat::None;
+            if (check(lex::Tok::Ident) || check(lex::Tok::Underscore))
+                arm.binding = advance().text;
+            else
+                arm.binding = "_";
+        } else {
+            arm.pat = ast::MatchArm::Pat::TypePat;
+            arm.type_pattern = parse_type();
+            if (check(lex::Tok::Ident))             arm.binding = advance().text;
+            else if (check(lex::Tok::Underscore)) { advance(); arm.binding = "_"; }
+            if (accept(lex::Tok::LParen)) {                 // 解构:Point(.x, .y) / Rect(w, h)
+                if (!check(lex::Tok::RParen)) {
+                    for (;;) {
+                        if (accept(lex::Tok::Underscore))
+                            arm.sub.push_back("_");
+                        else if (accept(lex::Tok::Dot)) {
+                            if (!check(lex::Tok::Ident)) err("expected field name after '.'");
+                            arm.sub.push_back("." + advance().text);
+                        } else if (check(lex::Tok::Ident)) {
+                            arm.sub.push_back(advance().text);
+                        } else {
+                            err("expected binding, '.field' or '_' in destructuring pattern");
+                        }
+                        if (!accept(lex::Tok::Comma)) break;
+                    }
+                }
+                expect(lex::Tok::RParen, "')' to close destructuring pattern");
+            }
+        }
+
+        if (check(lex::Tok::If)) {                           // 守卫:pattern if cond =>
+            advance();
+            bool prev = cond_like_;
+            cond_like_ = true;
+            arm.guard = expression();
+            cond_like_ = prev;
+        }
+        expect(lex::Tok::FatArrow, "'=>' after match arm pattern");
+
+        if (expr_form) {
+            if (check(lex::Tok::LBrace)) {
+                arm.body = block();
+            } else {
+                auto e = expression();
+                accept(lex::Tok::Semi);                      // 臂尾分号可省(块前无歧义)
+                auto s = std::make_unique<ast::ExprStmt>();
+                s->line = e->line; s->col = e->col;
+                s->expr = std::move(e);
+                arm.body = std::move(s);
+            }
+        } else {
+            arm.body = check(lex::Tok::LBrace) ? block() : statement();
+        }
+        arms.push_back(std::move(arm));
     }
 
     ast::StmtP while_stmt()
@@ -886,6 +1083,28 @@ private:
         return e;
     }
 
+    // 匿名函数:函数声明去掉名字(DESIGN §4.6)。捕获:v0.1 隐式 [&] 按引用
+    // (显式捕获列表与 [self] 约定随后续里程碑落地,见 IMPLEMENTATION 偏差表)。
+    ast::ExprP lambda_expr()
+    {
+        auto l = std::make_unique<ast::LambdaExpr>();
+        l->line = peek().line; l->col = peek().col;
+        advance(); // (
+        l->params = param_list();
+        expect(lex::Tok::RParen, "')' to end lambda parameters");
+        if (accept(lex::Tok::Arrow)) l->ret = parse_type();
+        if (check(lex::Tok::Throws))
+            unsupported("'throws' lambda", "later milestone");
+        expect(lex::Tok::Assign, "'=' before lambda body");
+        if (check(lex::Tok::LBrace)) {
+            l->has_block_body = true;
+            l->block_body = block();
+        } else {
+            l->expr_body = expression();
+        }
+        return l;
+    }
+
     ast::ExprP primary()
     {
         switch (peek().tok) {
@@ -915,9 +1134,12 @@ private:
             n->parts.push_back(advance().text);
             while (accept_double_colon()) n->parts.push_back(require_ident());
             // StructLit:Name{.field = value, ...} 或 Name{}(空);
-            // 条件位置不接受空字面量,避免吞掉 if/while/for 的块括号
+            // 条件位置不接受空字面量,避免吞掉 if/while/for 的块括号;
+            // '.field' 后必须跟 '=' 才算字段初始化——match 臂的 '.member =>'
+            // 不是赋值形状,scrutinee 后的臂块不能被吞成 struct 字面量
             if (check(lex::Tok::LBrace)
-                && (peek(1).tok == lex::Tok::Dot
+                && ((peek(1).tok == lex::Tok::Dot && peek(2).tok == lex::Tok::Ident
+                     && peek(3).tok == lex::Tok::Assign)
                     || (peek(1).tok == lex::Tok::RBrace && !cond_like_))) {
                 auto lit = std::make_unique<ast::StructLitExpr>();
                 lit->line = n->line; lit->col = n->col;
@@ -939,6 +1161,14 @@ private:
             return n;
         }
         case lex::Tok::LParen: {
+            // 匿名函数(DESIGN §4.6):(x: int) -> int = x * x
+            // 识别:'(' 后跟 'name :'(普通表达式无此形状)或 '() ->'
+            if ((peek(1).tok == lex::Tok::Ident && peek(2).tok == lex::Tok::Colon
+                 && peek(3).tok != lex::Tok::Colon)
+                || (peek(1).tok == lex::Tok::RParen
+                    && peek(2).tok == lex::Tok::Arrow)) {
+                return lambda_expr();
+            }
             advance();
             auto p = std::make_unique<ast::ParenExpr>();
             p->line = peek().line; p->col = peek().col;
@@ -948,6 +1178,23 @@ private:
             cond_like_ = prev;
             expect(lex::Tok::RParen, "')'");
             return p;
+        }
+        case lex::Tok::Match: {                       // match 表达式(DESIGN §5.5)
+            auto x = std::make_unique<ast::MatchExpr>();
+            x->line = peek().line; x->col = peek().col;
+            advance(); // match
+            bool prev = cond_like_;
+            cond_like_ = true;
+            x->scrutinee = expression();
+            cond_like_ = prev;
+            expect(lex::Tok::LBrace, "'{' to start match arms");
+            while (!check(lex::Tok::RBrace)) {
+                if (check(lex::Tok::Eof)) err("expected '}' before end of file");
+                if (accept(lex::Tok::Semi)) continue;
+                parse_arm(x->arms, /*expr_form*/true);
+            }
+            expect(lex::Tok::RBrace, "'}' to end match");
+            return x;
         }
         case lex::Tok::LBracket:
         case lex::Tok::LBrace: {

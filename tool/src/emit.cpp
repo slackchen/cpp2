@@ -1,4 +1,4 @@
-// C++2 → C++23 发射器实现(M3:摊平 / 模块 / 桥接三种发射模式)
+// C++2 → C++23 发射器实现(M3 摊平/模块/桥接 + M2d 泛型/variant/match/lambda)
 #include "emit.hpp"
 
 #include <unordered_map>
@@ -12,6 +12,7 @@ int bin_prec(std::string const& op)
 {
     if (op == "||") return 1;
     if (op == "&&") return 2;
+    if (op == "=")  return 2;
     if (op == "==" || op == "!=") return 3;
     if (op == "<" || op == ">" || op == "<=" || op == ">=") return 4;
     if (op == "+" || op == "-") return 5;
@@ -42,8 +43,8 @@ std::string escape_path(std::string p)
 std::string prelude_includes()
 {
     return std::string("#include \"cpp2/support.hpp\"\n")
-         + "#include <cmath>\n#include <cstdint>\n#include <string>\n"
-           "#include <utility>\n#include <vector>\n";
+         + "#include <cmath>\n#include <cstdint>\n#include <optional>\n"
+           "#include <string>\n#include <utility>\n#include <variant>\n#include <vector>\n";
 }
 
 // "app.util" → {cpp2mod, app, util}(用于摊平模式的嵌套命名空间与 using)
@@ -68,6 +69,7 @@ public:
         m_ = &m; sema_ = &sema;
         src_ = escape_path(src);
         out_.clear(); indent_ = 0; last_line_ = -1; fresh_ = 0; checks_on_ = true;
+        suppress_line_ = false;
     }
 
     std::string take() { return std::move(out_); }
@@ -96,10 +98,12 @@ public:
         auto hoist = [&](std::string const& n) {
             s += "using " + q + "::" + n + ";\n";
         };
-        for (auto& e : m_->enums)   if (e.exported || hoist_all) hoist(e.name);
+        for (auto& e : m_->enums)    if (e.exported || hoist_all) hoist(e.name);
         for (auto& s2 : m_->structs) if (s2.exported || hoist_all) hoist(s2.name);
-        for (auto& g : m_->globals) if (g.exported || hoist_all) hoist(g.name);
-        for (auto& f : m_->funcs)   if (f.name != "main") hoist(f.name);
+        for (auto& v : m_->variants) if (v.exported || hoist_all) hoist(v.name);
+        for (auto& c : m_->concepts) if (c.exported || hoist_all) hoist(c.name);
+        for (auto& g : m_->globals)  if (g.exported || hoist_all) hoist(g.name);
+        for (auto& f : m_->funcs)    if (f.name != "main") hoist(f.name);
         return s;
     }
 
@@ -118,10 +122,12 @@ public:
         if (!e.is_root) {
             out_ += "module;\n" + prelude_includes() + "\n";
             bool any_export = false;
-            for (auto& f : m_->funcs)   if (f.exported) any_export = true;
-            for (auto& s : m_->structs) if (s.exported) any_export = true;
-            for (auto& en : m_->enums)  if (en.exported) any_export = true;
-            for (auto& g : m_->globals) if (g.exported) any_export = true;
+            for (auto& f : m_->funcs)    if (f.exported) any_export = true;
+            for (auto& s : m_->structs)  if (s.exported) any_export = true;
+            for (auto& en : m_->enums)   if (en.exported) any_export = true;
+            for (auto& v : m_->variants) if (v.exported) any_export = true;
+            for (auto& c : m_->concepts) if (c.exported) any_export = true;
+            for (auto& g : m_->globals)  if (g.exported) any_export = true;
             out_ += std::string(any_export ? "export module " : "module ") + m_->name + ";\n";
         } else {
             out_ += prelude_includes() + "\n";
@@ -130,9 +136,11 @@ public:
         if (!e.imports.empty()) out_ += "\n";
 
         // 导出实体(先原型,后定义;root TU 内同 TU 可见)
-        for (auto& en : m_->enums)   if (en.exported)  emit_enum(en, e.is_root ? "" : "export ");
-        for (auto& s : m_->structs)  if (s.exported)   emit_struct(s, e.is_root ? "" : "export ");
-        for (auto& g : m_->globals)  if (g.exported)   emit_global(g, e.is_root ? "" : "export ");
+        for (auto& en : m_->enums)    if (en.exported)  emit_enum(en, e.is_root ? "" : "export ");
+        for (auto& s : m_->structs)   if (s.exported)   emit_struct(s, e.is_root ? "" : "export ");
+        for (auto& v : m_->variants)  if (v.exported)   emit_variant(v, e.is_root ? "" : "export ");
+        for (auto& c : m_->concepts)  if (c.exported)   emit_concept(c, e.is_root ? "" : "export ");
+        for (auto& g : m_->globals)   if (g.exported)   emit_global(g, e.is_root ? "" : "export ");
 
         bool wrote_exported_proto = false;
         for (auto& f : m_->funcs) {
@@ -144,19 +152,23 @@ public:
 
         // 内部实体 → 匿名命名空间(内部链接;DESIGN §4.7)
         bool has_internal = false;
-        for (auto& en : m_->enums)   if (!en.exported) has_internal = true;
-        for (auto& s : m_->structs)  if (!s.exported) has_internal = true;
-        for (auto& g : m_->globals) if (!g.exported) has_internal = true;
-        for (auto& f : m_->funcs)    if (!f.exported && f.name != "main") has_internal = true;
+        for (auto& en : m_->enums)    if (!en.exported) has_internal = true;
+        for (auto& s : m_->structs)   if (!s.exported) has_internal = true;
+        for (auto& v : m_->variants)  if (!v.exported) has_internal = true;
+        for (auto& c : m_->concepts)  if (!c.exported) has_internal = true;
+        for (auto& g : m_->globals)   if (!g.exported) has_internal = true;
+        for (auto& f : m_->funcs)     if (!f.exported && f.name != "main") has_internal = true;
         if (has_internal) {
             out_ += "namespace {\n\n";
             ++indent_;
-            for (auto& en : m_->enums)   if (!en.exported) emit_enum(en);
-            for (auto& s : m_->structs)  if (!s.exported) emit_struct(s);
-            for (auto& g : m_->globals) if (!g.exported) emit_global(g);
-            for (auto& f : m_->funcs)    if (!f.exported && f.name != "main") emit_prototype(f);
+            for (auto& en : m_->enums)    if (!en.exported) emit_enum(en);
+            for (auto& s : m_->structs)   if (!s.exported) emit_struct(s);
+            for (auto& v : m_->variants)  if (!v.exported) emit_variant(v);
+            for (auto& c : m_->concepts)  if (!c.exported) emit_concept(c);
+            for (auto& g : m_->globals)   if (!g.exported) emit_global(g);
+            for (auto& f : m_->funcs)     if (!f.exported && f.name != "main") emit_prototype(f);
             out_ += "\n";
-            for (auto& f : m_->funcs)    if (!f.exported && f.name != "main") emit_definition(f);
+            for (auto& f : m_->funcs)     if (!f.exported && f.name != "main") emit_definition(f);
             --indent_;
             out_ += "} // namespace\n\n";
         }
@@ -181,6 +193,8 @@ public:
         out_ += prelude_includes() + "\n";
         for (auto& en : m_->enums)   if (en.exported) emit_enum(en);
         for (auto& s : m_->structs)  if (s.exported) emit_struct(s);
+        for (auto& v : m_->variants) if (v.exported) emit_variant(v);
+        for (auto& c : m_->concepts) if (c.exported) emit_concept(c);
         for (auto& g : m_->globals)  if (g.exported) {
             sync_line(g.line);
             out_ += "extern " + type_str(g.type) + " " + g.name + ";\n";
@@ -234,6 +248,7 @@ private:
     int last_line_ = -1;
     int fresh_ = 0;
     bool checks_on_ = true;
+    bool suppress_line_ = false;      // 表达式内嵌语句序列(lambda/match 体)禁用 #line
     // post 契约发射状态:old(...) → 入口缓存变量;result → __c2_result
     // (throws 函数包 expected 需解引用;普通函数直接引用)
     std::unordered_map<ast::Expr*, std::string> const* old_names_ = nullptr;
@@ -243,12 +258,15 @@ private:
     sema::Type type_of(ast::Expr& e) const { return sema_->type_of(e); }
 
     // ── 声明序列(命名空间/匿名块内部通用;main 除外)──────────────
+    // 顺序:enum → struct → variant → concept(替身引用结构体;概念被函数用)
     void decls(bool emit_main, bool)
     {
-        for (auto& e : m_->enums)   emit_enum(e);
-        for (auto& s : m_->structs) emit_struct(s);
-        for (auto& g : m_->globals) emit_global(g);
-        for (auto& f : m_->funcs)   if (f.name != "main") emit_prototype(f);
+        for (auto& e : m_->enums)    emit_enum(e);
+        for (auto& s : m_->structs)  emit_struct(s);
+        for (auto& v : m_->variants) emit_variant(v);
+        for (auto& c : m_->concepts) emit_concept(c);
+        for (auto& g : m_->globals)  emit_global(g);
+        for (auto& f : m_->funcs)    if (f.name != "main") emit_prototype(f);
         out_ += "\n";
         for (auto& f : m_->funcs) {
             if (f.name == "main" && !emit_main) continue;
@@ -289,6 +307,7 @@ private:
             }
             s += ">";
         }
+        if (t.is_optional) s = "std::optional<" + s + ">";   // T?(M2d,DESIGN §6.4)
         if (t.is_const) s += " const";
         return s;
     }
@@ -347,6 +366,9 @@ private:
             auto& n = static_cast<ast::NameExpr&>(e);
             if (in_post_ && n.parts.size() == 1 && n.parts[0] == "result")
                 return result_wrapped_ ? "(*__c2_result)" : "__c2_result";
+            if (n.parts.size() == 1 && n.parts[0] == "none"
+                && type_of(e).kind == sema::Type::NoneVal)
+                return "std::nullopt";        // 空 optional(DESIGN §6.4)
             return name_expr_str(n);
         }
         case ast::Expr::Paren:
@@ -364,6 +386,16 @@ private:
                 auto& name = static_cast<ast::NameExpr&>(*c.callee);
                 if (name.parts.size() == 1 && name.parts[0] == "err")
                     return "cpp2::err(" + expr(*c.args[0]) + check_loc(c.line) + ")";
+            }
+            // UFCS:x.f(args) → f(x, args)(DESIGN §4.7;sema 已定向)
+            if (c.callee->kind() == ast::Expr::Member) {
+                std::string target = sema_->ufcs_of(c);
+                if (!target.empty()) {
+                    auto& mem = static_cast<ast::MemberExpr&>(*c.callee);
+                    std::string s = target + "(" + expr(*mem.base);
+                    for (auto& a : c.args) s += ", " + expr(*a);
+                    return s + ")";
+                }
             }
             std::string s = expr(*c.callee) + "(";
             for (size_t i = 0; i < c.args.size(); ++i) {
@@ -489,6 +521,12 @@ private:
             // 走到这里说明 sema 漏检——发射防御性标记,生成码编译期暴露
             return "/*internal:'?' outside statement position*/ ("
                  + expr(*static_cast<ast::TryExpr&>(e).operand) + ")";
+        case ast::Expr::Match:
+            // match 产值:提升为 IIFE 语句,返回值变量(sema 限定语句级位置;
+            // 语句行随后拼接,提升行先落 out_,顺序正确)
+            return emit_match_value(static_cast<ast::MatchExpr&>(e));
+        case ast::Expr::Lambda:
+            return emit_lambda(static_cast<ast::LambdaExpr&>(e));
         }
         return "/*?*/";
     }
@@ -524,10 +562,32 @@ private:
 
     void sync_line(int line)
     {
+        if (suppress_line_) return;
         if (line > 0 && line != last_line_) {
             out_ += "#line " + std::to_string(line) + " \"" + src_ + "\"\n";
             last_line_ = line;
         }
+    }
+
+    // 表达式内嵌语句序列(lambda 体 / match 表达式体):独立缓冲渲染。
+    // #line 指令不能出现在表达式中间,故整体禁用(位置由外围语句的 sync_line 承担)。
+    template <class F>
+    std::string render_nested(F&& fn)
+    {
+        std::string save = std::move(out_);
+        int save_indent = indent_;
+        int save_line = last_line_;
+        bool save_sup = suppress_line_;
+        out_.clear();
+        last_line_ = -1;
+        suppress_line_ = true;
+        fn();
+        std::string body = std::move(out_);
+        out_ = std::move(save);
+        indent_ = save_indent;
+        last_line_ = save_line;
+        suppress_line_ = save_sup;
+        return body;
     }
 
     void emit_body(ast::Stmt& s)
@@ -710,30 +770,276 @@ private:
         out_ += pad() + "}\n";
     }
 
-    // match f() { ok x => ...; err e => ...; }:has_value() 分支链(M2c 两臂)
+    // ── 模式匹配(M2d,DESIGN §4.5/§5.4/§5.5)─────────────────────────
+    // scrutinee 类型分类:决定条件与访问的降低形态
+    struct MatchInfo {
+        enum class Kind { Expected, Optional, Enum, Variant, Struct, Bad } kind = Kind::Bad;
+        std::string enum_name;
+        ast::VariantDecl* vd = nullptr;
+        ast::StructDecl* sd = nullptr;
+    };
+
+    MatchInfo match_info_of(ast::Expr& scrut)
+    {
+        sema::Type t = type_of(scrut);
+        MatchInfo mi;
+        if (t.is_expected)                          mi.kind = MatchInfo::Kind::Expected;
+        else if (t.is_optional)                     mi.kind = MatchInfo::Kind::Optional;
+        else if (t.kind == sema::Type::Variant) {
+            mi.kind = MatchInfo::Kind::Variant;
+            mi.vd = m_->find_variant(t.name);
+        } else if (t.kind == sema::Type::NamedStruct) {
+            mi.kind = MatchInfo::Kind::Struct;
+            mi.sd = m_->find_struct(t.name);
+        } else if (t.kind == sema::Type::NamedEnum) {
+            mi.kind = MatchInfo::Kind::Enum;
+            mi.enum_name = t.name;
+        }
+        return mi;
+    }
+
+    // 模式类型在 variant 中的替身(sema 已按规范化键校验存在)
+    std::string variant_alt_str(ast::VariantDecl& vd, ast::TypeUse const& pattern)
+    {
+        std::string want = type_str(pattern);
+        for (auto& alt : vd.alternatives)
+            if (type_str(alt) == want) return want;
+        return want;
+    }
+
+    // 臂链:线性 else-if;守卫臂在其 else 分支递归续链(守卫失败 → 落入后续臂)
+    void emit_arm_chain(std::vector<ast::MatchArm>& arms, size_t from, MatchInfo const& mi,
+                        std::string const& tmp, bool value_form, std::string const& ret_cpp)
+    {
+        for (size_t k = from; k < arms.size(); ++k) {
+            auto& arm = arms[k];
+            bool last = k + 1 == arms.size();
+
+            if (arm.pat == ast::MatchArm::Pat::Wildcard) {
+                out_ += pad() + "} else {\n";       // '_' 只能是最后一臂(sema 保证)
+                ++indent_;
+                emit_arm_body(arm, value_form, ret_cpp);
+                --indent_;
+                out_ += pad() + "}\n";
+                return;
+            }
+
+            std::string cond;
+            switch (arm.pat) {
+            case ast::MatchArm::Pat::Ok:
+            case ast::MatchArm::Pat::Some:
+                cond = tmp + ".has_value()";
+                break;
+            case ast::MatchArm::Pat::Err:
+            case ast::MatchArm::Pat::None:
+                cond = "!" + tmp + ".has_value()";
+                break;
+            case ast::MatchArm::Pat::EnumMember:
+                cond = tmp + " == " + mi.enum_name + "::" + arm.enum_member;
+                break;
+            case ast::MatchArm::Pat::TypePat:
+                if (mi.kind == MatchInfo::Kind::Variant && mi.vd)
+                    cond = "std::holds_alternative<" + variant_alt_str(*mi.vd, arm.type_pattern)
+                          + ">(" + tmp + ")";
+                else
+                    cond = "true";                  // struct 自身模式:恒真
+                break;
+            case ast::MatchArm::Pat::Wildcard:
+                break;
+            }
+
+            out_ += pad() + (k == from ? "if (" : "} else if (") + cond + ") {\n";
+            ++indent_;
+
+            auto emit_binding = [&](std::string const& name, std::string const& access) {
+                if (name.empty() || name == "_") return;
+                std::string line = pad();
+                line += "auto&& ";
+                line += name;
+                line += " = ";
+                line += access;
+                line += ";\n";
+                out_ += line;
+            };
+            if (arm.pat == ast::MatchArm::Pat::Ok || arm.pat == ast::MatchArm::Pat::Some)
+                emit_binding(arm.binding, "*" + tmp);
+            else if (arm.pat == ast::MatchArm::Pat::Err)
+                emit_binding(arm.binding, tmp + ".error()");
+            else if (arm.pat == ast::MatchArm::Pat::TypePat) {
+                std::string base_access;
+                if (mi.kind == MatchInfo::Kind::Variant && mi.vd)
+                    base_access = "std::get<" + variant_alt_str(*mi.vd, arm.type_pattern)
+                                + ">(" + tmp + ")";
+                else
+                    base_access = tmp;              // struct 自身模式
+                if (!arm.sub.empty()) {
+                    // sema 注记形态:".field=binding"(位置/命名字段统一;含替身结构体解析)
+                    for (size_t i = 0; i < arm.sub.size(); ++i) {
+                        std::string const& sp = arm.sub[i];
+                        if (sp == "_") continue;
+                        size_t eq = sp.find('=');
+                        if (sp.size() > 1 && sp[0] == '.' && eq != std::string::npos)
+                            emit_binding(sp.substr(eq + 1),
+                                         base_access + "." + sp.substr(1, eq - 1));
+                    }
+                } else {
+                    emit_binding(arm.binding, base_access);
+                }
+            }
+
+            if (arm.guard) {
+                // 守卫臂:两条失败路径都要续链——守卫失败(else)与模式不匹配
+                // (外层 else);余链在每个分支各发一份(g 守卫臂 → 2^g 膨胀,v0.1 接受)
+                out_ += pad() + "if (" + expr(*arm.guard) + ") {\n";
+                ++indent_;
+                emit_arm_body(arm, value_form, ret_cpp);
+                --indent_;
+                out_ += pad() + "} else {\n";
+                ++indent_;
+                emit_arm_chain(arms, k + 1, mi, tmp, value_form, ret_cpp);
+                --indent_;
+                out_ += pad() + "}\n";
+                --indent_;
+                out_ += pad() + "} else {\n";
+                ++indent_;
+                emit_arm_chain(arms, k + 1, mi, tmp, value_form, ret_cpp);
+                --indent_;
+                out_ += pad() + "}\n";
+                return;
+            }
+            emit_arm_body(arm, value_form, ret_cpp);
+            --indent_;
+            if (last) {
+                // 穷尽性由 sema 保证;值形式的 IIFE 补不可达 trap,
+                // 消除"并非所有路径都返回"警告并留运行时防御网
+                if (value_form) {
+                    out_ += pad() + "} else {\n";
+                    ++indent_;
+                    out_ += pad() + "cpp2::trap(\"unreachable match arm\""
+                          + check_loc(arm.line) + ");\n";
+                    --indent_;
+                    out_ += pad() + "}\n";
+                } else {
+                    out_ += pad() + "}\n";
+                }
+            }
+        }
+    }
+
+    // 臂体:语句形式原样;值形式 return 表达式(块体取尾表达式为返回值)
+    void emit_arm_body(ast::MatchArm& arm, bool value_form, std::string const& ret_cpp)
+    {
+        if (!value_form) {
+            emit_body(*arm.body);
+            return;
+        }
+        auto& b = *arm.body;
+        if (b.kind() == ast::Stmt::ExprStmt) {
+            out_ += pad() + "return ("
+                  + expr(*static_cast<ast::ExprStmt&>(b).expr) + ");\n";
+            return;
+        }
+        if (b.kind() == ast::Stmt::Block) {
+            auto& blk = static_cast<ast::BlockStmt&>(b);
+            bool returns_value = !ret_cpp.empty() && ret_cpp != "void";
+            for (size_t i = 0; i < blk.stmts.size(); ++i) {
+                bool tail = returns_value && i + 1 == blk.stmts.size()
+                            && blk.stmts[i]->kind() == ast::Stmt::ExprStmt;
+                if (tail)
+                    out_ += pad() + "return ("
+                          + expr(*static_cast<ast::ExprStmt&>(*blk.stmts[i]).expr) + ");\n";
+                else
+                    emit_stmt(*blk.stmts[i]);
+            }
+            return;
+        }
+        emit_stmt(b);
+    }
+
+    // match v { ... } 语句形式:块内臂链(scrutinee 求值一次)
     void emit_match(ast::MatchStmt& x)
     {
         std::string tmp = "__c2_m_" + std::to_string(fresh_++);
+        MatchInfo mi = match_info_of(*x.scrutinee);
+        sync_line(x.line);
         out_ += pad() + "{\n";
         ++indent_;
         out_ += pad() + "auto&& " + tmp + " = (" + expr(*x.scrutinee) + ");\n";
-        for (size_t k = 0; k < x.arms.size(); ++k) {
-            auto& arm = x.arms[k];
-            std::string cond = arm.is_ok ? tmp + ".has_value()"
-                                         : "!" + tmp + ".has_value()";
-            if (k == 0)                      out_ += pad() + "if (" + cond + ") {\n";
-            else if (k + 1 < x.arms.size())  out_ += pad() + "} else if (" + cond + ") {\n";
-            else                             out_ += pad() + "} else {\n";
-            ++indent_;
-            if (arm.binding != "_")
-                out_ += pad() + "auto&& " + arm.binding + " = "
-                      + (arm.is_ok ? "*" + tmp : tmp + ".error()") + ";\n";
-            emit_body(*arm.body);
-            --indent_;
-        }
-        out_ += pad() + "}\n";
+        emit_arm_chain(x.arms, 0, mi, tmp, /*value_form*/false, "");
         --indent_;
         out_ += pad() + "}\n";
+    }
+
+    // match v { ... } 值形式:IIFE 产值为提升变量(语句位置消费)
+    std::string emit_match_value(ast::MatchExpr& x)
+    {
+        std::string var = "__c2_mv_" + std::to_string(fresh_++);
+        MatchInfo mi = match_info_of(*x.scrutinee);
+        std::string ret_cpp = sema_type_cpp(type_of(x));
+        sync_line(x.line);
+        out_ += pad() + "auto " + var + " = [&]()"
+              + (ret_cpp.empty() ? "" : " -> " + ret_cpp) + " {\n";
+        ++indent_;
+        std::string tmp = "__c2_m_" + std::to_string(fresh_++);
+        out_ += pad() + "auto&& " + tmp + " = (" + expr(*x.scrutinee) + ");\n";
+        emit_arm_chain(x.arms, 0, mi, tmp, /*value_form*/true, ret_cpp);
+        --indent_;
+        out_ += pad() + "}();\n";
+        return var;
+    }
+
+    // sema 类型 → C++ 类型串(值形式 match 的返回类型标注;未知 → 省略由推导)
+    std::string sema_type_cpp(sema::Type const& t)
+    {
+        if (t.is_optional) return "std::optional<" + sema_type_cpp(t.val()) + ">";
+        switch (t.kind) {
+        case sema::Type::Bool: return "bool";
+        case sema::Type::Char: return "char";
+        case sema::Type::Float: return "float";
+        case sema::Type::Double: return "double";
+        case sema::Type::String: return "std::string";
+        case sema::Type::StringView: return "std::string_view";
+        case sema::Type::NamedStruct:
+        case sema::Type::NamedEnum:
+        case sema::Type::Variant:
+        case sema::Type::Generic:
+            return t.name;
+        case sema::Type::Container:
+            return map_type_name(t.name) + "<" + sema_type_cpp(t.elem()) + ">";
+        default:
+            return cpp_type_of(t);
+        }
+    }
+
+    // 匿名函数(DESIGN §4.6):[&](params) -> ret { body }。
+    // 块体经缓冲交换用语句发射器生成;体在表达式中间多行合法。
+    std::string emit_lambda(ast::LambdaExpr& l)
+    {
+        std::string header = "[&](" + params_str(l.params, /*with_defaults*/true) + ")";
+        if (l.ret) header += " -> " + type_str(*l.ret);
+
+        std::string buf;
+        std::swap(out_, buf);
+        ++indent_;
+        if (l.has_block_body && l.block_body) {
+            auto& blk = static_cast<ast::BlockStmt&>(*l.block_body);
+            bool returns_value = l.ret && type_str(*l.ret) != "void";
+            for (size_t i = 0; i < blk.stmts.size(); ++i) {
+                bool tail = returns_value && i + 1 == blk.stmts.size()
+                            && blk.stmts[i]->kind() == ast::Stmt::ExprStmt;
+                if (tail)
+                    out_ += pad() + "return ("
+                          + expr(*static_cast<ast::ExprStmt&>(*blk.stmts[i]).expr) + ");\n";
+                else
+                    emit_stmt(*blk.stmts[i]);
+            }
+        } else if (l.expr_body) {
+            sync_line(l.expr_body->line);
+            out_ += pad() + "return (" + expr(*l.expr_body) + ");\n";
+        }
+        --indent_;
+        std::swap(out_, buf);
+        return header + " {\n" + buf + pad() + "}";
     }
 
     void emit_if_inline(ast::IfStmt& i)
@@ -785,11 +1091,19 @@ private:
     }
 
     // ── 声明 ───────────────────────────────────────────────────────
+    // 泛型函数的 In 参数改发 "T const&":cpp2::in<T>(conditional_t)
+    // 是不可推导上下文,模板实参无法从调用点推得(v0.1 偏差,见 IMPLEMENTATION)
+    std::unordered_set<std::string> const* generic_params_ = nullptr;
+
     std::string param_str(ast::Param const& p, bool with_default)
     {
         std::string res;
+        bool generic_in = p.mode == ast::ParamMode::In && generic_params_;
         switch (p.mode) {
-        case ast::ParamMode::In:      res = "cpp2::in<" + type_str(p.type) + "> " + p.name; break;
+        case ast::ParamMode::In:
+            if (generic_in) res = type_str(p.type) + " const& " + p.name;
+            else            res = "cpp2::in<" + type_str(p.type) + "> " + p.name;
+            break;
         case ast::ParamMode::Inout:
         case ast::ParamMode::Out:     res = type_str(p.type) + "& " + p.name; break;
         case ast::ParamMode::Move:    res = type_str(p.type) + "&& " + p.name; break;
@@ -893,6 +1207,62 @@ private:
         }
         case ast::Expr::Must:
             return collect_olds(*static_cast<ast::MustExpr&>(e).operand, out);
+        case ast::Expr::Match: {
+            auto& x = static_cast<ast::MatchExpr&>(e);
+            collect_olds(*x.scrutinee, out);
+            for (auto& arm : x.arms) {
+                if (arm.guard) collect_olds(*arm.guard, out);
+                if (arm.body) collect_olds_stmt(*arm.body, out);
+            }
+            return;
+        }
+        case ast::Expr::Lambda: {
+            auto& l = static_cast<ast::LambdaExpr&>(e);
+            for (auto& p : l.params)
+                if (p.default_value) collect_olds(*p.default_value, out);
+            if (l.expr_body) collect_olds(*l.expr_body, out);
+            if (l.has_block_body && l.block_body)
+                collect_olds_stmt(*l.block_body, out);
+            return;
+        }
+        }
+    }
+
+    // 语句里的 old(...)(match 臂 / lambda 块体)
+    void collect_olds_stmt(ast::Stmt& s,
+                           std::unordered_map<ast::Expr*, std::string>& out)
+    {
+        switch (s.kind()) {
+        case ast::Stmt::ExprStmt: {
+            auto& x = static_cast<ast::ExprStmt&>(s);
+            if (x.expr) collect_olds(*x.expr, out);
+            return;
+        }
+        case ast::Stmt::Return: {
+            auto& r = static_cast<ast::ReturnStmt&>(s);
+            if (r.value) collect_olds(*r.value, out);
+            return;
+        }
+        case ast::Stmt::Var: {
+            auto& v = static_cast<ast::VarStmt&>(s);
+            if (v.init) collect_olds(*v.init, out);
+            return;
+        }
+        case ast::Stmt::If: {
+            auto& i = static_cast<ast::IfStmt&>(s);
+            if (i.cond) collect_olds(*i.cond, out);
+            if (i.let_init) collect_olds(*i.let_init, out);
+            if (i.then_block) collect_olds_stmt(*i.then_block, out);
+            if (i.else_block) collect_olds_stmt(*i.else_block, out);
+            return;
+        }
+        case ast::Stmt::Block: {
+            for (auto& st : static_cast<ast::BlockStmt&>(s).stmts)
+                collect_olds_stmt(*st, out);
+            return;
+        }
+        default:
+            return;
         }
     }
 
@@ -978,25 +1348,83 @@ private:
             emit_body(*block);
         } else if (body_expr) {
             bool returns = ret.has_value() && type_str(*ret) != "void";
+            if (body_expr->kind() == ast::Expr::Try) {
+                // 短体 f: () -> R throws = g()?;:失败提前 return unexpected
+                sync_line(line);
+                std::string tmp = emit_try_core(static_cast<ast::TryExpr&>(*body_expr));
+                out_ += pad() + (returns ? "return *std::move(" + tmp + ");"
+                                         : "(void)(" + tmp + ");") + "\n";
+                return;
+            }
             sync_line(line);
+            // match 值经 expr() 提升为语句(见 emit_match_value),此处消费变量
             out_ += pad() + (returns ? "return " : "(void)(")
                   + expr(*body_expr) + (returns ? ";\n" : ");\n");
         }
     }
 
+    // 泛型模板头:template <class T, ...> requires Ordered<T> && ...(DESIGN §5.6)
+    std::string template_header(ast::FuncDecl& f)
+    {
+        std::string s = "template <";
+        for (size_t i = 0; i < f.type_params.size(); ++i) {
+            if (i) s += ", ";
+            s += "class " + f.type_params[i].name;
+        }
+        s += ">";
+        std::string reqs;
+        auto join_parts = [](std::vector<std::string> const& parts) {
+            std::string r;
+            for (size_t i = 0; i < parts.size(); ++i)
+                r += (i ? "::" : "") + parts[i];
+            return r;
+        };
+        for (auto& tp : f.type_params) {
+            if (tp.concept_parts.empty()) continue;
+            if (!reqs.empty()) reqs += " && ";
+            reqs += join_parts(tp.concept_parts) + "<" + tp.name + ">";
+        }
+        for (auto& r : f.requires_list) {
+            if (!reqs.empty()) reqs += " && ";
+            reqs += join_parts(r.name_parts);
+            if (!r.args.empty()) {
+                reqs += "<";
+                for (size_t i = 0; i < r.args.size(); ++i) {
+                    if (i) reqs += ", ";
+                    reqs += r.args[i];
+                }
+                reqs += ">";
+            }
+        }
+        if (!reqs.empty()) s += " requires " + reqs;
+        return s;
+    }
+
     void emit_prototype(ast::FuncDecl& f, std::string const& prefix = "")
     {
         sync_line(f.line);
+        std::unordered_set<std::string> tp;
+        for (auto& t : f.type_params) tp.insert(t.name);
+        generic_params_ = f.type_params.empty() ? nullptr : &tp;
+        if (!f.type_params.empty())
+            out_ += prefix + template_header(f) + "\n";
         out_ += prefix + signature(f, /*with_defaults*/true) + ";\n";
+        generic_params_ = nullptr;
     }
 
     void emit_definition(ast::FuncDecl& f)
     {
         sync_line(f.line);
+        std::unordered_set<std::string> tp;
+        for (auto& t : f.type_params) tp.insert(t.name);
+        generic_params_ = f.type_params.empty() ? nullptr : &tp;
+        if (!f.type_params.empty())
+            out_ += template_header(f) + "\n";
         out_ += signature(f, /*with_defaults*/false) + "\n{\n";
         emit_body_of(f.name, f.throws, f.pre.get(), f.post.get(),
                      f.has_block_body, f.block_body.get(), f.expr_body.get(), f.ret, f.line);
         out_ += "}\n\n";
+        generic_params_ = nullptr;
     }
 
     void emit_global(ast::GlobalVar& g, std::string const& prefix = "")
@@ -1019,6 +1447,69 @@ private:
             out_ += e.members[i];
         }
         out_ += " };\n";
+    }
+
+    // Value: variant = { int, string } → using Value = std::variant<int, std::string>;
+    // (DESIGN §5.5:类型安全联合,match 是唯一合法访问)
+    void emit_variant(ast::VariantDecl& v, std::string const& prefix = "")
+    {
+        sync_line(v.line);
+        out_ += prefix + "using " + v.name + " = std::variant<";
+        for (size_t i = 0; i < v.alternatives.size(); ++i) {
+            if (i) out_ += ", ";
+            out_ += type_str(v.alternatives[i]);
+        }
+        out_ += ">;\n";
+    }
+
+    // Ordered: concept = { operator<: (that: self) -> bool; } →
+    // template <class __c2_Self> concept Ordered = requires(__c2_Self __c2_s) {
+    //     __c2_s < __c2_s; };  (DESIGN §5.6;满足性判定委托 C++20 concept)
+    static std::string op_symbol(std::string const& name)
+    {
+        if (name == "operator<")  return "<";
+        if (name == "operator>")  return ">";
+        if (name == "operator<=") return "<=";
+        if (name == "operator>=") return ">=";
+        if (name == "operator==") return "==";
+        if (name == "operator!=") return "!=";
+        if (name == "operator+")  return "+";
+        if (name == "operator-")  return "-";
+        if (name == "operator*")  return "*";
+        if (name == "operator/")  return "/";
+        return "";
+    }
+
+    void emit_concept(ast::ConceptDecl& c, std::string const& prefix = "")
+    {
+        auto is_self = [](ast::TypeUse const& tu) {
+            return tu.parts.size() == 1 && tu.parts[0] == "self";
+        };
+        auto operand = [&](ast::Param const& p) {
+            return is_self(p.type) ? std::string("__c2_s")
+                                   : "std::declval<" + type_str(p.type) + ">()";
+        };
+        sync_line(c.line);
+        out_ += prefix + "template <class __c2_Self>\n"
+              + prefix + "concept " + c.name + " = requires(__c2_Self __c2_s) {\n";
+        ++indent_;
+        for (auto& req : c.reqs) {
+            sync_line(req.line);
+            if (std::string op = op_symbol(req.name); !op.empty()) {
+                std::string rhs = "__c2_s";
+                if (req.params.size() >= 2) rhs = operand(req.params[1]);
+                out_ += pad() + "__c2_s " + op + " " + rhs + ";\n";
+            } else {
+                std::string args;
+                for (size_t i = 0; i < req.params.size(); ++i) {
+                    if (i) args += ", ";
+                    args += operand(req.params[i]);
+                }
+                out_ += pad() + "__c2_s." + req.name + "(" + args + ");\n";
+            }
+        }
+        --indent_;
+        out_ += "};\n";
     }
 
     void emit_struct(ast::StructDecl& s, std::string const& prefix = "")

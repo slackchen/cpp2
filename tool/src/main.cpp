@@ -1,4 +1,4 @@
-// cpp2 命令行工具(M4:build / run / transpile / export-headers / audit / fuzz)
+// cpp2 命令行工具(M2e:build / run / check / transpile / export-headers / audit / fuzz)
 #include "ast.hpp"
 #include "audit.hpp"
 #include "emit.hpp"
@@ -7,11 +7,14 @@
 #include "modules.hpp"
 #include "parser.hpp"
 #include "sema.hpp"
+#include "sha256.hpp"
 #include "toolchain.hpp"
 #include "util.hpp"
 
 #include <atomic>
+#include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -32,13 +35,14 @@ namespace sema  = cpp2::sema;
 namespace emit  = cpp2::emit;
 namespace mods  = cpp2::mods;
 namespace util  = cpp2::util;
+namespace sha256 = cpp2::sha256;
 namespace tc    = cpp2::toolchain;
 namespace audit = cpp2::audit;
 namespace fuzz  = cpp2::fuzz;
 
 namespace {
 
-constexpr char const* kVersion = "cpp2 0.1.0-m2c (error channel + contracts)";
+constexpr char const* kVersion = "cpp2 0.1.0-m2e (check CLI, .c2i v1 frozen: binary + sha256)";
 
 std::optional<std::string> read_file(fs::path const& p)
 {
@@ -151,13 +155,49 @@ std::optional<fs::path> find_rt_dir(fs::path const& input)
     return std::nullopt;
 }
 
-// ── .cpp2cache:每模块缓存记录(.c2i 文本种子)─────────────────────
+// ── .cpp2cache:每模块缓存记录(.c2i 格式 v1,冻结)─────────────────
+// 布局(小端):magic "C2IF" | u32 version=1 | u32 name_len + 模块名 |
+//   4 × 32B SHA-256(src / iface / gen / deps)| u64 len + 接口规范化文本
+// magic 或版本不符 → 视为无缓存(旧文本格式自然失效重建)。
 struct CacheRec {
     std::string src_hash;       // 源文本哈希 → 是否需要重转译
     std::string iface_hash;     // 导出接口哈希 → 依赖者是否需要重编
     std::string gen_hash;       // 生成文件哈希
     std::string deps_hash;      // 直接依赖的 iface 组合
 };
+
+constexpr char kC2ifMagic[4] = {'C', '2', 'I', 'F'};
+constexpr std::uint32_t kC2ifVersion = 1;
+
+void put_u32(std::string& o, std::uint32_t v)
+{
+    for (int i = 0; i < 4; ++i) o.push_back(char((v >> (i * 8)) & 0xff));
+}
+
+void put_u64(std::string& o, std::uint64_t v)
+{
+    for (int i = 0; i < 8; ++i) o.push_back(char((v >> (i * 8)) & 0xff));
+}
+
+bool get_u32(std::string const& s, size_t& pos, std::uint32_t& v)
+{
+    if (pos + 4 > s.size()) return false;
+    v = 0;
+    for (int i = 3; i >= 0; --i)
+        v = (v << 8) | std::uint8_t(s[pos + i]);
+    pos += 4;
+    return true;
+}
+
+bool get_u64(std::string const& s, size_t& pos, std::uint64_t& v)
+{
+    if (pos + 8 > s.size()) return false;
+    v = 0;
+    for (int i = 7; i >= 0; --i)
+        v = (v << 8) | std::uint8_t(s[pos + i]);
+    pos += 8;
+    return true;
+}
 
 std::string cache_path(fs::path const& build_dir, std::string const& mod)
 {
@@ -166,36 +206,54 @@ std::string cache_path(fs::path const& build_dir, std::string const& mod)
 
 std::optional<CacheRec> read_cache(fs::path const& build_dir, std::string const& mod)
 {
-    auto txt = read_file(cache_path(build_dir, mod));
-    if (!txt) return std::nullopt;
+    auto blob = read_file(cache_path(build_dir, mod));
+    if (!blob || blob->size() < 8) return std::nullopt;
+    if (std::memcmp(blob->data(), kC2ifMagic, 4) != 0) return std::nullopt;
+    size_t pos = 4;
+    std::uint32_t version = 0;
+    if (!get_u32(*blob, pos, version) || version != kC2ifVersion) return std::nullopt;
+
+    std::uint32_t name_len = 0;
+    if (!get_u32(*blob, pos, name_len) || pos + name_len > blob->size()) return std::nullopt;
+    std::string name = blob->substr(pos, name_len);
+    pos += name_len;
+    if (name != mod) return std::nullopt;               // 安全名碰撞防护
+
+    auto take_hash = [&](std::string& out) -> bool {
+        if (pos + 32 > blob->size()) return false;
+        out = sha256::hex_of_bytes(blob->data() + pos);
+        pos += 32;
+        return true;
+    };
     CacheRec r;
-    std::istringstream in(*txt);
-    std::string line;
-    while (std::getline(in, line)) {
-        if (line.rfind("--", 0) == 0) break;        // "--" 之后是接口文本,非键值
-        std::istringstream ls(line);
-        std::string key, val;
-        if (ls >> key >> val) {
-            if (key == "src")         r.src_hash = val;
-            else if (key == "iface")  r.iface_hash = val;
-            else if (key == "gen")    r.gen_hash = val;
-            else if (key == "deps")   r.deps_hash = val;
-        }
-    }
+    if (!take_hash(r.src_hash) || !take_hash(r.iface_hash)
+        || !take_hash(r.gen_hash) || !take_hash(r.deps_hash)) return std::nullopt;
+
+    std::uint64_t text_len = 0;
+    if (!get_u64(*blob, pos, text_len) || pos + text_len > blob->size()) return std::nullopt;
+    pos += text_len;                                    // 接口文本:调试可读,哈希已含
     return r;
 }
 
 void write_cache(fs::path const& build_dir, std::string const& mod, CacheRec const& r,
                  std::string const& iface_text)
 {
-    std::ostringstream o;
-    o << "module " << mod << "\n"
-      << "src " << r.src_hash << "\n"
-      << "iface " << r.iface_hash << "\n"
-      << "gen " << r.gen_hash << "\n"
-      << "deps " << r.deps_hash << "\n"
-      << "--\n" << iface_text;
-    write_file(cache_path(build_dir, mod), o.str());
+    auto put_hash = [](std::string& o, std::string const& hex32) {
+        auto d = sha256::digest_from_hex(hex32);
+        o.append(reinterpret_cast<char const*>(d.data()), d.size());
+    };
+    std::string o;
+    o.append(kC2ifMagic, 4);
+    put_u32(o, kC2ifVersion);
+    put_u32(o, static_cast<std::uint32_t>(mod.size()));
+    o += mod;
+    put_hash(o, r.src_hash);
+    put_hash(o, r.iface_hash);
+    put_hash(o, r.gen_hash);
+    put_hash(o, r.deps_hash);
+    put_u64(o, iface_text.size());
+    o += iface_text;
+    write_file(cache_path(build_dir, mod), o);
 }
 
 // ── 子命令 ────────────────────────────────────────────────────────
@@ -219,6 +277,19 @@ int cmd_transpile(std::vector<std::string> const& args)
         return 1;
     }
     std::cout << out.string() << "\n";
+    return 0;
+}
+
+// ── cpp2 check:快速语义检查,不生成代码(IMPLEMENTATION §2)────────
+int cmd_check(std::vector<std::string> const& args)
+{
+    if (args.empty()) {
+        std::cerr << "usage: cpp2 check <root.cppm>\n";
+        return 1;
+    }
+    auto p = prepare(fs::path(args[0]));
+    if (!p) return 1;
+    std::cout << p->graph.order.size() << " module(s) ok\n";
     return 0;
 }
 
@@ -311,7 +382,7 @@ int cmd_build(std::vector<std::string> const& args)
         auto const& u = g.units.at(name);
         // 源哈希混入工具版本:代码生成器变更后旧缓存自然失效,
         // 避免 emit 演进(如 M4 的空检查注入)被缓存掩盖
-        std::string src_hash = util::hash128(u.source + "|codegen:" + kVersion);
+        std::string src_hash = sha256::hex_of(u.source + "|codegen:" + kVersion);
 
         emit::ModuleEntry e;
         for (auto const& en : p->entries())
@@ -329,8 +400,8 @@ int cmd_build(std::vector<std::string> const& args)
             write_file(gen, code);
             CacheRec r;
             r.src_hash = src_hash;
-            r.iface_hash = util::hash128(mods::interface_text(u.ast));
-            r.gen_hash = util::hash128(code);
+            r.iface_hash = sha256::hex_of(mods::interface_text(u.ast));
+            r.gen_hash = sha256::hex_of(code);
             recs[name] = r;
             fresh[name] = true;
             iface[name] = r.iface_hash;
@@ -340,10 +411,13 @@ int cmd_build(std::vector<std::string> const& args)
 
     // 依赖组合哈希 + 是否需要编译:
     //   obj 缺失 / 本轮源变化(重转译)/ 直接依赖的接口哈希变化
+    // 组合串先归约为 SHA-256 hex 再入缓存:.c2i 中哈希存原始字节,
+    // 只有合法 64 位 hex 能无损往返(空串/任意文本会失真为全零摘要)
     std::unordered_map<std::string, bool> need_compile;
     for (auto const& name : g.order) {
-        std::string dh;
-        for (auto const& dep : g.units.at(name).imports) dh += iface.at(dep);
+        std::string joined = "deps1";
+        for (auto const& dep : g.units.at(name).imports) joined += "|" + iface.at(dep);
+        std::string dh = sha256::hex_of(joined);
         auto& r = recs[name];
         bool dh_changed = r.deps_hash != dh;
         r.deps_hash = dh;
@@ -547,6 +621,7 @@ void usage()
     std::cerr
         << "usage:\n"
         << "  cpp2 run <root.cppm>                        # 摊平转译 + 编译 + 执行\n"
+        << "  cpp2 check <root.cppm>                      # 快速语义检查,不生成代码\n"
         << "  cpp2 build [root.cppm]                      # C++20 模块模式:并行增量构建\n"
         << "  cpp2 transpile <root.cppm> [-o out.cpp]     # 摊平转译查看生成码\n"
         << "  cpp2 export-headers <root.cppm> [-o dir]    # 生成 Cpp1 消费者 .h/.cpp\n"
@@ -564,6 +639,7 @@ int main(int argc, char** argv)
     std::vector<std::string> args(argv + 2, argv + argc);
 
     if (cmd == "transpile")       return cmd_transpile(args);
+    if (cmd == "check")           return cmd_check(args);
     if (cmd == "run")             return cmd_run(args);
     if (cmd == "build")           return cmd_build(args);
     if (cmd == "export-headers")  return cmd_export_headers(args);

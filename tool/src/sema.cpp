@@ -1,4 +1,4 @@
-// C++2 语义分析实现(M2c:错误通道 + 契约)
+// C++2 语义分析实现(M2d:泛型/concept、variant、optional、模式匹配、UFCS)
 #include "sema.hpp"
 
 #include <unordered_set>
@@ -17,13 +17,47 @@ struct Sym {
     ast::MethodDecl* method = nullptr;      // kind == Method
 };
 
-// expected 包装:throws 调用结果的类型
-Type as_expected(Type t)
+// expected/optional 包装:throws 调用结果 / T?
+Type as_wrapped(Type t, bool optional)
 {
     Type w;
-    w.is_expected = true;
+    if (optional) w.is_optional = true; else w.is_expected = true;
     w.value = std::make_shared<Type>(std::move(t));
     return w;
+}
+
+Type as_expected(Type t) { return as_wrapped(std::move(t), false); }
+
+// TypeUse 的规范化键(模式匹配 / variant 替身比对):限定名 + 递归实参 + '?'
+std::string type_use_key(ast::TypeUse const& tu)
+{
+    if (tu.parts.empty()) return "";
+    std::string s = tu.parts[0];
+    for (size_t i = 1; i < tu.parts.size(); ++i) s += "::" + tu.parts[i];
+    if (!tu.args.empty()) {
+        s += "<";
+        for (size_t i = 0; i < tu.args.size(); ++i) {
+            if (i) s += ",";
+            s += type_use_key(tu.args[i]);
+        }
+        s += ">";
+    }
+    if (tu.is_optional) s += "?";
+    return s;
+}
+
+// UFCS 首参比对的接收者键:与源码类型写法对齐
+std::string base_key(Type const& t)
+{
+    switch (t.kind) {
+    case Type::NamedStruct:
+    case Type::NamedEnum:
+    case Type::Variant:
+    case Type::Container:
+        return t.name;
+    default:
+        return t.display();
+    }
 }
 
 class Checker {
@@ -42,11 +76,23 @@ public:
             if (!enums_.emplace(e.name, &e).second)
                 err(e.line, 0, "duplicate enum name '" + e.name + "'");
         }
+        for (auto& v : m_.variants) {
+            if (!variants_.emplace(v.name, &v).second)
+                err(v.line, 0, "duplicate variant name '" + v.name + "'");
+        }
+        for (auto& c : m_.concepts) {
+            if (!concepts_.emplace(c.name, &c).second)
+                err(c.line, 0, "duplicate concept name '" + c.name + "'");
+        }
         for (auto* im : imported_) {
             for (auto& s : im->structs)
                 if (s.exported) structs_.emplace(s.name, &s);
             for (auto& e : im->enums)
                 if (e.exported) enums_.emplace(e.name, &e);
+            for (auto& v : im->variants)
+                if (v.exported) variants_.emplace(v.name, &v);
+            for (auto& c : im->concepts)
+                if (c.exported) concepts_.emplace(c.name, &c);
             for (auto& f : im->funcs) {
                 if (!f.exported) continue;
                 Sym s; s.kind = SymKind::Func; s.func = &f;
@@ -64,6 +110,8 @@ public:
         register_top();
 
         for (auto& s : m_.structs) check_struct(s);
+        for (auto& v : m_.variants) check_variant(v);
+        for (auto& c : m_.concepts) check_concept(c);
         for (auto& f : m_.funcs)   check_func(f);
         for (auto& g : m_.globals) {
             if (g.init) infer(*g.init);
@@ -80,6 +128,8 @@ private:
     std::vector<ast::Module*> imported_;
     std::unordered_map<std::string, ast::StructDecl*> structs_;   // 自身 + 导入导出
     std::unordered_map<std::string, ast::EnumDecl*> enums_;
+    std::unordered_map<std::string, ast::VariantDecl*> variants_;
+    std::unordered_map<std::string, ast::ConceptDecl*> concepts_;
     Result res_;
     std::unordered_map<std::string, Sym> top_;
     std::vector<std::unordered_map<std::string, Sym>> scopes_;
@@ -88,6 +138,8 @@ private:
     bool cur_throws_ = false;               // 当前函数在错误通道上(可用 '?')
     bool prop_ok_ = false;                  // 当前表达式位置允许 '?'(语句顶层)
     bool in_post_ = false;                  // 在 post 契约内(old() 合法,result 可见)
+    // 当前函数的类型参数名(检查函数体/调用点时 T 解析为 Generic)
+    std::unordered_set<std::string> generic_names_;
 
     ast::StructDecl* find_struct(std::string const& n) {
         auto it = structs_.find(n);
@@ -96,6 +148,14 @@ private:
     ast::EnumDecl* find_enum(std::string const& n) {
         auto it = enums_.find(n);
         return it != enums_.end() ? it->second : nullptr;
+    }
+    ast::VariantDecl* find_variant(std::string const& n) {
+        auto it = variants_.find(n);
+        return it != variants_.end() ? it->second : nullptr;
+    }
+    ast::ConceptDecl* find_concept(std::string const& n) {
+        auto it = concepts_.find(n);
+        return it != concepts_.end() ? it->second : nullptr;
     }
 
     void err(int line, int col, std::string msg)  { res_.errors.push_back({line, col, std::move(msg)}); }
@@ -122,6 +182,13 @@ private:
 
     // ── 类型解析 ────────────────────────────────────────────────────
     Type type_from_use(ast::TypeUse const& tu)
+    {
+        Type t = type_from_use_core(tu);
+        if (tu.is_optional) return as_wrapped(std::move(t), /*optional*/true);
+        return t;
+    }
+
+    Type type_from_use_core(ast::TypeUse const& tu)
     {
         Type t;
         t.is_const = tu.is_const;
@@ -165,6 +232,12 @@ private:
         };
 
         if (tu.parts.size() == 1) {
+            if (last == "self") return t;            // concept 接口里的占位类型
+            if (generic_names_.count(last)) {        // 泛型参数 T(当前函数的)
+                t.kind = Type::Generic;
+                t.name = last;
+                return t;
+            }
             if (auto s = scalar(last); s.known()) return s;
             if (last == "unique" || last == "shared" || last == "weak"
                 || last == "unique_ptr" || last == "shared_ptr" || last == "weak_ptr")
@@ -181,6 +254,13 @@ private:
                 t.kind = Type::NamedEnum; t.name = last;
                 return t;
             }
+            if (find_variant(last)) {
+                t.kind = Type::Variant;
+                t.name = last;
+                return t;
+            }
+            if (find_concept(last))
+                err(tu.line, 0, "concept '" + last + "' is a constraint, not a value type");
             if (last == "_") return t;
             err(tu.line, 0, "unknown type '" + last + "'");
             return t;
@@ -225,6 +305,40 @@ private:
         for (auto& f : s.fields) out.push_back(&f);
     }
 
+    // 字段查找沿基类链(派生同名隐藏基类;DESIGN §5.1 公有继承的成员访问)
+    ast::FieldDecl* find_field_deep(ast::StructDecl& s, std::string const& n)
+    {
+        if (auto* f = s.find_field(n)) return f;
+        if (s.base && s.base->parts.size() == 1)
+            if (auto* b = find_struct(s.base->parts[0]))
+                return find_field_deep(*b, n);
+        return nullptr;
+    }
+
+    void check_variant(ast::VariantDecl& v)
+    {
+        for (auto& alt : v.alternatives) type_from_use(alt);
+    }
+
+    // concept 检查:要求签名可解析(self 占位类型);语义满足由降低后的
+    // C++20 concept 在实例化点判定(v0.1 委托,见 IMPLEMENTATION 偏差表)
+    void check_concept(ast::ConceptDecl& c)
+    {
+        for (auto& req : c.reqs) {
+            for (auto& p : req.params) type_from_use(p.type);
+            if (req.ret) type_from_use(*req.ret);
+        }
+    }
+
+    // 概念约束存在性:<T: C> 与 requires 子句(std:: 前缀交由编译器)
+    void check_constraint_name(std::vector<std::string> const& parts, int line)
+    {
+        if (parts.empty() || parts[0] == "std") return;
+        if (!find_concept(parts[0]))
+            err(line, 0, "unknown concept '" + parts[0]
+                         + "' (concepts are declared with 'name: concept = {...}')");
+    }
+
     void check_method(ast::StructDecl& s, ast::MethodDecl& md)
     {
         cur_struct_ = &s;
@@ -265,7 +379,7 @@ private:
         if (md.post) check_post(*md.post, md.ret);
 
         if (md.has_block_body && md.block_body) check_stmt(*md.block_body);
-        if (md.expr_body) infer(*md.expr_body);
+        if (md.expr_body) infer_top(*md.expr_body);   // 短体可为 match 表达式 / '?'
 
         cur_struct_ = nullptr;
         cur_method_ = nullptr;
@@ -278,6 +392,13 @@ private:
         cur_throws_ = f.throws;
         if (f.name == "main" && f.throws)
             err(f.line, 0, "main cannot be 'throws' (errors must be handled in main)");
+        if (f.name == "main" && !f.type_params.empty())
+            err(f.line, 0, "main cannot be generic");
+
+        // 泛型环境:函数体内 T → Generic;约束概念必须存在
+        for (auto& tp : f.type_params) check_constraint_name(tp.concept_parts, tp.line);
+        for (auto& r : f.requires_list) check_constraint_name(r.name_parts, f.line);
+        for (auto& tp : f.type_params) generic_names_.insert(tp.name);
 
         scopes_.clear();
         scopes_.emplace_back();                 // 参数作用域
@@ -292,7 +413,9 @@ private:
         if (f.pre) infer(*f.pre);
         if (f.post) check_post(*f.post, f.ret);
         if (f.has_block_body && f.block_body) check_stmt(*f.block_body);
-        if (f.expr_body) infer(*f.expr_body);
+        if (f.expr_body) infer_top(*f.expr_body);
+
+        for (auto& tp : f.type_params) generic_names_.erase(tp.name);
     }
 
     // post 契约:old() 合法、result 绑定返回值(DESIGN §6.5)
@@ -364,11 +487,16 @@ private:
         case ast::Stmt::If: {
             auto& i = static_cast<ast::IfStmt&>(s);
             if (i.is_let()) {
-                // if-let:x := f() { } else e := it { }(DESIGN §8.3)
+                // if-let:x := f() { } else e := it { }(DESIGN §8.3);
+                // M2d:亦接受 T?(DESIGN §6.4:if p := w.lock() { ... })
                 Type t = infer(*i.let_init);
-                if (!t.is_expected)
+                if (!t.is_expected && !t.is_optional)
                     err(i.line, i.col,
-                        "if-let initializer must be on the error channel (a 'throws' call)");
+                        "if-let initializer must be on the error channel (a 'throws' call) "
+                        "or an optional (T?)");
+                if (!i.else_binding.empty() && t.is_optional)
+                    err(i.line, i.col,
+                        "'else NAME := it' binds an error; optionals have no error value");
                 scopes_.emplace_back();
                 declare(i.let_name, t.val(), true, SymKind::Local, i.line, i.col);
                 check_stmt(*i.then_block);
@@ -423,26 +551,243 @@ private:
         case ast::Stmt::Match: {
             auto& x = static_cast<ast::MatchStmt&>(s);
             Type t = infer(*x.scrutinee);
-            if (!t.is_expected)
-                err(x.line, x.col,
-                    "match scrutinee must be on the error channel (a 'throws' call); "
-                    "enum/variant match arrives in M2d");
-            bool has_ok = false, has_err = false;
-            for (auto& arm : x.arms) {
-                if (arm.is_ok) has_ok = true; else has_err = true;
-                scopes_.emplace_back();
-                if (arm.binding != "_")
-                    declare(arm.binding, arm.is_ok ? t.val() : Type::of(Type::Error),
-                            true, SymKind::Local, arm.line, 0);
-                check_stmt(*arm.body);
-                scopes_.pop_back();
-            }
-            if (x.arms.empty() || !has_ok || !has_err)
-                err(x.line, x.col,
-                    "match on the error channel needs one 'ok' arm and one 'err' arm");
+            check_match_common(x.line, x.col, t, x.arms, /*value_form*/false);
             return;
         }
         }
+    }
+
+    // ── 模式匹配(M2d,DESIGN §4.5/§5.4/§5.5/§8.3)────────────────────
+    // 按 scrutinee 类型分派合法模式集,检查绑定/守卫/穷尽性;
+    // value_form 时臂体为表达式(已包成 ExprStmt),返回公共值类型。
+    Type check_match_common(int line, int col, Type t,
+                            std::vector<ast::MatchArm>& arms, bool value_form)
+    {
+        ast::EnumDecl* ed = nullptr;
+        ast::VariantDecl* vd = nullptr;
+        ast::StructDecl* sd = nullptr;
+        enum class Scrut { Expected, Optional, Enum, Variant, Struct, Bad } sc;
+        if (t.is_expected)                          sc = Scrut::Expected;
+        else if (t.is_optional)                     sc = Scrut::Optional;
+        else if (t.kind == Type::NamedEnum)  { sc = Scrut::Enum;    ed = find_enum(t.name); }
+        else if (t.kind == Type::Variant)    { sc = Scrut::Variant; vd = find_variant(t.name); }
+        else if (t.kind == Type::NamedStruct){ sc = Scrut::Struct;  sd = find_struct(t.name); }
+        else                                         sc = Scrut::Bad;
+
+        if (sc == Scrut::Bad) {
+            err(line, col,
+                "match scrutinee must be an error-channel value, enum, variant, "
+                "optional (T?), or struct; got '" + t.display() + "'");
+            return {};
+        }
+        if (arms.empty()) {
+            err(line, col, "match needs at least one arm");
+            return {};
+        }
+
+        std::unordered_set<std::string> covered;      // 覆盖(含守卫臂)
+        std::unordered_set<std::string> covered_strict; // 无守卫覆盖(再入 = 不可达)
+        bool has_wild = false;
+        Type value_t;
+        bool have_value = false;
+
+        for (size_t ai = 0; ai < arms.size(); ++ai) {
+            auto& arm = arms[ai];
+            Type bind_type;                          // 整体绑定(ok 值 / 替身值 / 自身)
+            std::vector<std::pair<std::string, Type>> sub_binds;
+
+            switch (arm.pat) {
+            case ast::MatchArm::Pat::Wildcard:
+                if (ai + 1 != arms.size())
+                    err(arm.line, 0, "'_' must be the last match arm");
+                has_wild = true;
+                break;
+            case ast::MatchArm::Pat::Ok:
+            case ast::MatchArm::Pat::Err:
+                if (sc != Scrut::Expected) {
+                    err(arm.line, 0, "'ok'/'err' patterns require an error-channel scrutinee");
+                } else {
+                    bind_type = arm.pat == ast::MatchArm::Pat::Ok
+                              ? t.val() : Type::of(Type::Error);
+                    if (!covered.insert(arm.pat == ast::MatchArm::Pat::Ok ? "ok" : "err").second)
+                        err(arm.line, 0, "duplicate 'ok'/'err' match arm");
+                }
+                break;
+            case ast::MatchArm::Pat::Some:
+                if (sc != Scrut::Optional) {
+                    err(arm.line, 0, "'some' patterns require an optional (T?) scrutinee");
+                } else {
+                    bind_type = t.val();
+                    if (!covered.insert("some").second)
+                        err(arm.line, 0, "duplicate 'some' match arm");
+                }
+                break;
+            case ast::MatchArm::Pat::None:
+                if (sc != Scrut::Optional)
+                    err(arm.line, 0, "'none' patterns require an optional (T?) scrutinee");
+                else if (!covered.insert("none").second)
+                    err(arm.line, 0, "duplicate 'none' match arm");
+                break;
+            case ast::MatchArm::Pat::EnumMember:
+                if (sc != Scrut::Enum) {
+                    err(arm.line, 0, "'.member' patterns require an enum scrutinee");
+                } else if (ed) {
+                    bool known = false;
+                    for (auto& mem : ed->members) known = known || mem == arm.enum_member;
+                    if (!known)
+                        err(arm.line, 0, "enum '" + ed->name + "' has no member '"
+                                         + arm.enum_member + "'");
+                    // 同一成员多次出现:仅"无守卫臂后跟无守卫臂"(不可达)报错
+                    if (!arm.guard && !covered_strict.insert(arm.enum_member).second)
+                        err(arm.line, 0, "duplicate match arm for '." + arm.enum_member + "'");
+                    covered.insert(arm.enum_member);
+                }
+                break;
+            case ast::MatchArm::Pat::TypePat: {
+                std::string key = type_use_key(arm.type_pattern);
+                if (sc == Scrut::Variant && vd) {
+                    bool found = false;
+                    for (auto& alt : vd->alternatives) {
+                        if (type_use_key(alt) != key) continue;
+                        found = true;
+                        bool destr_ok = false;      // 替身是结构体才能解构
+                        if (!arm.sub.empty()) {
+                            if (alt.parts.size() == 1)
+                                if (auto* as = find_struct(alt.parts[0])) {
+                                    sub_binds = validate_subs(arm, *as);
+                                    destr_ok = true;
+                                }
+                            if (!destr_ok)
+                                err(arm.line, 0, "only struct alternatives can be destructured");
+                        }
+                        if (sub_binds.empty() && !arm.binding.empty() && arm.binding != "_")
+                            bind_type = type_from_use(alt);
+                        break;
+                    }
+                    if (!found)
+                        err(arm.line, 0, "variant '" + vd->name
+                                         + "' has no alternative '" + key + "'");
+                    else {
+                        if (!arm.guard && !covered_strict.insert(key).second)
+                            err(arm.line, 0,
+                                "duplicate match arm for alternative '" + key + "'");
+                        covered.insert(key);
+                    }
+                } else if (sc == Scrut::Struct && sd) {
+                    if (key != sd->name)
+                        err(arm.line, 0, "type pattern for a struct scrutinee must be '"
+                                         + sd->name + "' itself");
+                    if (!arm.sub.empty()) sub_binds = validate_subs(arm, *sd);
+                    if (sub_binds.empty() && !arm.binding.empty() && arm.binding != "_")
+                        bind_type = t;
+                    covered.insert(sd->name);
+                } else {
+                    err(arm.line, 0,
+                        "type patterns require a variant or struct scrutinee");
+                }
+                break;
+            }
+            }
+
+            scopes_.emplace_back();                 // 臂作用域:绑定 + 守卫 + 体
+            if (!arm.binding.empty() && arm.binding != "_" && bind_type.known())
+                declare(arm.binding, bind_type, true, SymKind::Local, arm.line, 0);
+            for (auto& [n, ty] : sub_binds)
+                declare(n, ty, true, SymKind::Local, arm.line, 0);
+
+            if (arm.guard) {
+                Type g = infer(*arm.guard);
+                if (g.known() && g.kind != Type::Bool)
+                    err(arm.line, 0, "match guard must be a bool expression");
+            }
+
+            if (!value_form) {
+                check_stmt(*arm.body);
+            } else if (arm.body->kind() == ast::Stmt::Block) {
+                check_stmt(*arm.body);
+            } else if (arm.body->kind() == ast::Stmt::ExprStmt) {
+                Type bt = infer(*static_cast<ast::ExprStmt&>(*arm.body).expr);
+                if (bt.known()) {
+                    if (!have_value) { value_t = bt; have_value = true; }
+                    else if (value_t.known()) {
+                        Type merged = arm_common_type(value_t, bt);
+                        if (!merged.known())
+                            err(arm.line, 0,
+                                "match arms must all produce the same type ('"
+                                + value_t.display() + "' vs '" + bt.display() + "')");
+                        value_t = merged;
+                    }
+                }
+            }
+            scopes_.pop_back();
+        }
+
+        // 穷尽性:通配兜底,否则全部候选必须被覆盖
+        auto missing = [&]() -> std::string {
+            std::string m;
+            auto need = [&](std::string const& k) {
+                if (!covered.count(k)) m += (m.empty() ? "" : ", ") + k;
+            };
+            switch (sc) {
+            case Scrut::Expected: need("ok"); need("err"); break;
+            case Scrut::Optional: need("some"); need("none"); break;
+            case Scrut::Enum:    if (ed) for (auto& mem : ed->members) need(mem); break;
+            case Scrut::Variant: if (vd) { for (auto& alt : vd->alternatives)
+                                             need(type_use_key(alt)); } break;
+            case Scrut::Struct:  if (sd) need(sd->name); break;
+            case Scrut::Bad: break;
+            }
+            return m;
+        };
+        if (!has_wild && !missing().empty())
+            err(line, col, "match arms must be exhaustive (or end with '_'); missing: "
+                 + missing());
+
+        return value_t;
+    }
+
+    // 解构子模式:位置绑定(Rect(w, h))与命名字段(Point(.x, .y));返回绑定表。
+    // 就地把 arm.sub 归一化为 ".字段=绑定名"(发射侧无需再查字段序,导入类型同样可用)
+    // 臂间公共类型:同型;均为算术 → 宽化(0 与 2.5 统一为 double)
+    Type arm_common_type(Type const& a, Type const& b)
+    {
+        if (a.display() == b.display()) return a;
+        if (a.is_arith() && b.is_arith()) {
+            if (a.is_floaty() || b.is_floaty()) return Type::of(Type::Double);
+            if (a.is_signed() && b.is_signed())
+                return a.signed_rank() >= b.signed_rank() ? a : b;
+            if (a.is_unsigned() && b.is_unsigned())
+                return a.signed_rank() >= b.signed_rank() ? a : b;
+        }
+        return {};
+    }
+
+    std::vector<std::pair<std::string, Type>> validate_subs(ast::MatchArm& arm,
+                                                            ast::StructDecl& sd)
+    {
+        std::vector<std::pair<std::string, Type>> binds;
+        for (size_t i = 0; i < arm.sub.size(); ++i) {
+            std::string const& sp = arm.sub[i];
+            if (sp == "_") continue;
+            if (sp[0] == '.') {
+                std::string field = sp.substr(1);
+                if (auto* fd = find_field_deep(sd, field)) {
+                    binds.push_back({field, type_from_use(fd->type)});
+                    arm.sub[i] = "." + field + "=" + field;
+                } else
+                    err(arm.line, 0, "type '" + sd.name + "' has no field '" + field + "'");
+            } else {
+                if (i >= sd.fields.size()) {
+                    err(arm.line, 0, "type '" + sd.name + "' has only "
+                                     + std::to_string(sd.fields.size())
+                                     + " field(s); too many sub-patterns");
+                    continue;
+                }
+                binds.push_back({sp, type_from_use(sd.fields[i].type)});
+                arm.sub[i] = "." + sd.fields[i].name + "=" + sp;
+            }
+        }
+        return binds;
     }
 
     void declare(std::string const& name, Type t, bool is_const, SymKind k, int line, int col)
@@ -608,6 +953,34 @@ private:
             (void)r;
             return l.val();
         }
+        case ast::Expr::Match: {
+            // match 产值(DESIGN §5.5):与 '?' 同样只支持语句级位置
+            // (整 initializer / return / 赋值右值 / 函数体),机械展开需要拆语句
+            auto& x = static_cast<ast::MatchExpr&>(e);
+            if (!prop_ok_)
+                err(x.line, x.col,
+                    "match as a value is only supported as a whole initializer, "
+                    "assignment value, return value, or function body in this milestone");
+            Type t = infer(*x.scrutinee);
+            return check_match_common(x.line, x.col, t, x.arms, /*value_form*/true);
+        }
+        case ast::Expr::Lambda: {
+            // (x: int) -> int = x * x(DESIGN §4.6);闭包类型交由 C++ 推导
+            auto& l = static_cast<ast::LambdaExpr&>(e);
+            scopes_.emplace_back();
+            for (auto& p : l.params) {
+                Sym sym;
+                sym.kind = SymKind::Param;
+                sym.type = type_from_use(p.type);
+                sym.is_const = p.mode == ast::ParamMode::In;
+                scopes_.back()[p.name] = sym;
+            }
+            if (l.ret) type_from_use(*l.ret);
+            if (l.has_block_body && l.block_body) check_stmt(*l.block_body);
+            if (l.expr_body) infer(*l.expr_body);
+            scopes_.pop_back();
+            return {};
+        }
         }
         return {};
     }
@@ -640,7 +1013,9 @@ private:
             note_member_use(*sym);
             return sym->type;
         }
-        if (find_struct(n.parts[0]) || find_enum(n.parts[0]))
+        if (n.parts[0] == "none")                    // 空 optional 字面量(DESIGN §6.4)
+            return Type::of(Type::NoneVal);
+        if (find_struct(n.parts[0]) || find_enum(n.parts[0]) || find_variant(n.parts[0]))
             err(n.line, n.col, "use of type '" + n.parts[0] + "' where a value is expected");
         else
             err(n.line, n.col, "use of undeclared name '" + n.parts[0] + "'");
@@ -692,27 +1067,106 @@ private:
             }
         }
 
-        // 模块函数:返回类型(throws → 错误通道值)
+        // 模块函数:返回类型(throws → 错误通道值;泛型 → 直位参数合一)
         if (c.callee->kind() == ast::Expr::Name) {
             auto& name = static_cast<ast::NameExpr&>(*c.callee);
             if (!name.qualified()) {
                 if (auto* sym = resolve(name.parts[0])) {
                     note_member_use(*sym);
-                    if (sym->kind == SymKind::Func && sym->func && sym->func->ret) {
-                        Type t = type_from_use(*sym->func->ret);
-                        if (sym->func->throws) return as_expected(t);
-                        return t;
-                    }
+                    if (sym->kind == SymKind::Func && sym->func)
+                        return infer_func_call(*sym->func, c);
                 }
                 return {};
             }
             return {};
         }
 
-        // 方法调用:obj.method(...)
+        // 方法调用:obj.method(...);成员不存在时尝试 UFCS 自由函数(DESIGN §4.7)
         if (c.callee->kind() == ast::Expr::Member) {
             auto& mem = static_cast<ast::MemberExpr&>(*c.callee);
-            return infer_member(mem, &c);
+            Type t = infer_member(mem, &c);
+            if (!t.known()) {
+                if (Type u = try_ufcs(mem, c, type_of_expr(*mem.base)); u.known())
+                    return u;
+                if (res_.ufcs.count(&c)) return {};
+            }
+            return t;
+        }
+        return {};
+    }
+
+    Type type_of_expr(ast::Expr& e)
+    {
+        auto it = res_.expr_types.find(&e);
+        return it != res_.expr_types.end() ? it->second : Type{};
+    }
+
+    // 泛型函数调用推断:临时泛型环境 + 直位合一(参数类型恰为 T 时绑定实参类型),
+    // 返回类型做 T → 实参类型替换。嵌套容器型(vector<T>)不做深度合一(v0.1)。
+    Type infer_func_call(ast::FuncDecl& fd, ast::CallExpr& c)
+    {
+        if (fd.type_params.empty()) {
+            if (!fd.ret) return {};
+            Type t = type_from_use(*fd.ret);
+            if (fd.throws) return as_expected(t);
+            return t;
+        }
+
+        for (auto& tp : fd.type_params) generic_names_.insert(tp.name);
+        std::unordered_map<std::string, Type> subst;
+        for (size_t i = 0; i < fd.params.size() && i < c.args.size(); ++i) {
+            auto& p = fd.params[i];
+            if (p.type.parts.size() != 1 || p.type.args.size() > 1) continue;
+            bool is_tp = false;
+            for (auto& tp : fd.type_params)
+                is_tp = is_tp || tp.name == p.type.parts[0];
+            if (!is_tp) continue;
+            Type at = type_of_expr(*c.args[i]);
+            if (at.known() && !at.is_expected && !at.is_optional
+                && !subst.count(p.type.parts[0]))
+                subst[p.type.parts[0]] = at;
+        }
+        Type t = fd.ret ? type_from_use(*fd.ret) : Type{};
+        if (t.kind == Type::Generic) {
+            auto it = subst.find(t.name);
+            if (it != subst.end()) {
+                t = it->second;
+                t.is_const = false;
+            }
+        }
+        for (auto& tp : fd.type_params) generic_names_.erase(tp.name);
+        if (fd.throws) return as_expected(t);
+        return t;
+    }
+
+    // UFCS:x.f(args) → f(x, args)(DESIGN §4.7)。模块级自由函数首参类型
+    // 匹配接收者(或泛型首参);标量 .to_string() 桥到 std::to_string。
+    Type try_ufcs(ast::MemberExpr& mem, ast::CallExpr& call, Type const& base)
+    {
+        if (base.is_expected || base.is_optional) return {};
+        auto* sym = resolve(mem.name);
+        if (sym && sym->kind == SymKind::Func && sym->func
+            && !sym->func->params.empty()) {
+            auto* fd = sym->func;
+            auto& p0 = fd->params[0];
+            bool ok = false;
+            if (fd->type_params.empty()) {
+                ok = !type_use_key(p0.type).empty()
+                     && type_use_key(p0.type) == base_key(base);
+            } else {
+                for (auto& tp : fd->type_params)
+                    if (p0.type.parts.size() == 1 && tp.name == p0.type.parts[0])
+                        ok = true;
+            }
+            if (ok) {
+                res_.ufcs[&call] = fd->name;
+                return infer_func_call(*fd, call);
+            }
+        }
+        if (mem.name == "to_string"
+            && (base.is_arith() || base.kind == Type::Char)) {
+            res_.ufcs[&call] = "std::to_string";
+            return Type::of(Type::String);
         }
         return {};
     }
@@ -726,7 +1180,7 @@ private:
         if (obj.is_smart()) obj = obj.deref();      // 智能指针自动解引用
         if (obj.kind == Type::NamedStruct) {
             if (auto* sd = find_struct(obj.name)) {
-                if (auto* fd = sd->find_field(mem.name)) {
+                if (auto* fd = find_field_deep(*sd, mem.name)) {
                     Type t = type_from_use(fd->type);
                     t.is_const = t.is_const || base.is_const;   // const 传播
                     return t;
@@ -745,6 +1199,11 @@ private:
                         return t;
                     }
                     return {};
+                }
+                if (call) {                          // UFCS:x.f(y) ≡ f(x, y)
+                    if (Type u = try_ufcs(mem, *call, obj); u.known())
+                        return u;
+                    if (res_.ufcs.count(call)) return {};
                 }
                 err(mem.line, mem.col,
                     "type '" + obj.name + "' has no member '" + mem.name + "'");
