@@ -126,7 +126,11 @@ private:
             if (try_get('>')) return make(Tok::FatArrow, "=>", sl, sc);
             return make(Tok::Assign, "=", sl, sc);
         }
-        if (c == '!') { get(); return make(Tok::Bang, "!", sl, sc); }
+        if (c == '!') {
+            get();
+            if (try_get('=')) return make(Tok::Ne, "!=", sl, sc);
+            return make(Tok::Bang, "!", sl, sc);
+        }
         if (c == '<') { get(); if (try_get('=')) return make(Tok::Le, "<=", sl, sc); return make(Tok::Lt, "<", sl, sc); }
         if (c == '>') { get(); if (try_get('=')) return make(Tok::Ge, ">=", sl, sc); return make(Tok::Gt, ">", sl, sc); }
         if (c == '&') { get(); if (try_get('&')) return make(Tok::AndAnd, "&&", sl, sc); return make(Tok::Amp, "&", sl, sc); }

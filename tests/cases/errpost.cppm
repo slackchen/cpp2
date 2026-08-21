@@ -1,0 +1,23 @@
+// errpost.cppm — throws + post 契约组合:错误通道上的出口检查
+module errpost;
+import std;
+
+halve: (n: int) -> int throws
+    pre:  n >= 0
+    post: result >= 0
+= {
+    if n % 2 != 0 { return err("odd input"); }
+    return n / 2;
+}
+
+main: () -> int = {
+    match halve(10) {
+        ok  n => std::print("half = {0}\n", n);
+        err e => std::print("failed: {0}\n", e.message());
+    }
+    match halve(3) {
+        ok  n => std::print("half = {0}\n", n);
+        err e => std::print("failed: {0}\n", e.message());
+    }
+    return 0;
+}

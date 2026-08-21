@@ -1,4 +1,4 @@
-// C++2 AST(M2b:类型定义、方法/mutates、enum、检查注解、struct 字面量、as 转换)
+// C++2 AST(M2c:错误通道 ?/!/or/match/if-let、契约 pre/post)
 // 节点带源位置;dispatch 用 kind() + static_cast,不依赖 RTTI。
 #pragma once
 
@@ -32,7 +32,8 @@ using ExprP = std::unique_ptr<Expr>;
 
 struct Expr : Node {
     enum Kind { Literal, Name, Call, Binary, Unary, Assign, Index, Member, Paren,
-                StructLit, AsCast, ListLit };
+                StructLit, AsCast, ListLit,
+                Try, OrDefault, Must };
     virtual Kind kind() const = 0;
 };
 
@@ -107,12 +108,27 @@ struct ListLitExpr : Expr {                  // [1, 2, 3]
     Kind kind() const override { return Kind::ListLit; }
 };
 
+struct TryExpr : Expr {                      // f()? — 解包,失败向上传播(DESIGN §8.2)
+    ExprP operand;
+    Kind kind() const override { return Kind::Try; }
+};
+
+struct OrDefaultExpr : Expr {                // f() or "fallback" — 失败取默认(DESIGN §8.3)
+    ExprP lhs, rhs;
+    Kind kind() const override { return Kind::OrDefault; }
+};
+
+struct MustExpr : Expr {                     // f()! — 确信必成功,失败即 bug → trap
+    ExprP operand;
+    Kind kind() const override { return Kind::Must; }
+};
+
 // ── 语句 ────────────────────────────────────────────────────────────
 struct Stmt;
 using StmtP = std::unique_ptr<Stmt>;
 
 struct Stmt : Node {
-    enum Kind { ExprStmt, Return, Var, If, While, For, Break, Continue, Block };
+    enum Kind { ExprStmt, Return, Var, If, While, For, Break, Continue, Block, Match };
     virtual Kind kind() const = 0;
     bool no_check = false;                   // @unchecked / @unsafe 注解
     bool is_unsafe = false;                  // 注解具体是 @unsafe(audit 区分两者)
@@ -138,9 +154,13 @@ struct VarStmt : Stmt {                      // 局部变量声明(三种形式)
 };
 
 struct IfStmt : Stmt {
-    ExprP cond;
+    ExprP cond;                              // 普通形式
+    std::string let_name;                    // if-let:x := f() { }(非空 = if-let,DESIGN §8.3)
+    ExprP let_init;                          // if-let 的初始化表达式(错误通道值)
     StmtP then_block;
     StmtP else_block;                        // BlockStmt 或 IfStmt(else-if 链)
+    std::string else_binding;                // else e := it { }:绑定错误值
+    bool is_let() const { return !let_name.empty(); }
     Kind kind() const override { return Kind::If; }
 };
 
@@ -168,6 +188,19 @@ struct BlockStmt : Stmt {
     Kind kind() const override { return Kind::Block; }
 };
 
+struct MatchArm {                            // ok NAME => / err NAME =>(M2c 子集)
+    int line = 0;
+    bool is_ok = false;
+    std::string binding;                     // 绑定名("_" = 忽略)
+    StmtP body;                              // 块或单条语句
+};
+
+struct MatchStmt : Stmt {                    // match f() { ok x => ...; err e => ...; }
+    ExprP scrutinee;                         // 必须是错误通道值(sema 检查)
+    std::vector<MatchArm> arms;
+    Kind kind() const override { return Kind::Match; }
+};
+
 // ── 顶层声明 ────────────────────────────────────────────────────────
 enum class ParamMode { In, Inout, Out, Move, Copy, Forward };
 
@@ -186,6 +219,8 @@ struct FuncDecl {
     std::vector<Param> params;
     std::optional<TypeUse> ret;
     bool throws = false;
+    ExprP pre;                               // 契约:入口检查(M2c)
+    ExprP post;                              // 契约:出口检查;old()/result 在此可用
     bool has_block_body = false;
     StmtP block_body;                        // BlockStmt
     ExprP expr_body;                         // 简短体
@@ -206,6 +241,8 @@ struct MethodDecl {                          // 类型成员函数;name=="destru
     std::optional<TypeUse> ret;
     bool throws = false;
     bool mutates = false;
+    ExprP pre;                               // 契约(M2c)
+    ExprP post;
     bool has_block_body = false;
     StmtP block_body;
     ExprP expr_body;

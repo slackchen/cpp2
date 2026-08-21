@@ -224,7 +224,8 @@ std::string interface_text(ast::Module const& m)
                 if (i) o << ",";
                 o << type_sig(md.params[i].type, type_sig);
             }
-            o << ")" << ret_sig(md.ret) << (md.mutates ? " mutates" : "") << ";";
+            o << ")" << ret_sig(md.ret) << (md.mutates ? " mutates" : "")
+              << (md.throws ? " throws" : "") << ";";
         }
         o << "}\n";
     }

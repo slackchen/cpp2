@@ -249,11 +249,10 @@ private:
         if (check(lex::Tok::Throws)) {
             advance();
             md.throws = true;
-            if (check(lex::Tok::Ident)) parse_type(); // 错误类别:M2c 起使用
+            parse_error_category();
         }
         if (accept(lex::Tok::Mutates)) md.mutates = true;
-        if (check(lex::Tok::Ident) && peek().text == "pre")  unsupported("pre/post contracts", "M2c");
-        if (check(lex::Tok::Ident) && peek().text == "post") unsupported("pre/post contracts", "M2c");
+        parse_contracts(md.pre, md.post);
 
         expect(lex::Tok::Assign, "'=' before method body");
         if (check(lex::Tok::LBrace)) {
@@ -305,12 +304,11 @@ private:
         if (check(lex::Tok::Throws)) {
             advance();
             f.throws = true;
-            if (check(lex::Tok::Ident)) parse_type();
+            parse_error_category();
         }
         if (accept(lex::Tok::Mutates))
             err("'mutates' is only valid on type member methods");
-        if (check(lex::Tok::Ident) && peek().text == "pre")  unsupported("pre/post contracts", "M2c");
-        if (check(lex::Tok::Ident) && peek().text == "post") unsupported("pre/post contracts", "M2c");
+        parse_contracts(f.pre, f.post);
 
         expect(lex::Tok::Assign, "'=' before function body");
         if (check(lex::Tok::LBrace)) {
@@ -321,6 +319,31 @@ private:
             expect(lex::Tok::Semi, "';' after short function body");
         }
         m.funcs.push_back(std::move(f));
+    }
+
+    // throws E 的错误类别:v0.1 解析后丢弃(§8.4 错误类型体系 v0.3 落地);
+    // "pre:"/"post:" 不是类别(后跟 ':'),不能吞掉
+    void parse_error_category()
+    {
+        if (check(lex::Tok::Ident)
+            && !(peek(1).tok == lex::Tok::Colon
+                 && (peek().text == "pre" || peek().text == "post"))) {
+            parse_type();
+        }
+    }
+
+    // 契约:pre: expr / post: expr(DESIGN §6.5)。表达式在 '=' 前自然终止
+    // ('=' 与 'post'/'pre' 均不参与二元运算)。old()/result 由 sema/emit 处理。
+    void parse_contracts(ast::ExprP& pre, ast::ExprP& post)
+    {
+        if (check(lex::Tok::Ident) && peek().text == "pre" && peek(1).tok == lex::Tok::Colon) {
+            advance(); advance();
+            pre = expression();
+        }
+        if (check(lex::Tok::Ident) && peek().text == "post" && peek(1).tok == lex::Tok::Colon) {
+            advance(); advance();
+            post = expression();
+        }
     }
 
     std::vector<ast::Param> param_list()
@@ -455,7 +478,7 @@ private:
             advance(); expect(lex::Tok::Semi, "';' after 'continue'");
             return s;
         }
-        case lex::Tok::Match:    unsupported("match expression", "M2d");
+        case lex::Tok::Match:    return match_stmt();
         case lex::Tok::LBrace:   return block();   // 裸块:@unsafe/@unchecked 块形式(DESIGN §6.2/§6.6)
         default: break;
         }
@@ -523,15 +546,70 @@ private:
         auto s = std::make_unique<ast::IfStmt>();
         s->line = peek().line; s->col = peek().col;
         advance(); // if
+
         bool prev = cond_like_;
         cond_like_ = true;
-        s->cond = expression();
+
+        // if-let:x := f() { ... } else e := it { ... }(DESIGN §8.3;':=' 不出现在普通表达式)
+        if (check(lex::Tok::Ident) && peek(1).tok == lex::Tok::Walrus) {
+            s->let_name = advance().text;
+            advance(); // :=
+            s->let_init = expression();
+        } else {
+            s->cond = expression();
+        }
         cond_like_ = prev;
         s->then_block = block();
+
         if (accept(lex::Tok::Else)) {
-            if (check(lex::Tok::If)) s->else_block = if_stmt();
-            else                     s->else_block = block();
+            // else e := it { }:错误分支绑定(DESIGN §8.3)
+            if (check(lex::Tok::Ident) && peek(1).tok == lex::Tok::Walrus
+                && peek(2).tok == lex::Tok::Ident && peek(2).text == "it") {
+                if (!s->is_let())
+                    err("'else NAME := it' binds the error of an if-let condition");
+                s->else_binding = advance().text;
+                advance(); // :=
+                advance(); // it
+                s->else_block = block();
+            } else if (check(lex::Tok::If)) {
+                s->else_block = if_stmt();
+            } else {
+                s->else_block = block();
+            }
         }
+        return s;
+    }
+
+    // match f() { ok x => ...; err e => ...; }(M2c 子集:错误通道两臂)
+    ast::StmtP match_stmt()
+    {
+        auto s = std::make_unique<ast::MatchStmt>();
+        s->line = peek().line; s->col = peek().col;
+        advance(); // match
+        bool prev = cond_like_;
+        cond_like_ = true;                     // scrutinee 不吞块括号
+        s->scrutinee = expression();
+        cond_like_ = prev;
+        expect(lex::Tok::LBrace, "'{' to start match arms");
+
+        while (!check(lex::Tok::RBrace)) {
+            if (check(lex::Tok::Eof)) err("expected '}' before end of file");
+            if (accept(lex::Tok::Semi)) continue;           // 臂之间空行残留分号
+            ast::MatchArm arm;
+            arm.line = peek().line;
+            if (!check(lex::Tok::Ident)
+                || (peek().text != "ok" && peek().text != "err"))
+                err("match arm must start with 'ok' or 'err' (M2c subset)");
+            arm.is_ok = peek().text == "ok";
+            advance();
+            if (!check(lex::Tok::Ident) && !check(lex::Tok::Underscore))
+                err("expected binding name after 'ok'/'err'");
+            arm.binding = advance().text;
+            expect(lex::Tok::FatArrow, "'=>' after match arm pattern");
+            arm.body = check(lex::Tok::LBrace) ? block() : statement();
+            s->arms.push_back(std::move(arm));
+        }
+        expect(lex::Tok::RBrace, "'}' to end match");
         return s;
     }
 
@@ -599,7 +677,39 @@ private:
     ast::ExprP expression()
     {
         DepthGuard g{*this};
-        return logical_or();
+        return or_default();
+    }
+
+    // 最低优先级:err-or-default(f() or "fallback",DESIGN §8.3)
+    ast::ExprP or_default()
+    {
+        auto l = logical_or();
+        while (check(lex::Tok::Ident) && peek().text == "or"
+               && starts_expression(1)) {
+            int ln = peek().line, cl = peek().col;
+            advance(); // or
+            auto b = std::make_unique<ast::OrDefaultExpr>();
+            b->line = ln; b->col = cl;
+            b->lhs = std::move(l); b->rhs = logical_or();
+            l = std::move(b);
+        }
+        return l;
+    }
+
+    // 'or' 之后是否跟着一个表达式的开头(排除把普通标识符误当运算符)
+    bool starts_expression(size_t ahead) const
+    {
+        switch (peek(ahead).tok) {
+        case lex::Tok::IntLit: case lex::Tok::DoubleLit:
+        case lex::Tok::StringLit: case lex::Tok::CharLit:
+        case lex::Tok::True: case lex::Tok::False:
+        case lex::Tok::Ident: case lex::Tok::LParen:
+        case lex::Tok::LBracket: case lex::Tok::LBrace:
+        case lex::Tok::Bang: case lex::Tok::Minus: case lex::Tok::Plus:
+            return true;
+        default:
+            return false;
+        }
     }
 
     ast::ExprP logical_or()
@@ -755,8 +865,20 @@ private:
                 advance(); // as
                 x->target = parse_type();
                 e = std::move(x);
-            } else if (check(lex::Tok::Question) || check(lex::Tok::Bang)) {
-                unsupported("postfix '?'/'!' (error propagation)", "M2c");
+            } else if (check(lex::Tok::Question)) {
+                // f()? — 解包 + 失败向上传播(DESIGN §8.2;M2c)
+                auto x = std::make_unique<ast::TryExpr>();
+                x->line = peek().line; x->col = peek().col;
+                x->operand = std::move(e);
+                advance();
+                e = std::move(x);
+            } else if (check(lex::Tok::Bang)) {
+                // f()! — 确信必成功,失败即 bug → trap(前缀 ! 已在 unary 消费)
+                auto x = std::make_unique<ast::MustExpr>();
+                x->line = peek().line; x->col = peek().col;
+                x->operand = std::move(e);
+                advance();
+                e = std::move(x);
             } else {
                 break;
             }

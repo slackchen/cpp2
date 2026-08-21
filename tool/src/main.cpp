@@ -38,7 +38,7 @@ namespace fuzz  = cpp2::fuzz;
 
 namespace {
 
-constexpr char const* kVersion = "cpp2 0.1.0-m4 (checker complete + audit + fuzz)";
+constexpr char const* kVersion = "cpp2 0.1.0-m2c (error channel + contracts)";
 
 std::optional<std::string> read_file(fs::path const& p)
 {
@@ -491,7 +491,7 @@ int cmd_audit(std::vector<std::string> const& args)
     auto p = prepare(in);
     if (!p) return 1;
 
-    int arith = 0, index = 0, deref = 0, narrow = 0;
+    int arith = 0, index = 0, deref = 0, narrow = 0, contract = 0;
     int unchecked = 0, unsafe = 0;
     for (auto const& name : p->graph.order) {
         auto const& u = p->graph.units.at(name);
@@ -499,11 +499,13 @@ int cmd_audit(std::vector<std::string> const& args)
         std::cout << audit::format_section(name, u.file.string(), rep);
         arith += rep.checked_arith; index += rep.checked_index;
         deref += rep.checked_deref; narrow += rep.checked_narrow;
+        contract += rep.checked_contract;
         unchecked += rep.unchecked(); unsafe += rep.unsafe();
     }
     std::cout << "audit: " << p->graph.order.size() << " module(s), checks: arith "
               << arith << " / index " << index << " / deref " << deref
-              << " / narrow " << narrow << "; opt-outs: @unchecked x" << unchecked
+              << " / narrow " << narrow << " / contract " << contract
+              << "; opt-outs: @unchecked x" << unchecked
               << ", @unsafe x" << unsafe << "\n";
     return 0;
 }

@@ -29,6 +29,9 @@ public:
             for (auto& f : s.fields)
                 if (f.init) expr(*f.init);
             for (auto& md : s.methods) {
+                count_contracts(md.pre.get(), md.post.get());
+                if (md.pre)  expr(*md.pre);
+                if (md.post) expr(*md.post);
                 if (md.has_block_body && md.block_body) stmt(*md.block_body);
                 if (md.expr_body) expr(*md.expr_body);
             }
@@ -36,10 +39,19 @@ public:
         for (auto& g : m.globals)
             if (g.init) expr(*g.init);
         for (auto& f : m.funcs) {
+            count_contracts(f.pre.get(), f.post.get());
+            if (f.pre)  expr(*f.pre);
+            if (f.post) expr(*f.post);
             if (f.has_block_body && f.block_body) stmt(*f.block_body);
             if (f.expr_body) expr(*f.expr_body);
         }
         return rep_;
+    }
+
+    void count_contracts(ast::Expr* pre, ast::Expr* post)
+    {
+        if (pre)  ++rep_.checked_contract;
+        if (post) ++rep_.checked_contract;
     }
 
 private:
@@ -124,6 +136,12 @@ private:
         case ast::Stmt::Break:
         case ast::Stmt::Continue:
             break;
+        case ast::Stmt::Match: {
+            auto& x = static_cast<ast::MatchStmt&>(s);
+            expr(*x.scrutinee);
+            for (auto& arm : x.arms) stmt(*arm.body);
+            break;
+        }
         }
 
         checks_on_ = prev;
@@ -195,6 +213,18 @@ private:
             for (auto& el : l.elements) expr(*el);
             break;
         }
+        case ast::Expr::Try:
+            expr(*static_cast<ast::TryExpr&>(e).operand);
+            break;
+        case ast::Expr::OrDefault: {
+            auto& x = static_cast<ast::OrDefaultExpr&>(e);
+            expr(*x.lhs);
+            expr(*x.rhs);
+            break;
+        }
+        case ast::Expr::Must:
+            expr(*static_cast<ast::MustExpr&>(e).operand);
+            break;
         }
     }
 };
@@ -213,7 +243,8 @@ std::string format_section(std::string const& module_name, std::string const& fi
     s += "   checks : arith " + std::to_string(rep.checked_arith)
        + ", index "  + std::to_string(rep.checked_index)
        + ", deref "  + std::to_string(rep.checked_deref)
-       + ", narrow " + std::to_string(rep.checked_narrow) + "\n";
+       + ", narrow " + std::to_string(rep.checked_narrow)
+       + ", contract " + std::to_string(rep.checked_contract) + "\n";
     if (rep.opt_outs.empty()) {
         s += "   opt-out: none\n";
     } else {

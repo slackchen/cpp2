@@ -8,6 +8,7 @@
 #include <concepts>
 #include <cstdio>
 #include <cstdlib>
+#include <expected>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -135,6 +136,35 @@ inline T checked_mod(T a, T b, char const* file = "", int line = 0)
 {
     if (b == 0) { trap("division by zero", file, line); }
     return static_cast<T>(a % b);
+}
+
+// ── 错误通道:错误是值,bug 是 trap(DESIGN §8)─────────────────────
+// throws 函数降为返回 cpp2::expected<R, cpp2::error>(IMPL §4.3)。
+// v0.1 错误体 = 消息 + 源位置;类别/错误码体系留待 v0.3(DESIGN §8.4)。
+struct error {
+    std::string text;
+    error() = default;
+    explicit error(std::string s) : text(std::move(s)) {}
+    std::string const& message() const { return text; }
+};
+
+template <class T>
+using expected = std::expected<T, error>;
+
+// err():throws 函数体内构造失败值 → return err("not found");
+// 位置并入消息,错误链可追溯(栈的确定性替代)。
+inline std::unexpected<error> err(std::string msg, char const* file = "", int line = 0)
+{
+    return std::unexpected(error(std::move(msg) + " (" + file + ":"
+                                 + std::to_string(line) + ")"));
+}
+
+// must():f()! — 调用方确信不会失败,失败即 bug → trap(DESIGN §8.2)
+template <class E>
+inline decltype(auto) must(E&& e, char const* file = "", int line = 0)
+{
+    if (!e.has_value()) { trap("error asserted impossible", file, line); }
+    return *std::forward<E>(e);
 }
 
 // ── 所有权类型别名与工厂(DESIGN §7.2)──────────────────────────────

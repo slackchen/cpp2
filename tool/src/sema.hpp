@@ -1,4 +1,4 @@
-// C++2 语义分析(M2b:类型推断 + 符号/const/mutates 检查)
+// C++2 语义分析(M2c:错误通道类型 + 强制处理 + 契约检查)
 #pragma once
 
 #include "ast.hpp"
@@ -10,7 +10,7 @@
 
 namespace cpp2::sema {
 
-// 表达式类型(M2b 子集:标量、字符串、结构体、枚举、容器、智能指针)
+// 表达式类型(M2c 子集:标量、字符串、结构体、枚举、容器、智能指针、错误通道)
 struct Type {
     enum Kind {
         Unknown, Bool, Char,
@@ -19,7 +19,9 @@ struct Type {
         Float, Double, String, StringView,
         NamedStruct, NamedEnum,
         Container,                        // vector/list/map/... 有下标
-        SmartPtr                          // unique/shared/weak → pointee
+        SmartPtr,                         // unique/shared/weak → pointee
+        Error,                            // cpp2::error 值(match err 臂 / else 绑定)
+        ErrVal                            // err("msg") 的构造值(return 时转 unexpected)
     };
 
     Kind kind = Unknown;
@@ -27,9 +29,12 @@ struct Type {
     std::shared_ptr<Type> pointee;        // SmartPtr 指向类型(间接:避免自包含)
     std::shared_ptr<Type> element;        // Container 元素类型
     bool is_const = false;
+    bool is_expected = false;             // 错误通道值:expected<value, error>(throws 调用结果)
+    std::shared_ptr<Type> value;          // expected 的值类型(is_expected 时有效)
 
     Type deref() const { return pointee ? *pointee : Type{}; }
     Type elem()  const { return element ? *element : Type{}; }
+    Type val()   const { return value ? *value : Type{}; }
 
     bool known()     const { return kind != Unknown; }
     bool is_signed() const {
@@ -60,6 +65,7 @@ struct Type {
     }
 
     std::string display() const {
+        if (is_expected) return "expected<" + val().display() + ">";
         switch (kind) {
         case Unknown: return "unknown";
         case Bool: return "bool";
@@ -77,6 +83,8 @@ struct Type {
         case NamedEnum: return name;
         case Container: return name + "<" + elem().display() + ">";
         case SmartPtr: return "unique<" + deref().display() + ">";
+        case Error: return "error";
+        case ErrVal: return "err-value";
         }
         return "?";
     }

@@ -1,0 +1,13 @@
+// must_trap.cppm — f()!:调用方确信必成功,失败即 bug → trap
+module musttrap;
+import std;
+
+parse: (s: string) -> int throws = {
+    return err("bad input: " + s);
+}
+
+main: () -> int = {
+    n: int := parse("x")!;         // 此处失败 = bug
+    std::print("n = {0}\n", n);
+    return 0;
+}

@@ -1,4 +1,4 @@
-// C++2 语义分析实现(M2b:类型推断 + 表注解)
+// C++2 语义分析实现(M2c:错误通道 + 契约)
 #include "sema.hpp"
 
 #include <unordered_set>
@@ -16,6 +16,15 @@ struct Sym {
     ast::FuncDecl* func = nullptr;          // kind == Func
     ast::MethodDecl* method = nullptr;      // kind == Method
 };
+
+// expected 包装:throws 调用结果的类型
+Type as_expected(Type t)
+{
+    Type w;
+    w.is_expected = true;
+    w.value = std::make_shared<Type>(std::move(t));
+    return w;
+}
 
 class Checker {
 public:
@@ -76,6 +85,9 @@ private:
     std::vector<std::unordered_map<std::string, Sym>> scopes_;
     ast::StructDecl* cur_struct_ = nullptr;
     ast::MethodDecl* cur_method_ = nullptr;
+    bool cur_throws_ = false;               // 当前函数在错误通道上(可用 '?')
+    bool prop_ok_ = false;                  // 当前表达式位置允许 '?'(语句顶层)
+    bool in_post_ = false;                  // 在 post 契约内(old() 合法,result 可见)
 
     ast::StructDecl* find_struct(std::string const& n) {
         auto it = structs_.find(n);
@@ -217,6 +229,9 @@ private:
     {
         cur_struct_ = &s;
         cur_method_ = &md;
+        cur_throws_ = md.throws;
+        if (md.name == "destructor" && (md.pre || md.post))
+            err(md.line, 0, "destructor cannot have pre/post contracts");
 
         scopes_.clear();
         scopes_.emplace_back();                 // 成员作用域(字段 + 方法)
@@ -246,6 +261,8 @@ private:
             scopes_.back()[p.name] = sym;
         }
         if (md.ret) type_from_use(*md.ret);
+        if (md.pre) infer(*md.pre);
+        if (md.post) check_post(*md.post, md.ret);
 
         if (md.has_block_body && md.block_body) check_stmt(*md.block_body);
         if (md.expr_body) infer(*md.expr_body);
@@ -258,6 +275,9 @@ private:
     {
         cur_struct_ = nullptr;
         cur_method_ = nullptr;
+        cur_throws_ = f.throws;
+        if (f.name == "main" && f.throws)
+            err(f.line, 0, "main cannot be 'throws' (errors must be handled in main)");
 
         scopes_.clear();
         scopes_.emplace_back();                 // 参数作用域
@@ -269,8 +289,28 @@ private:
             scopes_.back()[p.name] = sym;
         }
         if (f.ret) type_from_use(*f.ret);
+        if (f.pre) infer(*f.pre);
+        if (f.post) check_post(*f.post, f.ret);
         if (f.has_block_body && f.block_body) check_stmt(*f.block_body);
         if (f.expr_body) infer(*f.expr_body);
+    }
+
+    // post 契约:old() 合法、result 绑定返回值(DESIGN §6.5)
+    void check_post(ast::Expr& post, std::optional<ast::TypeUse> const& ret)
+    {
+        scopes_.emplace_back();
+        if (ret) {
+            Sym s;
+            s.type = type_from_use(*ret);
+            s.is_const = true;
+            s.kind = SymKind::Local;
+            scopes_.back()["result"] = s;
+        }
+        bool prev = in_post_;
+        in_post_ = true;
+        infer(post);
+        in_post_ = prev;
+        scopes_.pop_back();
     }
 
     // ── 语句 ────────────────────────────────────────────────────────
@@ -285,17 +325,29 @@ private:
             return;
         }
         case ast::Stmt::ExprStmt: {
-            infer(*static_cast<ast::ExprStmt&>(s).expr);
+            auto& x = static_cast<ast::ExprStmt&>(s);
+            Type t = infer_top(*x.expr);    // 裸 f()?; = 检查 + 传播,丢弃值
+            if (x.expr->kind() == ast::Expr::Call && t.is_expected)
+                err(x.line, x.col,
+                    "unhandled error-channel call; handle it with '?', '!', 'or', match, or if-let");
             return;
         }
         case ast::Stmt::Return: {
             auto& r = static_cast<ast::ReturnStmt&>(s);
-            if (r.value) infer(*r.value);
+            if (r.value) {
+                Type t = infer_top(*r.value);
+                if (t.is_expected && !cur_throws_)
+                    err(r.line, r.col,
+                        "cannot return an error-channel value from a function that is not 'throws'");
+            }
             return;
         }
         case ast::Stmt::Var: {
             auto& v = static_cast<ast::VarStmt&>(s);
-            Type init_t = v.init ? infer(*v.init) : Type{};
+            Type init_t = v.init ? infer_top(*v.init) : Type{};
+            if (init_t.is_expected)
+                err(v.line, v.col,
+                    "unhandled error-channel value; handle it with '?', '!', 'or', match, or if-let");
             if (!v.has_type && v.init
                 && v.init->kind() == ast::Expr::ListLit
                 && static_cast<ast::ListLitExpr&>(*v.init).elements.empty())
@@ -311,14 +363,39 @@ private:
         }
         case ast::Stmt::If: {
             auto& i = static_cast<ast::IfStmt&>(s);
-            infer(*i.cond);
+            if (i.is_let()) {
+                // if-let:x := f() { } else e := it { }(DESIGN §8.3)
+                Type t = infer(*i.let_init);
+                if (!t.is_expected)
+                    err(i.line, i.col,
+                        "if-let initializer must be on the error channel (a 'throws' call)");
+                scopes_.emplace_back();
+                declare(i.let_name, t.val(), true, SymKind::Local, i.line, i.col);
+                check_stmt(*i.then_block);
+                scopes_.pop_back();
+                if (i.else_block) {
+                    scopes_.emplace_back();
+                    if (!i.else_binding.empty())
+                        declare(i.else_binding, Type::of(Type::Error), true,
+                                SymKind::Local, i.line, i.col);
+                    check_stmt(*i.else_block);
+                    scopes_.pop_back();
+                }
+                return;
+            }
+            Type ct = infer(*i.cond);
+            if (ct.is_expected)
+                err(i.line, i.col,
+                    "if condition is an unhandled error-channel value; use if-let, match, '?', '!' or 'or'");
             check_stmt(*i.then_block);
             if (i.else_block) check_stmt(*i.else_block);
             return;
         }
         case ast::Stmt::While: {
             auto& w = static_cast<ast::WhileStmt&>(s);
-            infer(*w.cond);
+            Type ct = infer(*w.cond);
+            if (ct.is_expected)
+                err(w.line, w.col, "while condition is an unhandled error-channel value");
             check_stmt(*w.body);
             return;
         }
@@ -343,6 +420,28 @@ private:
         case ast::Stmt::Break:
         case ast::Stmt::Continue:
             return;
+        case ast::Stmt::Match: {
+            auto& x = static_cast<ast::MatchStmt&>(s);
+            Type t = infer(*x.scrutinee);
+            if (!t.is_expected)
+                err(x.line, x.col,
+                    "match scrutinee must be on the error channel (a 'throws' call); "
+                    "enum/variant match arrives in M2d");
+            bool has_ok = false, has_err = false;
+            for (auto& arm : x.arms) {
+                if (arm.is_ok) has_ok = true; else has_err = true;
+                scopes_.emplace_back();
+                if (arm.binding != "_")
+                    declare(arm.binding, arm.is_ok ? t.val() : Type::of(Type::Error),
+                            true, SymKind::Local, arm.line, 0);
+                check_stmt(*arm.body);
+                scopes_.pop_back();
+            }
+            if (x.arms.empty() || !has_ok || !has_err)
+                err(x.line, x.col,
+                    "match on the error channel needs one 'ok' arm and one 'err' arm");
+            return;
+        }
         }
     }
 
@@ -373,9 +472,24 @@ private:
     }
 
     // ── 表达式推断 ──────────────────────────────────────────────────
+    // infer:嵌套位置——'?' 在此不合法(机械展开需要语句级拆分)
     Type infer(ast::Expr& e)
     {
+        bool prev = prop_ok_;
+        prop_ok_ = false;
         Type t = infer_inner(e);
+        prop_ok_ = prev;
+        res_.expr_types[&e] = t;
+        return t;
+    }
+
+    // infer_top:语句顶层(变量初始化 / return / 赋值右值)——允许整层 '?'
+    Type infer_top(ast::Expr& e)
+    {
+        bool prev = prop_ok_;
+        prop_ok_ = true;
+        Type t = infer_inner(e);
+        prop_ok_ = prev;
         res_.expr_types[&e] = t;
         return t;
     }
@@ -411,7 +525,13 @@ private:
         case ast::Expr::Assign: {
             auto& a = static_cast<ast::AssignExpr&>(e);
             check_assign_target(*a.target, a.line, a.col);
-            infer(*a.value);
+            if (a.op != "=" && a.value->kind() == ast::Expr::Try)
+                err(a.line, a.col,
+                    "'?' with compound assignment is not supported; unwrap into a variable first");
+            Type vt = infer_top(*a.value);
+            if (vt.is_expected)
+                err(a.line, a.col,
+                    "unhandled error-channel value; handle it with '?', '!', or 'or'");
             return infer_existing(*a.target);
         }
         case ast::Expr::Index: {
@@ -454,6 +574,39 @@ private:
             c.name = "list";
             c.element = std::make_shared<Type>(first);
             return c;
+        }
+        case ast::Expr::Try: {
+            auto& x = static_cast<ast::TryExpr&>(e);
+            if (!prop_ok_)
+                err(x.line, x.col,
+                    "'?' is only supported as a whole initializer, assignment value, "
+                    "return value, or statement in this milestone");
+            Type t = infer(*x.operand);
+            if (!t.is_expected)
+                err(x.line, x.col,
+                    "'?' requires a call result on the error channel (a 'throws' function)");
+            if (!cur_throws_)
+                err(x.line, x.col,
+                    "'?' propagation requires the enclosing function to be 'throws'");
+            return t.val();
+        }
+        case ast::Expr::Must: {
+            auto& x = static_cast<ast::MustExpr&>(e);
+            Type t = infer(*x.operand);
+            if (!t.is_expected)
+                err(x.line, x.col,
+                    "'!' requires a call result on the error channel (a 'throws' function)");
+            return t.val();
+        }
+        case ast::Expr::OrDefault: {
+            auto& x = static_cast<ast::OrDefaultExpr&>(e);
+            Type l = infer(*x.lhs);
+            Type r = infer(*x.rhs);
+            if (!l.is_expected)
+                err(x.line, x.col,
+                    "'or' default requires an error-channel left side (a 'throws' call)");
+            (void)r;
+            return l.val();
         }
         }
         return {};
@@ -498,6 +651,32 @@ private:
     {
         for (auto& a : c.args) infer(*a);
 
+        // 契约/错误内建:old(...) / err(...)(用户同名声明优先)
+        if (c.callee->kind() == ast::Expr::Name) {
+            auto& name = static_cast<ast::NameExpr&>(*c.callee);
+            if (!name.qualified()) {
+                if (name.parts[0] == "old" && !resolve("old")) {
+                    if (!in_post_)
+                        err(c.line, c.col, "'old(...)' is only valid in 'post' conditions");
+                    if (c.args.size() != 1)
+                        err(c.line, c.col, "'old(...)' takes exactly one argument");
+                    else
+                        return infer_existing(*c.args[0]);
+                    return {};
+                }
+                if (name.parts[0] == "err" && !resolve("err")) {
+                    if (c.args.size() != 1)
+                        err(c.line, c.col, "'err(...)' takes exactly one message argument");
+                    else if (Type t = infer_existing(*c.args[0]);
+                             t.kind != Type::String && t.kind != Type::StringView)
+                        err(c.line, c.col, "'err(...)' message must be a string");
+                    Type t;
+                    t.kind = Type::ErrVal;
+                    return t;
+                }
+            }
+        }
+
         // make_unique/make_shared 工厂
         if (c.callee->kind() == ast::Expr::Name && !c.args.empty()) {
             auto& name = static_cast<ast::NameExpr&>(*c.callee);
@@ -513,14 +692,17 @@ private:
             }
         }
 
-        // 模块函数:返回类型
+        // 模块函数:返回类型(throws → 错误通道值)
         if (c.callee->kind() == ast::Expr::Name) {
             auto& name = static_cast<ast::NameExpr&>(*c.callee);
             if (!name.qualified()) {
                 if (auto* sym = resolve(name.parts[0])) {
                     note_member_use(*sym);
-                    if (sym->kind == SymKind::Func && sym->func && sym->func->ret)
-                        return type_from_use(*sym->func->ret);
+                    if (sym->kind == SymKind::Func && sym->func && sym->func->ret) {
+                        Type t = type_from_use(*sym->func->ret);
+                        if (sym->func->throws) return as_expected(t);
+                        return t;
+                    }
                 }
                 return {};
             }
@@ -557,7 +739,11 @@ private:
                                 "cannot call mutates method '" + mem.name
                                 + "' on a const value");
                     }
-                    if (md->ret) return type_from_use(*md->ret);
+                    if (md->ret) {
+                        Type t = type_from_use(*md->ret);
+                        if (md->throws) return as_expected(t);
+                        return t;
+                    }
                     return {};
                 }
                 err(mem.line, mem.col,
@@ -639,6 +825,13 @@ private:
     {
         Type l = infer(*b.lhs);
         Type r = infer(*b.rhs);
+
+        if (l.is_expected || r.is_expected) {
+            err(b.line, b.col,
+                "cannot use an error-channel value in a binary operation; "
+                "handle it first ('?', '!', 'or', match, if-let)");
+            return {};
+        }
 
         if (b.op == "&&" || b.op == "||"
          || b.op == "==" || b.op == "!="

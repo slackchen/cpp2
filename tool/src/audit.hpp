@@ -1,4 +1,4 @@
-// C++2 安全审计(M4):统计检查注入点 + @unsafe/@unchecked 位置
+// C++2 安全审计(M4/M2c):检查注入点 + @unsafe/@unchecked 位置 + 契约
 // DESIGN §6.6:安全边界"白纸黑字"——一条命令列出全部退出点。
 #pragma once
 
@@ -20,10 +20,12 @@ struct Report {
     int checked_index = 0;                  // 越界检查注入点
     int checked_deref = 0;                  // 空检查注入点
     int checked_narrow = 0;                 // as 收窄检查注入点
+    int checked_contract = 0;               // pre/post 契约检查注入点(M2c)
     std::vector<OptOut> opt_outs;
 
     int checks() const
-    { return checked_arith + checked_index + checked_deref + checked_narrow; }
+    { return checked_arith + checked_index + checked_deref + checked_narrow
+           + checked_contract; }
     int unchecked() const;
     int unsafe() const;
 };

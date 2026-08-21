@@ -234,6 +234,11 @@ private:
     int last_line_ = -1;
     int fresh_ = 0;
     bool checks_on_ = true;
+    // post 契约发射状态:old(...) → 入口缓存变量;result → __c2_result
+    // (throws 函数包 expected 需解引用;普通函数直接引用)
+    std::unordered_map<ast::Expr*, std::string> const* old_names_ = nullptr;
+    bool in_post_ = false;
+    bool result_wrapped_ = false;
 
     sema::Type type_of(ast::Expr& e) const { return sema_->type_of(e); }
 
@@ -338,12 +343,28 @@ private:
         switch (e.kind()) {
         case ast::Expr::Literal:
             return static_cast<ast::LiteralExpr&>(e).text;
-        case ast::Expr::Name:
-            return name_expr_str(static_cast<ast::NameExpr&>(e));
+        case ast::Expr::Name: {
+            auto& n = static_cast<ast::NameExpr&>(e);
+            if (in_post_ && n.parts.size() == 1 && n.parts[0] == "result")
+                return result_wrapped_ ? "(*__c2_result)" : "__c2_result";
+            return name_expr_str(n);
+        }
         case ast::Expr::Paren:
             return "(" + expr(*static_cast<ast::ParenExpr&>(e).inner) + ")";
         case ast::Expr::Call: {
             auto& c = static_cast<ast::CallExpr&>(e);
+            // post 契约中的 old(...) → 入口缓存变量(sema 保证仅 post 出现)
+            if (old_names_) {
+                auto it = old_names_->find(&c);
+                if (it != old_names_->end()) return it->second;
+            }
+            // err("msg") → cpp2::err("msg", "file", line)(sema 已标 ErrVal)
+            if (c.callee->kind() == ast::Expr::Name && c.args.size() == 1
+                && type_of(c).kind == sema::Type::ErrVal) {
+                auto& name = static_cast<ast::NameExpr&>(*c.callee);
+                if (name.parts.size() == 1 && name.parts[0] == "err")
+                    return "cpp2::err(" + expr(*c.args[0]) + check_loc(c.line) + ")";
+            }
             std::string s = expr(*c.callee) + "(";
             for (size_t i = 0; i < c.args.size(); ++i) {
                 if (i) s += ", ";
@@ -453,6 +474,21 @@ private:
             }
             return s + "}";
         }
+        case ast::Expr::Must: {
+            // f()! → cpp2::must(f(), "file", line);失败即 bug → trap(DESIGN §8.2)
+            auto& x = static_cast<ast::MustExpr&>(e);
+            return "(cpp2::must(" + expr(*x.operand) + check_loc(x.line) + "))";
+        }
+        case ast::Expr::OrDefault: {
+            // f() or "d" → (f()).value_or("d")(DESIGN §8.3)
+            auto& x = static_cast<ast::OrDefaultExpr&>(e);
+            return "(" + expr(*x.lhs) + ").value_or((" + expr(*x.rhs) + "))";
+        }
+        case ast::Expr::Try:
+            // '?' 的机械展开需要语句级拆分,由 emit_stmt 处理;
+            // 走到这里说明 sema 漏检——发射防御性标记,生成码编译期暴露
+            return "/*internal:'?' outside statement position*/ ("
+                 + expr(*static_cast<ast::TryExpr&>(e).operand) + ")";
         }
         return "/*?*/";
     }
@@ -511,9 +547,25 @@ private:
         switch (s.kind()) {
         case ast::Stmt::ExprStmt: {
             auto& x = static_cast<ast::ExprStmt&>(s);
+            if (x.expr->kind() == ast::Expr::Try) {
+                // 裸 f()?;:检查 + 传播,丢弃值(expected<void> 风格的调用点)
+                sync_line(s.line);
+                emit_try_core(static_cast<ast::TryExpr&>(*x.expr));
+                break;
+            }
             if (x.expr->kind() == ast::Expr::Assign) {
                 auto& a = static_cast<ast::AssignExpr&>(*x.expr);
                 sync_line(s.line);
+                if (a.value->kind() == ast::Expr::Try && a.op == "=") {
+                    // x = f()?;:右值机械展开(临时量作用域隔离)
+                    out_ += pad() + "{\n";
+                    ++indent_;
+                    std::string tmp = emit_try_core(static_cast<ast::TryExpr&>(*a.value));
+                    out_ += pad() + expr(*a.target) + " = *std::move(" + tmp + ");\n";
+                    --indent_;
+                    out_ += pad() + "}\n";
+                    break;
+                }
                 if (a.op != "=" && checks_on_) {
                     sema::Type t = type_of(*a.target);
                     if (t.is_signed()) {
@@ -538,20 +590,36 @@ private:
         case ast::Stmt::Return: {
             auto& r = static_cast<ast::ReturnStmt&>(s);
             sync_line(s.line);
+            if (r.value && r.value->kind() == ast::Expr::Try) {
+                // return f()?;:失败提前 return unexpected,成功解包
+                std::string tmp = emit_try_core(static_cast<ast::TryExpr&>(*r.value));
+                out_ += pad() + "return *std::move(" + tmp + ");\n";
+                break;
+            }
             out_ += pad() + (r.value ? "return " + expr(*r.value) + ";\n" : "return;\n");
             break;
         }
         case ast::Stmt::Var: {
             auto& v = static_cast<ast::VarStmt&>(s);
-            sync_line(s.line);
+            sync_line(v.line);
             std::string type = v.has_type ? type_str(v.type)
                               : (v.is_const ? "auto const" : "auto");
+            if (v.init && v.init->kind() == ast::Expr::Try) {
+                // x := f()?; 机械展开(IMPL §4.3):求值 → 失败传播 → 解包绑定
+                std::string tmp = emit_try_core(static_cast<ast::TryExpr&>(*v.init));
+                out_ += pad() + type + " " + v.name + " = *std::move(" + tmp + ");\n";
+                break;
+            }
             out_ += pad() + type + " " + v.name + " = " + expr(*v.init) + ";\n";
             break;
         }
         case ast::Stmt::If: {
             auto& i = static_cast<ast::IfStmt&>(s);
             sync_line(s.line);
+            if (i.is_let()) {
+                emit_if_let(i);
+                break;
+            }
             out_ += pad() + "if (" + expr(*i.cond) + ") {\n";
             ++indent_;
             emit_body(*i.then_block);
@@ -597,9 +665,75 @@ private:
             out_ += pad() + "}\n";
             break;
         }
+        case ast::Stmt::Match:
+            emit_match(static_cast<ast::MatchStmt&>(s));
+            break;
         }
 
         checks_on_ = prev_checks;
+    }
+
+    // '?' 核心展开:求值到临时量,失败提前 return unexpected;返回临时量名。
+    // 解包/绑定/丢弃由调用侧追加(变量初始化 / return / 赋值 / 裸语句)。
+    std::string emit_try_core(ast::TryExpr& t)
+    {
+        std::string tmp = "__c2_try_" + std::to_string(fresh_++);
+        out_ += pad() + "auto " + tmp + " = (" + expr(*t.operand) + ");\n";
+        out_ += pad() + "if (!" + tmp + ") { return std::unexpected(std::move("
+              + tmp + ").error()); }\n";
+        return tmp;
+    }
+
+    // if x := f() { } else e := it { }:has_value 分支 + 错误绑定(DESIGN §8.3)
+    void emit_if_let(ast::IfStmt& i)
+    {
+        std::string tmp = "__c2_if_" + std::to_string(fresh_++);
+        out_ += pad() + "{\n";
+        ++indent_;
+        out_ += pad() + "auto&& " + tmp + " = (" + expr(*i.let_init) + ");\n";
+        out_ += pad() + "if (" + tmp + ".has_value()) {\n";
+        ++indent_;
+        if (i.let_name != "_")
+            out_ += pad() + "auto&& " + i.let_name + " = *" + tmp + ";\n";
+        emit_body(*i.then_block);
+        --indent_;
+        if (i.else_block) {
+            out_ += pad() + "} else {\n";
+            ++indent_;
+            if (!i.else_binding.empty())
+                out_ += pad() + "auto&& " + i.else_binding + " = " + tmp + ".error();\n";
+            emit_body(*i.else_block);
+            --indent_;
+        }
+        out_ += pad() + "}\n";
+        --indent_;
+        out_ += pad() + "}\n";
+    }
+
+    // match f() { ok x => ...; err e => ...; }:has_value() 分支链(M2c 两臂)
+    void emit_match(ast::MatchStmt& x)
+    {
+        std::string tmp = "__c2_m_" + std::to_string(fresh_++);
+        out_ += pad() + "{\n";
+        ++indent_;
+        out_ += pad() + "auto&& " + tmp + " = (" + expr(*x.scrutinee) + ");\n";
+        for (size_t k = 0; k < x.arms.size(); ++k) {
+            auto& arm = x.arms[k];
+            std::string cond = arm.is_ok ? tmp + ".has_value()"
+                                         : "!" + tmp + ".has_value()";
+            if (k == 0)                      out_ += pad() + "if (" + cond + ") {\n";
+            else if (k + 1 < x.arms.size())  out_ += pad() + "} else if (" + cond + ") {\n";
+            else                             out_ += pad() + "} else {\n";
+            ++indent_;
+            if (arm.binding != "_")
+                out_ += pad() + "auto&& " + arm.binding + " = "
+                      + (arm.is_ok ? "*" + tmp : tmp + ".error()") + ";\n";
+            emit_body(*arm.body);
+            --indent_;
+        }
+        out_ += pad() + "}\n";
+        --indent_;
+        out_ += pad() + "}\n";
     }
 
     void emit_if_inline(ast::IfStmt& i)
@@ -676,20 +810,170 @@ private:
         return s;
     }
 
+    // throws → cpp2::expected<R>(= std::expected<R, cpp2::error>,IMPL §4.3)
+    std::string ret_type_str(std::optional<ast::TypeUse> const& ret, bool throws)
+    {
+        std::string rt = ret ? type_str(*ret) : "void";
+        if (throws) rt = "cpp2::expected<" + rt + ">";
+        return rt;
+    }
+
     std::string signature(ast::FuncDecl& f, bool with_defaults)
     {
         std::string s;
         if (f.name == "main") s = "int main(";
         else                  s = "auto " + f.name + "(";
         s += params_str(f.params, with_defaults) + ")";
-        if (f.name != "main" && f.ret) s += " -> " + type_str(*f.ret);
+        if (f.name != "main" && f.ret)
+            s += " -> " + ret_type_str(f.ret, f.throws);
         return s;
     }
 
-    void emit_body_of(bool has_block, ast::Stmt* block, ast::Expr* body_expr,
+    // 收集 post 契约中的 old(...) 节点 → 缓存变量名(发射顺序 = 遍历顺序,稳定)
+    void collect_olds(ast::Expr& e, std::unordered_map<ast::Expr*, std::string>& out)
+    {
+        switch (e.kind()) {
+        case ast::Expr::Literal:
+        case ast::Expr::Name:
+            return;
+        case ast::Expr::Paren:
+            return collect_olds(*static_cast<ast::ParenExpr&>(e).inner, out);
+        case ast::Expr::Call: {
+            auto& c = static_cast<ast::CallExpr&>(e);
+            if (c.callee->kind() == ast::Expr::Name
+                && static_cast<ast::NameExpr&>(*c.callee).parts.size() == 1
+                && static_cast<ast::NameExpr&>(*c.callee).parts[0] == "old"
+                && c.args.size() == 1) {
+                out.emplace(&e, "__c2_old_" + std::to_string(fresh_++));
+            }
+            for (auto& a : c.args) collect_olds(*a, out);
+            return;
+        }
+        case ast::Expr::Binary: {
+            auto& b = static_cast<ast::BinaryExpr&>(e);
+            collect_olds(*b.lhs, out);
+            collect_olds(*b.rhs, out);
+            return;
+        }
+        case ast::Expr::Unary:
+            return collect_olds(*static_cast<ast::UnaryExpr&>(e).operand, out);
+        case ast::Expr::Assign: {
+            auto& a = static_cast<ast::AssignExpr&>(e);
+            collect_olds(*a.target, out);
+            collect_olds(*a.value, out);
+            return;
+        }
+        case ast::Expr::Index: {
+            auto& x = static_cast<ast::IndexExpr&>(e);
+            collect_olds(*x.base, out);
+            collect_olds(*x.index, out);
+            return;
+        }
+        case ast::Expr::Member:
+            return collect_olds(*static_cast<ast::MemberExpr&>(e).base, out);
+        case ast::Expr::StructLit: {
+            for (auto& [n, v] : static_cast<ast::StructLitExpr&>(e).fields)
+                collect_olds(*v, out);
+            return;
+        }
+        case ast::Expr::AsCast:
+            return collect_olds(*static_cast<ast::AsCastExpr&>(e).operand, out);
+        case ast::Expr::ListLit: {
+            for (auto& el : static_cast<ast::ListLitExpr&>(e).elements)
+                collect_olds(*el, out);
+            return;
+        }
+        case ast::Expr::Try:
+            return collect_olds(*static_cast<ast::TryExpr&>(e).operand, out);
+        case ast::Expr::OrDefault: {
+            auto& x = static_cast<ast::OrDefaultExpr&>(e);
+            collect_olds(*x.lhs, out);
+            collect_olds(*x.rhs, out);
+            return;
+        }
+        case ast::Expr::Must:
+            return collect_olds(*static_cast<ast::MustExpr&>(e).operand, out);
+        }
+    }
+
+    // 函数体发射:无契约 = 原样;有契约 = old 入口缓存 → pre → 体(post 时
+    // lambda 包裹)→ post 检查(DESIGN §6.5,IMPL §4.4)。
+    // throws 函数的 lambda 返回 expected('?'/return R 同型直达出口);
+    // 非 throws 函数返回 R 本身——失败只可能来自 trap,不存在错误传播。
+    void emit_body_of(std::string const& name, bool throws, ast::Expr* pre, ast::Expr* post,
+                      bool has_block, ast::Stmt* block, ast::Expr* body_expr,
                       std::optional<ast::TypeUse> const& ret, int line)
     {
         ++indent_;
+        bool returns = ret.has_value() && type_str(*ret) != "void";
+
+        if (!pre && !post) {                   // 快路径:零额外代码
+            emit_body_core(has_block, block, body_expr, ret, line);
+            --indent_;
+            return;
+        }
+
+        // old() 入口缓存(post 中的 old(expr) 在函数入口求值并暂存)
+        std::unordered_map<ast::Expr*, std::string> olds;
+        if (post) collect_olds(*post, olds);
+        for (auto& [call, var] : olds) {
+            auto& oc = static_cast<ast::CallExpr&>(*call);
+            sync_line(oc.line);
+            out_ += pad() + "auto " + var + " = (" + expr(*oc.args[0]) + ");\n";
+        }
+
+        if (pre) {                             // pre:违反 = bug → trap,不可捕获
+            sync_line(pre->line);
+            out_ += pad() + "if (!(" + expr(*pre) + ")) { cpp2::trap(\"precondition failed: "
+                  + name + "\"" + check_loc(pre->line) + "); }\n";
+        }
+
+        if (!post) {
+            emit_body_core(has_block, block, body_expr, ret, line);
+            --indent_;
+            return;
+        }
+
+        if (returns) {
+            // 体包进 lambda:return R 隐式转 expected;'?' 传播同型直达出口
+            std::string lt = throws ? "cpp2::expected<" + type_str(*ret) + ">"
+                                    : type_str(*ret);
+            out_ += pad() + "auto __c2_result = [&]() -> " + lt + " {\n";
+            ++indent_;
+            emit_body_core(has_block, block, body_expr, ret, line);
+            --indent_;
+            out_ += pad() + "}();\n";
+            if (throws)
+                out_ += pad() + "if (!__c2_result) { return __c2_result; }\n";
+            old_names_ = &olds;
+            in_post_ = true;
+            result_wrapped_ = throws;
+            sync_line(post->line);
+            out_ += pad() + "if (!(" + expr(*post) + ")) { cpp2::trap(\"postcondition failed: "
+                  + name + "\"" + check_loc(post->line) + "); }\n";
+            in_post_ = false;
+            old_names_ = nullptr;
+            out_ += pad() + "return __c2_result;\n";
+        } else {
+            out_ += pad() + "[&] {\n";
+            ++indent_;
+            emit_body_core(has_block, block, body_expr, ret, line);
+            --indent_;
+            out_ += pad() + "}();\n";
+            old_names_ = &olds;
+            in_post_ = true;
+            sync_line(post->line);
+            out_ += pad() + "if (!(" + expr(*post) + ")) { cpp2::trap(\"postcondition failed: "
+                  + name + "\"" + check_loc(post->line) + "); }\n";
+            in_post_ = false;
+            old_names_ = nullptr;
+        }
+        --indent_;
+    }
+
+    void emit_body_core(bool has_block, ast::Stmt* block, ast::Expr* body_expr,
+                        std::optional<ast::TypeUse> const& ret, int line)
+    {
         if (has_block && block) {
             emit_body(*block);
         } else if (body_expr) {
@@ -698,7 +982,6 @@ private:
             out_ += pad() + (returns ? "return " : "(void)(")
                   + expr(*body_expr) + (returns ? ";\n" : ");\n");
         }
-        --indent_;
     }
 
     void emit_prototype(ast::FuncDecl& f, std::string const& prefix = "")
@@ -711,7 +994,8 @@ private:
     {
         sync_line(f.line);
         out_ += signature(f, /*with_defaults*/false) + "\n{\n";
-        emit_body_of(f.has_block_body, f.block_body.get(), f.expr_body.get(), f.ret, f.line);
+        emit_body_of(f.name, f.throws, f.pre.get(), f.post.get(),
+                     f.has_block_body, f.block_body.get(), f.expr_body.get(), f.ret, f.line);
         out_ += "}\n\n";
     }
 
@@ -759,7 +1043,8 @@ private:
         out_ += "\n";
         if (md.name == "destructor") {
             out_ += pad() + "~" + s.name + "()\n{\n";
-            emit_body_of(md.has_block_body, md.block_body.get(), md.expr_body.get(),
+            emit_body_of(md.name, false, nullptr, nullptr,
+                         md.has_block_body, md.block_body.get(), md.expr_body.get(),
                          std::nullopt, md.line);
             out_ += pad() + "}\n";
             return;
@@ -767,9 +1052,10 @@ private:
         std::string sig = "auto " + md.name + "(" + params_str(md.params, false) + ")";
         if (!md.uses_members) sig = "static " + sig;
         else if (!md.mutates) sig += " const";
-        if (md.ret) sig += " -> " + type_str(*md.ret);
+        if (md.ret) sig += " -> " + ret_type_str(md.ret, md.throws);
         out_ += pad() + sig + "\n" + pad() + "{\n";
-        emit_body_of(md.has_block_body, md.block_body.get(), md.expr_body.get(), md.ret, md.line);
+        emit_body_of(md.name, md.throws, md.pre.get(), md.post.get(),
+                     md.has_block_body, md.block_body.get(), md.expr_body.get(), md.ret, md.line);
         out_ += pad() + "}\n";
     }
 };

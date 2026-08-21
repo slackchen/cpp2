@@ -115,23 +115,27 @@ cpp2/
 
 方法:`mutates` → 非 const 成员函数;默认 → `const` 成员函数;不引用 `self` 的成员 → `static` 成员函数(如工厂 `File::open`)。
 
-### 4.3 错误通道:expected,不是异常
+### 4.3 错误通道:expected,不是异常(M2c 已落地)
 
-`-> R throws [E]` → 返回 `cpp2::expected<R, cpp2::error>`(即 `std::expected`);`?` 机械展开:
+`-> R throws [E]` → 返回 `cpp2::expected<R>`(即 `std::expected<R, cpp2::error>`);`?` 机械展开:
 
 ```cpp
 // C++2
 text: string := read_file(path)?;
 
-// 生成(v0.x 形态)
+// 生成(v0.x 实际形态)
 #line 3 "app/config.cppm"
-cpp2::expected<std::string, cpp2::error> text = read_file(path);
-if (!text) { return cpp2::unexpected(std::move(text).error()); }
+auto __c2_try_0 = (read_file(path));
+if (!__c2_try_0) { return std::unexpected(std::move(__c2_try_0).error()); }
+std::string text = *std::move(__c2_try_0);
 ```
 
-- `f()!` → 结果检查失败即 `cpp2::trap`(带 C++2 源位置)
-- `match ... { ok x => / err e => }` → `has_value()` 分支;`f() or "d"` → `value_or`
-- 错误类型列表(`throws E`)编码进 `cpp2::error` 类别集合,v0.3 起在传播点静态核对
+- `?` 的合法位置(M2c 子集):变量初始化、赋值右值、`return`、裸语句(丢弃值);嵌套进更大表达式 → sema 干净报错(机械展开需要语句级拆分,表达式级 IIFE 会破坏返回类型推导)
+- `f()!` → `cpp2::must(f(), "file", line)`:失败即 `cpp2::trap`;可在任意表达式位置
+- `match f() { ok x => / err e => }` → `has_value()` 分支;`f() or "d"` → `value_or`;`if x := f() { } else e := it { }` → 同 if-let 展开
+- 失败值构造:`return err("原因");` → `cpp2::err("原因", "file", line)`,源位置并入消息(错误链的确定性替代)
+- **编译器强制处理**:错误通道值出现在未处理位置(裸调用/条件/运算对象)→ sema 报错,不允许静默丢弃
+- 错误类型列表(`throws E`)v0.1 解析后丢弃;类别体系 v0.3 起静态核对(DESIGN §8.4)
 
 **为什么不用异常承载 throws**(备选曾认真考虑):异常从 Cpp1 侧可被捕获,破坏"错误是值、bug 是 trap"的二分语义;失败密集路径回溯成本高;expected 让失败路径在生成码中显式可见。Cpp1 异常在 `cxx_legacy` 边界由生成的 `try/catch` 包装转换为 `cpp2::error`(DESIGN §9.2)。保留 `--lower-errors=exceptions` 实验开关,供互操作密集的迁移场景评估。
 
@@ -142,8 +146,8 @@ if (!text) { return cpp2::unexpected(std::move(text).error()); }
 | 下标 | `v[cpp2::index(v, i, "app.cppm:42")]`;`index()` 内联比较 `size()`,失败 trap |
 | 有符号算术 | `cpp2::checked_add(a, b)` 等;gcc/clang 用 `__builtin_*_overflow`,MSVC 用可移植预检 |
 | `n as i32` | `cpp2::narrow_cast<i32>(n)`,溢出 trap;浮点→整型经 2^N 边界重载(NaN/越界 trap) |
-| pre / post | 入口/出口 `if (!(...)) cpp2::trap(...)`;`old()` 入口求值缓存 |
-| invariant | 注入公开成员函数出入口(M4) |
+| pre / post | 入口/出口 `if (!(...)) cpp2::trap(...)`;`old()` 入口求值缓存;post 时体包进 lambda(throws 函数 lambda 返回 `expected<R>`,`?` 传播同型直达出口),`result` 绑定返回值(M2c 已落地) |
+| invariant | 注入公开成员函数出入口(v0.3) |
 | 空安全 | 智能指针解引用 → `cpp2::deref(p)->m` 空检 trap(M4 已接入);`T?` 解包经 `has_value()` 显式路径(M2d);legacy 指针解引用 → 空检 trap(M6) |
 
 `@unchecked` 块内不注入;`@unsafe` 块内容逐字转译并登记 audit。
@@ -187,15 +191,16 @@ struct Config {
     std::int64_t level = 0;
 };
 
-[[nodiscard]] cpp2::expected<Config, cpp2::error>
+cpp2::expected<Config>
 load(cpp2::in<std::string> path)
 {
 #line 10 "app/config.cppm"
-    cpp2::expected<std::string, cpp2::error> text = read_file(std::move(path));
-    if (!text) { return cpp2::unexpected(std::move(text).error()); }
-    auto __r1 = parse_config(std::move(text).value());
-    if (!__r1) { return cpp2::unexpected(std::move(__r1).error()); }
-    return std::move(__r1);
+    auto __c2_try_0 = (read_file(path));
+    if (!__c2_try_0) { return std::unexpected(std::move(__c2_try_0).error()); }
+    std::string text = *std::move(__c2_try_0);
+    auto __c2_try_1 = (parse_config(text));
+    if (!__c2_try_1) { return std::unexpected(std::move(__c2_try_1).error()); }
+    return *__c2_try_1;
 }
 
 } // namespace cpp2mod::app::config
@@ -209,7 +214,7 @@ load(cpp2::in<std::string> path)
 |---|---|
 | `trap(msg, file, line)` | 打印原因与位置后 `std::abort`;不抛出 |
 | `checked_add/sub/mul`、`narrow_cast<T>`、`index(c, i, loc)` | 溢出/越界检查;优先编译器 builtin |
-| `expected` / `error` | `std::expected` 别名;`error` = 类别集合 + 消息 + 可选来源(错误链) |
+| `expected` / `error` | `std::expected<T, cpp2::error>` 单参别名;`error` = 消息 + `message()`;`err(msg, loc)` 构造失败值(位置并入消息);`must(e, loc)` 断言必成功(M2c 已落地;类别集合/错误链 v0.3) |
 | `in<T>` | 参数传递模式包装(§4.2) |
 | `arena` | 段式分配 + 析构登记(创建序);`reset()` 逆序执行析构后整块归还 |
 | `unique` / `shared` / `weak` | std 别名 + 工厂函数 |
@@ -258,7 +263,7 @@ load(cpp2::in<std::string> path)
 1. **用例驱动**:每个 `tests/cases/*.cppm` 附 `expected/*.txt`(stdout)与可选 `errors.txt`(诊断);runner:转译 → 三编译器矩阵编译 → 运行 → diff
 2. **规范即测试**:DESIGN.md 每个示例进 `examples/`;文档改动必须过测试(doc-driven,规范与实现不漂移)
 3. **降低快照**:代表性用例的生成码快照,PR 中审查降低规则变化
-4. **故障注入(M4,已落地)**:注入越界/溢出/空解引用/浮点转换的用例必须 trap,且断言 trap 消息携带 `.cppm` 源位置——验证检查存在且生效
+4. **故障注入(M4/M2c,已落地)**:注入越界/溢出/空解引用/浮点转换/契约违反(pre/post)/`!` 断言失败的用例必须 trap,且断言 trap 消息携带 `.cppm` 源位置——验证检查存在且生效
 5. **模糊测试(M4,已落地)**:内置 `cpp2 fuzz` 确定性变异 fuzzer(seed 可复现,CI 友好);libFuzzer harness 备于 `tool/fuzz/`(支持该 sanitizer 的平台使用)
 
 ---
@@ -281,7 +286,7 @@ load(cpp2::in<std::string> path)
 |---|---|---|
 | M2a | 词法/语法子集、整程序模式、Emit + `#line`、rt 骨架 | `hello.cppm` 在 clang/gcc/MSVC 跑通 |
 | M2b | type/成员/`mutates`、参数模式、enum、检查注入(下标/溢出) | DESIGN §5–§6 示例全绿 |
-| M2c | 错误通道(expected / `?` / `!` / match ok-err / `or`)、契约 | DESIGN §8 示例全绿 |
+| M2c | ~~错误通道(expected / `?` / `!` / match ok-err / `or`)、契约~~ **已完成** | DESIGN §8 示例全绿 |
 | M2d | 泛型 + concept、UFCS、variant/optional、模式匹配 | DESIGN §4.5–§5.6 示例全绿 |
 | M2e | `.c2i` 产出、`cpp2 audit`、`cpp2 run` / `check` CLI | `.c2i` 格式冻结 v1 |
 | M3 | C++20 模块发射、`cpp2 build` 并行增量、`export-headers` | 千单元项目增量构建正确 |
@@ -307,10 +312,22 @@ M4 实现偏差:
 
 | 偏差 | 现状 | 计划 |
 |---|---|---|
-| 契约检查项 | audit 不含 pre/post/invariant——语法属 M2c,尚未实现 | M2c 落地后:注入 + 计入 audit + 故障注入用例 |
+| ~~契约检查项~~ | ~~audit 不含 pre/post/invariant~~ **M2c 已落地**:pre/post 注入 + audit 计数 + 故障注入用例;invariant 仍挂账 | invariant v0.3 注入公开成员函数出入口 |
 | gcc/msvc 模块参数 | 文档形态,未实测(本机无对应编译器) | 取得环境后跑 `tests/run.sh` 修正 |
 | libFuzzer | llvm-mingw(windows-gnu)不支持 `-fsanitize=fuzzer`(实测报错);harness 已备(`tool/fuzz/`),内置变异 fuzzer 承担本机与 CI 职责 | Linux/MSVC CI 接入 |
 | fuzz 覆盖 | 词法/语法/sema;emit 未入 fuzz(其崩溃面小且有快照测试) | M5 起纳入 emit 与模块图加载 |
+
+**M2c 完成记录(2026-08-21)**:错误通道全链路落地——`throws` 函数签名降为 `cpp2::expected<R>`(`rt`:`std::expected` 单参别名 + `error{message()}` + `err(msg, loc)` + `must(e, loc)`);`?` 机械展开(求值到临时量 → 失败提前 `return std::unexpected(error)` → 解包),合法位置 = 变量初始化/赋值右值/`return`/裸语句,嵌套使用 sema 干净报错;`f()!` → `cpp2::must`(任意表达式位置);`f() or 默认` → `value_or`;`match f() { ok x / err e }` → `has_value()` 分支(穷尽性 = 恰好一 ok 一 err);`if x := f() { } else e := it { }` 同构展开;`err("消息")` 自动附 `.cppm:行` 源位置。**编译器强制处理**:错误通道值出现在裸调用/`if`/`while` 条件/二元运算等未处理位置一律 sema 报错(DESIGN §8.1 "调用方必须处理"由类型系统背书)。契约:`pre:`/`post:`(函数与方法),`old()` 入口求值缓存,`result` 绑定返回值;post 时体包进 lambda——throws 函数 lambda 返回 `expected<R>`(`return R` 隐式转换、`?` 传播同型直达出口,失败跳过 post),非 throws 函数返回 `R` 本身;契约违反 → trap 不可捕获。audit 新增 contract 计数。接口哈希:方法签名补 `throws` 标记(签名变更触发依赖者重编)。过程中修复一个存量词法缺陷:`!=` 从未有过双字符规则(此前所有示例恰好只用 `==`),postfix `!` 落地后暴露,已补 `Ne` 词法。
+
+M2c 实现偏差:
+
+| 偏差 | 现状 | 计划 |
+|---|---|---|
+| `?` 嵌套进更大表达式 | sema 报错(仅语句级四种位置) | M2d+ 评估语句拆分或表达式级 lowering |
+| `throws E` 显式类别 | 解析后丢弃 | v0.3 错误类型体系(DESIGN §8.4) |
+| `err()` 消息 | 纯字符串 + 位置;无类别/错误链 | v0.3 同上 |
+| invariant | 未实现(DESIGN §6.5 类型不变量) | v0.3 注入公开成员函数出入口 |
+| 契约 + 简短体外的复杂控制流 | lambda 包裹对 NRVO 有影响(post 存在时) | Release 档位裁剪 post 时零开销(M4 §6.7 规则不变) |
 
 ---
 

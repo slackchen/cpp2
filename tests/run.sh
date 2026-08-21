@@ -113,6 +113,67 @@ else
     echo "FAIL m4/depth-guard"; fail=$((fail+1))
 fi
 
+# ── M2c:错误通道 + 契约 ──────────────────────────────────────────
+# 错误通道五件套:? 传播 / ! 断言 / or 默认 / match ok-err / if-let(DESIGN §8)
+run_case examples/errors.cppm "a = 21"                                ok
+run_case examples/errors.cppm "b = 7"                                 ok
+run_case examples/errors.cppm "double = 40"                           ok
+run_case examples/errors.cppm "failed: not a digit in '2x' (examples/errors.cppm:12)" ok
+run_case examples/errors.cppm "v = 99"                                ok
+# 契约:pre/post/old()/result(DESIGN §6.5)
+run_case examples/contract.cppm "w = 30, balance = 70"                ok
+run_case examples/contract.cppm "int_sqrt(26) = 5"                    ok
+run_case examples/contract.cppm "value = 5"                           ok
+# throws + post 组合(错误通道上的出口检查)
+run_case tests/cases/errpost.cppm "half = 5"                          ok
+run_case tests/cases/errpost.cppm "failed: odd input (tests/cases/errpost.cppm:9)" ok
+# 故障注入:契约违反 / ! 断言失败 = bug → trap(带 .cppm 源位置)
+run_case tests/cases/pre_trap.cppm  "precondition failed"             trap "pre_trap.cppm:6"
+run_case tests/cases/post_trap.cppm "postcondition failed"            trap "post_trap.cppm:6"
+run_case tests/cases/must_trap.cppm "error asserted impossible"       trap "must_trap.cppm:10"
+
+# audit:契约计数(contract.cppm = withdraw/int_sqrt/bump 各 pre+post = 6)
+if "$CPP2" audit examples/contract.cppm 2>/dev/null | grep -q "contract 6"; then
+    echo "PASS m2c/audit-contract"; pass=$((pass+1))
+else
+    echo "FAIL m2c/audit-contract"; fail=$((fail+1))
+fi
+
+# 模块模式:expected 签名跨 BMI 正常(模块单元 + 链接)
+if "$CPP2" build examples/errors.cppm >/dev/null 2>&1 \
+   && ./examples/.cpp2build/errors 2>/dev/null | grep -q "double = 40"; then
+    echo "PASS m2c/module-errors"; pass=$((pass+1))
+else
+    echo "FAIL m2c/module-errors"; fail=$((fail+1))
+fi
+
+# 负例:未处理错误通道调用 → 干净诊断(编译器强制处理,DESIGN §8.1)
+cat > .cpp2build/unhandled.cppm <<'EOF'
+module unhandled;
+import std;
+f: () -> int throws = { return err("boom"); }
+main: () -> int = { f(); return 0; }
+EOF
+if "$CPP2" transpile .cpp2build/unhandled.cppm 2>&1 | grep -q "unhandled error-channel"; then
+    echo "PASS m2c/unhandled-call"; pass=$((pass+1))
+else
+    echo "FAIL m2c/unhandled-call"; fail=$((fail+1))
+fi
+
+# 负例:非 throws 函数内用 '?' → 干净诊断
+cat > .cpp2build/nonthrows.cppm <<'EOF'
+module nonthrows;
+import std;
+f: () -> int throws = { return 1; }
+g: () -> int = { n: int := f()?; return n; }
+main: () -> int = { return 0; }
+EOF
+if "$CPP2" transpile .cpp2build/nonthrows.cppm 2>&1 | grep -q "enclosing function to be 'throws'"; then
+    echo "PASS m2c/prop-requires-throws"; pass=$((pass+1))
+else
+    echo "FAIL m2c/prop-requires-throws"; fail=$((fail+1))
+fi
+
 echo
 echo "passed $pass, failed $fail"
 [[ $fail -eq 0 ]]
