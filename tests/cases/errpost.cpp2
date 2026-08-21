@@ -1,4 +1,4 @@
-// errpost.cppm — throws + post 契约组合:错误通道上的出口检查
+// errpost.cpp2 — throws + post 契约组合:错误通道上的出口检查
 module errpost;
 import std;
 

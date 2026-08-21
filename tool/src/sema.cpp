@@ -1,6 +1,7 @@
 // C++2 语义分析实现(M2d:泛型/concept、variant、optional、模式匹配、UFCS)
 #include "sema.hpp"
 
+#include <functional>
 #include <unordered_set>
 
 namespace cpp2::sema {
@@ -1111,8 +1112,73 @@ private:
 
     // 泛型函数调用推断:临时泛型环境 + 直位合一(参数类型恰为 T 时绑定实参类型),
     // 返回类型做 T → 实参类型替换。嵌套容器型(vector<T>)不做深度合一(v0.1)。
+    // 调用点实参相容性:刻意宽松——只拦"确定不兼容"(结构体名不符、
+    // expected/optional 包装不符),算术宽化/字符串字面量/泛型一律放行
+    // (收窄类问题由运行期检查兜底)。未知类型放行,避免误报。
+    bool arg_assignable(Type const& param, Type const& arg)
+    {
+        if (!param.known() || !arg.known()) return true;
+        if (param.kind == Type::Generic || arg.kind == Type::Generic) return true;
+        if (param.display() == arg.display()) return true;
+        if (param.is_arith() && arg.is_arith()) return true;
+        auto stry = [](Type const& t) {
+            return t.kind == Type::String || t.kind == Type::StringView;
+        };
+        if (stry(param) && stry(arg)) return true;
+        if (param.is_expected == arg.is_expected && param.is_optional == arg.is_optional
+            && param.value && arg.value)
+            return arg_assignable(*param.value, *arg.value);
+        return false;
+    }
+
+    void check_call_args(std::string const& name, std::vector<ast::Param>& params,
+                         ast::CallExpr& c, ast::FuncDecl* fd = nullptr)
+    {
+        size_t required = 0;
+        for (auto& p : params)
+            if (!p.default_value) ++required;
+        if (c.args.size() < required || c.args.size() > params.size()) {
+            std::string expect = std::to_string(required);
+            if (required != params.size())
+                expect += " to " + std::to_string(params.size());
+            err(c.line, c.col,
+                "function '" + name + "' expects " + expect + " argument(s), got "
+                + std::to_string(c.args.size()));
+            return;
+        }
+        // 被调函数自身的类型参数(T)不在此环境解析(避免 unknown type 误报):
+        // 形参类型任意位置(含 vector<T> 等嵌套实参)引用 T 时整参放行
+        std::unordered_set<std::string> own_tp;
+        if (fd)
+            for (auto& t : fd->type_params) own_tp.insert(t.name);
+        auto mentions_tp = [&](ast::TypeUse const& t) -> bool {
+            if (own_tp.empty()) return false;
+            std::function<bool(ast::TypeUse const&)> walk =
+                [&](ast::TypeUse const& u) {
+                    for (auto& p : u.parts)
+                        if (own_tp.count(p)) return true;
+                    for (auto& a : u.args)
+                        if (walk(a)) return true;
+                    return false;
+                };
+            return walk(t);
+        };
+        for (size_t i = 0; i < c.args.size() && i < params.size(); ++i) {
+            if (mentions_tp(params[i].type))
+                continue;
+            Type pt = type_from_use(params[i].type);
+            Type at = type_of_expr(*c.args[i]);
+            if (!arg_assignable(pt, at))
+                err(c.line, c.col,
+                    "argument " + std::to_string(i + 1) + " of '" + name
+                    + "' expects '" + pt.display() + "', got '"
+                    + (at.known() ? at.display() : "?") + "'");
+        }
+    }
+
     Type infer_func_call(ast::FuncDecl& fd, ast::CallExpr& c)
     {
+        check_call_args(fd.name, fd.params, c, &fd);
         if (fd.type_params.empty()) {
             if (!fd.ret) return {};
             Type t = type_from_use(*fd.ret);
@@ -1194,13 +1260,18 @@ private:
                     return t;
                 }
                 if (auto* md = sd->find_method(mem.name)) {
-                    if (call) {
-                        // mutates 方法不能作用在 const 接收者上
-                        if (md->mutates && (base.is_const || receiver_is_const(*mem.base)))
-                            err(mem.line, mem.col,
-                                "cannot call mutates method '" + mem.name
-                                + "' on a const value");
+                    if (!call) {
+                        // 方法不是值:成员访问位置引用方法(如赋值目标)→ 干净诊断
+                        err(mem.line, mem.col,
+                            "'" + mem.name + "' is a method, not a value");
+                        return {};
                     }
+                    // mutates 方法不能作用在 const 接收者上
+                    if (md->mutates && (base.is_const || receiver_is_const(*mem.base)))
+                        err(mem.line, mem.col,
+                            "cannot call mutates method '" + mem.name
+                            + "' on a const value");
+                    check_call_args(mem.name, md->params, *call);
                     if (md->ret) {
                         Type t = type_from_use(*md->ret);
                         if (md->throws) return as_expected(t);

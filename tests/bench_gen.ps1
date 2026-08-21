@@ -65,7 +65,7 @@ for ($i = 0; $i -lt $Count; $i++) {
             [void]$sb.AppendLine("}")
         }
     }
-    $path = Join-Path $Root (("m{0:D3}" -f $i) + ".cppm")
+    $path = Join-Path $Root (("m{0:D3}" -f $i) + ".cpp2")
     [System.IO.File]::WriteAllText($path, $sb.ToString(), $utf8)
 }
 
@@ -87,6 +87,6 @@ for ($i = 0; $i -lt $Count; $i += 10) {
 [void]$sb.AppendLine("    std::println(`"bench ok: {0}`", total);")
 [void]$sb.AppendLine("    return 0;")
 [void]$sb.AppendLine("}")
-[System.IO.File]::WriteAllText((Join-Path $Root "main.cppm"), $sb.ToString(), $utf8)
+[System.IO.File]::WriteAllText((Join-Path $Root "main.cpp2"), $sb.ToString(), $utf8)
 
-Write-Output ("generated: $Count modules x $Funcs funcs -> " + (Join-Path $Root "main.cppm"))
+Write-Output ("generated: $Count modules x $Funcs funcs -> " + (Join-Path $Root "main.cpp2"))

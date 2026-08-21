@@ -1,6 +1,7 @@
 // cpp2 命令行工具(M2e:build / run / check / transpile / export-headers / audit / fuzz)
 #include "ast.hpp"
 #include "audit.hpp"
+#include "diagfilter.hpp"
 #include "emit.hpp"
 #include "fuzz.hpp"
 #include "lexer.hpp"
@@ -19,6 +20,8 @@
 #include <fstream>
 #include <functional>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <string>
@@ -37,6 +40,7 @@ namespace emit  = cpp2::emit;
 namespace mods  = cpp2::mods;
 namespace util  = cpp2::util;
 namespace sha256 = cpp2::sha256;
+namespace diagfilter = cpp2::diagfilter;
 namespace tc    = cpp2::toolchain;
 namespace audit = cpp2::audit;
 namespace fuzz  = cpp2::fuzz;
@@ -69,6 +73,30 @@ void print_diag(std::string const& file, char const* sev, int line, int col, std
 }
 
 std::string quote(std::string const& s) { return "\"" + s + "\""; }
+
+// 运行命令并捕获输出(编译失败时做后端诊断过滤,替代直通 system)
+struct CmdResult { bool ok; std::string output; };
+
+CmdResult run_capture(std::string const& cmd)
+{
+    // 诊断走 stderr:合并后再捕获,否则过滤形同虚设
+#if defined(_WIN32)
+    FILE* p = _popen((cmd + " 2>&1").c_str(), "r");
+#else
+    FILE* p = popen((cmd + " 2>&1").c_str(), "r");
+#endif
+    if (!p) return { false, "" };
+    std::string out;
+    char buf[4096];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof buf, p)) > 0) out.append(buf, n);
+#if defined(_WIN32)
+    int rc = _pclose(p);
+#else
+    int rc = pclose(p);
+#endif
+    return { rc == 0, std::move(out) };
+}
 
 std::string native(fs::path p)
 {
@@ -261,7 +289,7 @@ void write_cache(fs::path const& build_dir, std::string const& mod, CacheRec con
 int cmd_transpile(std::vector<std::string> const& args)
 {
     if (args.empty()) {
-        std::cerr << "usage: cpp2 transpile <root.cppm> [-o out.cpp]\n";
+        std::cerr << "usage: cpp2 transpile <root.cpp2> [-o out.cpp]\n";
         return 1;
     }
     fs::path in = args[0];
@@ -285,7 +313,7 @@ int cmd_transpile(std::vector<std::string> const& args)
 int cmd_check(std::vector<std::string> const& args)
 {
     if (args.empty()) {
-        std::cerr << "usage: cpp2 check <root.cppm>\n";
+        std::cerr << "usage: cpp2 check <root.cpp2>\n";
         return 1;
     }
     auto p = prepare(fs::path(args[0]));
@@ -297,7 +325,7 @@ int cmd_check(std::vector<std::string> const& args)
 int cmd_run(std::vector<std::string> const& args)
 {
     if (args.empty()) {
-        std::cerr << "usage: cpp2 run <root.cppm>\n";
+        std::cerr << "usage: cpp2 run <root.cpp2>\n";
         return 1;
     }
     fs::path in = args[0];
@@ -324,7 +352,10 @@ int cmd_run(std::vector<std::string> const& args)
     std::string cc = cxx + " -std=c++23 -O0 -g -I" + quote(native(*rt))
                    + " " + quote(native(cpp)) + " -o " + quote(exe_s);
     std::cerr << "[cpp2] " << cc << "\n";
-    if (std::system(cc.c_str()) != 0) {
+    auto r = run_capture(cc);
+    if (!r.ok) {
+        std::cerr << diagfilter::banner
+                  << diagfilter::filter(r.output, native(build_dir));
         std::cerr << "error: compilation failed\n";
         return 2;
     }
@@ -355,12 +386,12 @@ int cmd_build(std::vector<std::string> const& args)
         return 1;
     }
     if (in.empty()) {
-        for (char const* cand : {"main.cppm", "app.cppm"}) {
+        for (char const* cand : {"main.cpp2", "app.cpp2"}) {
             if (fs::exists(cand)) { in = cand; break; }
         }
     }
     if (in.empty()) {
-        std::cerr << "usage: cpp2 build <root.cppm> [--backend=headers|cxx20-modules]"
+        std::cerr << "usage: cpp2 build <root.cpp2> [--backend=headers|cxx20-modules]"
                      " [--max-tu-size=N]\n";
         return 1;
     }
@@ -521,6 +552,7 @@ int cmd_build(std::vector<std::string> const& args)
         }
 
         // part 间无编译依赖(接口全在 .h)→ 全量并行
+        std::mutex err_mtx;
         std::vector<std::thread> workers;
         for (size_t i = 0; i < jobs.size(); ++i) {
             if (fs::exists(jobs[i].obj)) continue;    // 未被判定为 needed
@@ -529,7 +561,14 @@ int cmd_build(std::vector<std::string> const& args)
                 std::string cc = tc::plain_compile_command(
                     cxx, fam, native(*rt), native(cpp), native(jobs[i].obj));
                 std::cerr << "[cpp2] " << cc << "\n";
-                if (std::system(cc.c_str()) != 0) { ++failures; return; }
+                auto r = run_capture(cc);
+                if (!r.ok) {
+                    std::lock_guard<std::mutex> lk(err_mtx);
+                    std::cerr << diagfilter::banner
+                              << diagfilter::filter(r.output, native(build_dir));
+                    ++failures;
+                    return;
+                }
                 ++compiled;
             });
         }
@@ -557,6 +596,8 @@ int cmd_build(std::vector<std::string> const& args)
                 if (need_compile.at(dep)) ++n;
             indeg[name] = n;
         }
+
+        std::mutex err_mtx;
 
         std::vector<std::string> remaining = g.order;
         while (!remaining.empty()) {
@@ -613,11 +654,15 @@ int cmd_build(std::vector<std::string> const& args)
                 }
 
                 std::cerr << "[cpp2] " << cc << "\n";
-                    if (std::system(cc.c_str()) != 0) {
-                        ++failures;
-                        return;
-                    }
-                    ++compiled;
+                auto r = run_capture(cc);
+                if (!r.ok) {
+                    std::lock_guard<std::mutex> lk(err_mtx);
+                    std::cerr << diagfilter::banner
+                              << diagfilter::filter(r.output, native(build_dir));
+                    ++failures;
+                    return;
+                }
+                ++compiled;
                 });
             }
             for (auto& w : workers) w.join();
@@ -661,7 +706,7 @@ int cmd_build(std::vector<std::string> const& args)
 int cmd_export_headers(std::vector<std::string> const& args)
 {
     if (args.empty()) {
-        std::cerr << "usage: cpp2 export-headers <root.cppm> [-o dir]\n";
+        std::cerr << "usage: cpp2 export-headers <root.cpp2> [-o dir]\n";
         return 1;
     }
     fs::path in = args[0];
@@ -692,7 +737,7 @@ int cmd_export_headers(std::vector<std::string> const& args)
 int cmd_audit(std::vector<std::string> const& args)
 {
     if (args.empty() || (!args[0].empty() && args[0][0] == '-')) {
-        std::cerr << "usage: cpp2 audit <root.cppm>\n";
+        std::cerr << "usage: cpp2 audit <root.cpp2>\n";
         return 1;
     }
     fs::path in = args[0];
@@ -740,7 +785,7 @@ int cmd_fuzz(std::vector<std::string> const& args)
         }
     }
     if (files.empty()) {
-        std::cerr << "usage: cpp2 fuzz <corpus.cppm...> [--seed N] [--iters N]"
+        std::cerr << "usage: cpp2 fuzz <corpus.cpp2...> [--seed N] [--iters N]"
                      " [--crash-dir dir]\n";
         return 1;
     }
@@ -754,13 +799,13 @@ void usage()
 {
     std::cerr
         << "usage:\n"
-        << "  cpp2 run <root.cppm>                        # 摊平转译 + 编译 + 执行\n"
-        << "  cpp2 check <root.cppm>                      # 快速语义检查,不生成代码\n"
-        << "  cpp2 build [root.cppm]                      # 并行增量构建(默认 headers 后端)\n"
+        << "  cpp2 run <root.cpp2>                        # 摊平转译 + 编译 + 执行\n"
+        << "  cpp2 check <root.cpp2>                      # 快速语义检查,不生成代码\n"
+        << "  cpp2 build [root.cpp2]                      # 并行增量构建(默认 headers 后端)\n"
         << "      [--backend=headers|cxx20-modules] [--max-tu-size=N]\n"
-        << "  cpp2 transpile <root.cppm> [-o out.cpp]     # 摊平转译查看生成码\n"
-        << "  cpp2 export-headers <root.cppm> [-o dir]    # 生成 Cpp1 消费者 .h/.cpp\n"
-        << "  cpp2 audit <root.cppm>                      # 安全审计:检查点 + 退出点\n"
+        << "  cpp2 transpile <root.cpp2> [-o out.cpp]     # 摊平转译查看生成码\n"
+        << "  cpp2 export-headers <root.cpp2> [-o dir]    # 生成 Cpp1 消费者 .h/.cpp\n"
+        << "  cpp2 audit <root.cpp2>                      # 安全审计:检查点 + 退出点\n"
         << "  cpp2 fuzz <corpus...> [--seed N --iters N]  # 前端模糊测试\n"
         << "  cpp2 version\n";
 }

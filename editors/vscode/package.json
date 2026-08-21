@@ -1,0 +1,77 @@
+{
+  "name": "cpp2-lang",
+  "displayName": "C++2 (cpp2)",
+  "description": "C++2 language support: syntax highlighting, diagnostics via cpp2 check, completions, outline, run/build commands",
+  "version": "0.1.0",
+  "publisher": "cpp2",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Programming Languages"
+  ],
+  "activationEvents": [
+    "onLanguage:cpp2"
+  ],
+  "main": "./extension.js",
+  "contributes": {
+    "languages": [
+      {
+        "id": "cpp2",
+        "aliases": [
+          "C++2",
+          "cpp2"
+        ],
+        "extensions": [
+          ".cpp2"
+        ],
+        "configuration": "./language-configuration.json"
+      }
+    ],
+    "grammars": [
+      {
+        "language": "cpp2",
+        "scopeName": "source.cpp2",
+        "path": "./syntaxes/cpp2.tmLanguage.json"
+      }
+    ],
+    "commands": [
+      {
+        "command": "cpp2.run",
+        "title": "C++2: Run File",
+        "category": "C++2"
+      },
+      {
+        "command": "cpp2.build",
+        "title": "C++2: Build",
+        "category": "C++2"
+      },
+      {
+        "command": "cpp2.check",
+        "title": "C++2: Check Current File",
+        "category": "C++2"
+      }
+    ],
+    "configuration": {
+      "title": "C++2",
+      "properties": {
+        "cpp2.toolPath": {
+          "type": "string",
+          "default": "cpp2",
+          "description": "Path to the cpp2 tool executable (e.g. D:/project/AI/glm/cpp2/.cpp2build/cpp2.exe)"
+        },
+        "cpp2.checkOnSave": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run cpp2 check when a document is saved"
+        },
+        "cpp2.checkOnChange": {
+          "type": "boolean",
+          "default": true,
+          "description": "Run cpp2 check while typing (debounced)"
+        }
+      }
+    }
+  }
+}

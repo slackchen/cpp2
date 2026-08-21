@@ -1,4 +1,4 @@
-// colors.cppm — scoped enum、as 转换、底层类型
+// colors.cpp2 — scoped enum、as 转换、底层类型
 module colors;
 import std;
 

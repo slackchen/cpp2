@@ -1,4 +1,4 @@
-// smart.cppm — unique/shared 所有权、'.' 自动解引用、显式 move
+// smart.cpp2 — unique/shared 所有权、'.' 自动解引用、显式 move
 module smart;
 import std;
 

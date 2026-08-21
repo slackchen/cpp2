@@ -1,0 +1,239 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "C++2",
+  "scopeName": "source.cpp2",
+  "patterns": [
+    {
+      "include": "#comments"
+    },
+    {
+      "include": "#annotations"
+    },
+    {
+      "include": "#strings"
+    },
+    {
+      "include": "#module-line"
+    },
+    {
+      "include": "#type-decl"
+    },
+    {
+      "include": "#func-decl"
+    },
+    {
+      "include": "#var-decl"
+    },
+    {
+      "include": "#keywords"
+    },
+    {
+      "include": "#builtin-types"
+    },
+    {
+      "include": "#std-names"
+    },
+    {
+      "include": "#numbers"
+    },
+    {
+      "include": "#operators"
+    }
+  ],
+  "repository": {
+    "comments": {
+      "patterns": [
+        {
+          "name": "comment.block.cpp2",
+          "begin": "/\\*",
+          "end": "\\*/",
+          "patterns": [
+            {
+              "include": "#comments"
+            }
+          ]
+        },
+        {
+          "name": "comment.line.double-slash.cpp2",
+          "match": "//.*$"
+        }
+      ]
+    },
+    "annotations": {
+      "patterns": [
+        {
+          "name": "keyword.other.annotation.cpp2",
+          "match": "@(unsafe|unchecked)\\b"
+        },
+        {
+          "name": "variable.other.compile-time.cpp2",
+          "match": "\\$[A-Za-z_]\\w*"
+        }
+      ]
+    },
+    "strings": {
+      "patterns": [
+        {
+          "name": "string.quoted.double.cpp2",
+          "begin": "\"",
+          "end": "\"",
+          "patterns": [
+            {
+              "name": "constant.character.escape.cpp2",
+              "match": "\\\\(?:[abfnrtv'\"\\\\]|x[0-9a-fA-F]{2})"
+            }
+          ]
+        },
+        {
+          "name": "string.quoted.single.cpp2",
+          "begin": "'",
+          "end": "'",
+          "patterns": [
+            {
+              "name": "constant.character.escape.cpp2",
+              "match": "\\\\(?:[abfnrtv'\"\\\\]|x[0-9a-fA-F]{2})"
+            }
+          ]
+        }
+      ]
+    },
+    "module-line": {
+      "patterns": [
+        {
+          "name": "meta.module.cpp2",
+          "match": "^\\s*(module|import)\\s+([A-Za-z_]\\w*(?:\\.[A-Za-z_]\\w*)*)",
+          "captures": {
+            "1": {
+              "name": "keyword.control.import.cpp2"
+            },
+            "2": {
+              "name": "entity.name.namespace.cpp2"
+            }
+          }
+        }
+      ]
+    },
+    "type-decl": {
+      "patterns": [
+        {
+          "name": "meta.type-decl.cpp2",
+          "match": "^\\s*([A-Za-z_]\\w*)\\s*:\\s*(type|enum|variant|concept)\\b",
+          "captures": {
+            "1": {
+              "name": "entity.name.type.cpp2"
+            },
+            "2": {
+              "name": "keyword.declaration.cpp2"
+            }
+          }
+        }
+      ]
+    },
+    "func-decl": {
+      "patterns": [
+        {
+          "name": "meta.function-decl.cpp2",
+          "match": "^\\s*([A-Za-z_]\\w*)\\s*:\\s*(?=<[^;{]*>?\\s*\\(|\\()",
+          "captures": {
+            "1": {
+              "name": "entity.name.function.cpp2"
+            }
+          }
+        }
+      ]
+    },
+    "var-decl": {
+      "patterns": [
+        {
+          "name": "meta.var-decl.cpp2",
+          "match": "^\\s*([A-Za-z_]\\w*)\\s*:(?![=])",
+          "captures": {
+            "1": {
+              "name": "variable.other.cpp2"
+            }
+          }
+        }
+      ]
+    },
+    "keywords": {
+      "patterns": [
+        {
+          "name": "keyword.control.flow.cpp2",
+          "match": "\\b(if|else|for|while|return|break|continue|match)\\b"
+        },
+        {
+          "name": "keyword.control.import.cpp2",
+          "match": "\\b(module|import|export)\\b"
+        },
+        {
+          "name": "keyword.declaration.cpp2",
+          "match": "\\b(type|enum|variant|concept)\\b"
+        },
+        {
+          "name": "storage.modifier.cpp2",
+          "match": "\\b(const|mutates|throws|inout|out|move|copy|forward|in)\\b"
+        },
+        {
+          "name": "constant.language.cpp2",
+          "match": "\\b(true|false|none|some|self|_)\\b"
+        },
+        {
+          "name": "keyword.other.special.cpp2",
+          "match": "\\b(destructor|operator(?:<|>|<=|>=|==|!=|\\+|-|\\*|/))\\b"
+        }
+      ]
+    },
+    "builtin-types": {
+      "name": "support.type.cpp2",
+      "match": "\\b(void|bool|char|i8|i16|i32|i64|u8|u16|u32|u64|int|float|double|string|string_view|list|vector|byte|unique|shared|weak|auto)\\b"
+    },
+    "std-names": {
+      "patterns": [
+        {
+          "name": "support.function.std.cpp2",
+          "match": "\\bstd::(println|print|to_string|sqrt|pow|abs|make_unique|make_shared)\\b"
+        },
+        {
+          "name": "support.type.std.cpp2",
+          "match": "\\bstd::([A-Za-z_]\\w*)\\b"
+        }
+      ]
+    },
+    "numbers": {
+      "patterns": [
+        {
+          "name": "constant.numeric.cpp2",
+          "match": "\\b\\d[\\d']*(\\.[\\d']*)?([eE][+-]?\\d+)?\\b"
+        }
+      ]
+    },
+    "operators": {
+      "patterns": [
+        {
+          "name": "keyword.operator.assignment.cpp2",
+          "match": ":="
+        },
+        {
+          "name": "keyword.operator.arrow.cpp2",
+          "match": "->|=>"
+        },
+        {
+          "name": "keyword.operator.comparison.cpp2",
+          "match": "==|!=|<=|>=|<|>"
+        },
+        {
+          "name": "keyword.operator.logical.cpp2",
+          "match": "&&|\\|\\||!"
+        },
+        {
+          "name": "keyword.operator.arithmetic.cpp2",
+          "match": "[+\\-*/%]"
+        },
+        {
+          "name": "keyword.operator.misc.cpp2",
+          "match": "[&|=?.:]"
+        }
+      ]
+    }
+  }
+}

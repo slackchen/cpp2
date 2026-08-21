@@ -1,4 +1,4 @@
-// hello.cppm — M2a 验收用例
+// hello.cpp2 — M2a 验收用例
 module hello;
 import std;
 

@@ -5,13 +5,13 @@
 # ASCII-only on purpose: Windows PowerShell 5.1 reads BOM-less ps1 as ANSI.
 param(
     [string]$Cpp2 = ".\.cpp2build\cpp2.exe",
-    [string]$Target = "tests\bench\main.cppm",
+    [string]$Target = "tests\bench\main.cpp2",
     [int[]]$Budgets = @(65536, 131072, 262144, 524288, 1048576, 2097152, 4194304)
 )
 $ErrorActionPreference = "Stop"
 
-$probe = "tests\bench\m050.cppm"
-$backup = ".cpp2build\m050.orig.cppm"
+$probe = "tests\bench\m050.cpp2"
+$backup = ".cpp2build\m050.orig.cpp2"
 Copy-Item $probe $backup -Force
 
 function Build([long]$budget) {

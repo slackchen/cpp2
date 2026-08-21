@@ -1,4 +1,4 @@
-// post_trap.cppm — post 违反(old() 入口快照)→ trap
+// post_trap.cpp2 — post 违反(old() 入口快照)→ trap
 module posttrap;
 import std;
 

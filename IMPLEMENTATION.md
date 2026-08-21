@@ -9,7 +9,7 @@
 
 ### 1.1 转译优先(承接 D5)
 
-`cpp2c` 把 `.cppm` 转译为 C++23,交给现有编译器:
+`cpp2c` 把 `.cpp2` 转译为 C++23,交给现有编译器:
 
 | 收益 | 说明 |
 |---|---|
@@ -17,7 +17,7 @@
 | 互操作天然成立 | 生成的就是 C++,ABI 一致,链接器无感 |
 | 语义锚定 | "C++2 = C++ 语义 + 显式检查",转译器即规范的参考实现 |
 
-关键配套技巧:**生成代码穿插 `#line` 指令**,把编译器诊断与调试信息映射回 `.cppm` 源位置——用户永远面对 C++2 源码,不面对生成物。
+关键配套技巧:**生成代码穿插 `#line` 指令**,把编译器诊断与调试信息映射回 `.cpp2` 源位置——用户永远面对 C++2 源码,不面对生成物。
 
 代价(接受):一次构建经过两个前端(cpp2c + C++ 编译器),编译时间高于纯 C++;生成码可读性有损。M3 的模块化发射与长期原生后端逐步消化。
 
@@ -25,9 +25,9 @@
 
 | 阶段 | 模式 | 说明 |
 |---|---|---|
-| M2 | **整程序模式** | 入口 `.cppm` + 传递 import → 生成**单个** `.cpp`(所有模块摊平,非导出声明内部链接) |
+| M2 | **整程序模式** | 入口 `.cpp2` + 传递 import → 生成**单个** `.cpp`(所有模块摊平,非导出声明内部链接) |
 | M3b | **headers 模式(build 默认)** | 每模块 `.h`(导出接口)+ 实现片段按 TU 大小预算装箱成若干 `.cpp`,普通 TU 并行编译,**零 C++20 modules 依赖** |
-| M3 | **模块模式** | 每个 `.cppm` → 一个 C++20 named module(`export module app.config;`),`.c2i` 提供 C++2 层的增量与接口哈希 |
+| M3 | **模块模式** | 每个 `.cpp2` → 一个 C++20 named module(`export module app.config;`),`.c2i` 提供 C++2 层的增量与接口哈希 |
 
 整程序模式先行:最快跑通端到端、完全避开三家 C++20 模块实现差异、便于调试生成物;并且**永远保留**(单文件脚本、调试退化路径)。M3b headers 是 `cpp2 build` 的默认后端:三家编译器矩阵开箱即用,装箱策略"尽可能少的 TU 但绝不成单文件"(预算内塞满才开新 TU,`--max-tu-size` 可调);模块模式解决规模化编译,留给环境成熟的场景(opt-in)。
 
@@ -46,7 +46,7 @@
 单一可执行 `cpp2`(子命令式),编译核心是库 `libcpp2`:
 
 ```
-$ cpp2 run hello.cppm          # 转译 + 编译 + 执行
+$ cpp2 run hello.cpp2          # 转译 + 编译 + 执行
 $ cpp2 build                   # 扫描 import → DAG → 并行编译
 $ cpp2 check                   # 快速语义检查,不生成代码
 $ cpp2 audit                   # 列出全部 @unsafe / @unchecked / memory_only
@@ -60,7 +60,8 @@ cpp2/
   rt/cpp2/         # 运行时支持头(生成代码与工具共用)
   stdbridge/       # std 模块桥接描述 + 生成脚本
   examples/        # DESIGN.md 全部示例 = 验收用例
-  tests/           # cases/*.cppm + expected/*.txt + runner
+  tests/           # cases/*.cpp2 + expected/*.txt + runner;bench_gen/bench_sweep 基准脚本
+  editors/vscode/  # VSCode 插件:语法分色 / cpp2 check 实时诊断 / 补全 / 大纲 / Run
 ```
 
 ---
@@ -68,7 +69,7 @@ cpp2/
 ## 3. 编译管线
 
 ```
-.cppm ─► Lexer ─► Parser ─► Sema ─► IFC 提取 ─► Lower ─► Emit ─► .cpp ─► clang/gcc/MSVC
+.cpp2 ─► Lexer ─► Parser ─► Sema ─► IFC 提取 ─► Lower ─► Emit ─► .cpp ─► clang/gcc/MSVC
 ```
 
 | 阶段 | 职责 | 要点 |
@@ -125,7 +126,7 @@ cpp2/
 text: string := read_file(path)?;
 
 // 生成(v0.x 实际形态)
-#line 3 "app/config.cppm"
+#line 3 "app/config.cpp2"
 auto __c2_try_0 = (read_file(path));
 if (!__c2_try_0) { return std::unexpected(std::move(__c2_try_0).error()); }
 std::string text = *std::move(__c2_try_0);
@@ -144,7 +145,7 @@ std::string text = *std::move(__c2_try_0);
 
 | 检查 | 生成 |
 |---|---|
-| 下标 | `v[cpp2::index(v, i, "app.cppm:42")]`;`index()` 内联比较 `size()`,失败 trap |
+| 下标 | `v[cpp2::index(v, i, "app.cpp2:42")]`;`index()` 内联比较 `size()`,失败 trap |
 | 有符号算术 | `cpp2::checked_add(a, b)` 等;gcc/clang 用 `__builtin_*_overflow`,MSVC 用可移植预检 |
 | `n as i32` | `cpp2::narrow_cast<i32>(n)`,溢出 trap;浮点→整型经 2^N 边界重载(NaN/越界 trap) |
 | pre / post | 入口/出口 `if (!(...)) cpp2::trap(...)`;`old()` 入口求值缓存;post 时体包进 lambda(throws 函数 lambda 返回 `expected<R>`,`?` 传播同型直达出口),`result` 绑定返回值(M2c 已落地) |
@@ -178,14 +179,14 @@ std::string text = *std::move(__c2_try_0);
 ### 4.9 生成示例(端到端)
 
 ```cpp
-// ── 输入:app/config.cppm(节选)────────────────────────────
+// ── 输入:app/config.cpp2(节选)────────────────────────────
 export load: (path: string) -> Config throws = {
     text: string := read_file(path)?;
     return parse_config(text)?;
 }
 
-// ── 生成(整程序模式节选,#line 已映射回 .cppm)─────────────
-#line 1 "app/config.cppm"
+// ── 生成(整程序模式节选,#line 已映射回 .cpp2)─────────────
+#line 1 "app/config.cpp2"
 namespace cpp2mod::app::config {
 
 struct Config {
@@ -196,7 +197,7 @@ struct Config {
 cpp2::expected<Config>
 load(cpp2::in<std::string> path)
 {
-#line 10 "app/config.cppm"
+#line 10 "app/config.cpp2"
     auto __c2_try_0 = (read_file(path));
     if (!__c2_try_0) { return std::unexpected(std::move(__c2_try_0).error()); }
     std::string text = *std::move(__c2_try_0);
@@ -245,7 +246,7 @@ load(cpp2::in<std::string> path)
 
 "整体更快"成立的必要条件与手段:
 
-1. **M3 模块模式**:每 `.cppm` → 独立 C++20 named module,构建图并行;
+1. **M3 模块模式**:每 `.cpp2` → 独立 C++20 named module,构建图并行;
 2. **`.cpp2cache` 转译层缓存**:源哈希不变 → 直接复用生成物,cpp2c 只处理变更模块;
 3. **集中模板实例化**:高频实例化(`vector<int>` 等)由转译器统一提升到预编译支持模块,避免逐模块重复实例化——机器生成代码比手写代码更易做到;
 4. **检查按构建档位裁剪**(DESIGN §6.7):Release 关闭溢出检查,生成码膨胀随之下降。
@@ -262,10 +263,10 @@ load(cpp2::in<std::string> path)
 
 ## 7. 测试策略
 
-1. **用例驱动**:每个 `tests/cases/*.cppm` 附 `expected/*.txt`(stdout)与可选 `errors.txt`(诊断);runner:转译 → 三编译器矩阵编译 → 运行 → diff
+1. **用例驱动**:每个 `tests/cases/*.cpp2` 附 `expected/*.txt`(stdout)与可选 `errors.txt`(诊断);runner:转译 → 三编译器矩阵编译 → 运行 → diff
 2. **规范即测试**:DESIGN.md 每个示例进 `examples/`;文档改动必须过测试(doc-driven,规范与实现不漂移)
 3. **降低快照**:代表性用例的生成码快照,PR 中审查降低规则变化
-4. **故障注入(M4/M2c,已落地)**:注入越界/溢出/空解引用/浮点转换/契约违反(pre/post)/`!` 断言失败的用例必须 trap,且断言 trap 消息携带 `.cppm` 源位置——验证检查存在且生效
+4. **故障注入(M4/M2c,已落地)**:注入越界/溢出/空解引用/浮点转换/契约违反(pre/post)/`!` 断言失败的用例必须 trap,且断言 trap 消息携带 `.cpp2` 源位置——验证检查存在且生效
 5. **模糊测试(M4,已落地)**:内置 `cpp2 fuzz` 确定性变异 fuzzer(seed 可复现,CI 友好);libFuzzer harness 备于 `tool/fuzz/`(支持该 sanitizer 的平台使用)
 
 ---
@@ -286,7 +287,7 @@ load(cpp2::in<std::string> path)
 
 | 切片 | 内容 | 出口判据 |
 |---|---|---|
-| M2a | 词法/语法子集、整程序模式、Emit + `#line`、rt 骨架 | `hello.cppm` 在 clang/gcc/MSVC 跑通 |
+| M2a | 词法/语法子集、整程序模式、Emit + `#line`、rt 骨架 | `hello.cpp2` 在 clang/gcc/MSVC 跑通 |
 | M2b | type/成员/`mutates`、参数模式、enum、检查注入(下标/溢出) | DESIGN §5–§6 示例全绿 |
 | M2c | ~~错误通道(expected / `?` / `!` / match ok-err / `or`)、契约~~ **已完成** | DESIGN §8 示例全绿 |
 | M2d | ~~泛型 + concept、UFCS、variant/optional、模式匹配~~ **已完成** | ~~DESIGN §4.5–§5.6 示例全绿~~ |
@@ -308,7 +309,7 @@ M3 实现偏差(相对本章早先的设想,均待后续里程碑消除):
 | M6 | `cxx_legacy` 增强、`gc<T>`(保守式) | 与 zlib 双向互操作 |
 | M7+ | 自举实验、原生后端评估 | — |
 
-**M4 完成记录(2026-08-20)**:检查器补齐空安全(智能指针 `.` 自动解引用 → `cpp2::deref(p)->m` 空检 trap,`@unsafe`/`@unchecked` 可退出,块形式语法落地——DESIGN §6.2/§6.6 原样)与浮点→整型转换越界检查(`narrow_cast` 浮点重载,2^N 精确边界,NaN 一并捕获);`cpp2 audit` 输出每模块检查注入点计数(arith/index/deref/narrow,谓词与发射侧一致)与全部 `@unsafe`/`@unchecked` 位置(含行号);故障注入套件扩至 5 例(溢出/越界/除零/空解引用/浮点转换),全部断言 trap 消息**与 `.cppm` 源位置**;模糊测试:`cpp2 fuzz` 内置确定性变异 fuzzer(seed 可复现,regression 内置 10000 次迭代零崩溃),parser 增加递归深度防护(3000 层嵌套 → 干净诊断而非爆栈);编译器矩阵:`toolchain.cpp` 按 `--version` 输出探测家族(本机 `g++` 为 clang 别名,仅看名字会误判),模块编译参数按 clang/gcc/msvc 分派;生成码缓存键混入工具版本,emit 演进不再被旧缓存掩盖。
+**M4 完成记录(2026-08-20)**:检查器补齐空安全(智能指针 `.` 自动解引用 → `cpp2::deref(p)->m` 空检 trap,`@unsafe`/`@unchecked` 可退出,块形式语法落地——DESIGN §6.2/§6.6 原样)与浮点→整型转换越界检查(`narrow_cast` 浮点重载,2^N 精确边界,NaN 一并捕获);`cpp2 audit` 输出每模块检查注入点计数(arith/index/deref/narrow,谓词与发射侧一致)与全部 `@unsafe`/`@unchecked` 位置(含行号);故障注入套件扩至 5 例(溢出/越界/除零/空解引用/浮点转换),全部断言 trap 消息**与 `.cpp2` 源位置**;模糊测试:`cpp2 fuzz` 内置确定性变异 fuzzer(seed 可复现,regression 内置 10000 次迭代零崩溃),parser 增加递归深度防护(3000 层嵌套 → 干净诊断而非爆栈);编译器矩阵:`toolchain.cpp` 按 `--version` 输出探测家族(本机 `g++` 为 clang 别名,仅看名字会误判),模块编译参数按 clang/gcc/msvc 分派;生成码缓存键混入工具版本,emit 演进不再被旧缓存掩盖。
 
 M4 实现偏差:
 
@@ -319,7 +320,7 @@ M4 实现偏差:
 | libFuzzer | llvm-mingw(windows-gnu)不支持 `-fsanitize=fuzzer`(实测报错);harness 已备(`tool/fuzz/`),内置变异 fuzzer 承担本机与 CI 职责 | Linux/MSVC CI 接入 |
 | fuzz 覆盖 | 词法/语法/sema;emit 未入 fuzz(其崩溃面小且有快照测试) | M5 起纳入 emit 与模块图加载 |
 
-**M2c 完成记录(2026-08-21)**:错误通道全链路落地——`throws` 函数签名降为 `cpp2::expected<R>`(`rt`:`std::expected` 单参别名 + `error{message()}` + `err(msg, loc)` + `must(e, loc)`);`?` 机械展开(求值到临时量 → 失败提前 `return std::unexpected(error)` → 解包),合法位置 = 变量初始化/赋值右值/`return`/裸语句,嵌套使用 sema 干净报错;`f()!` → `cpp2::must`(任意表达式位置);`f() or 默认` → `value_or`;`match f() { ok x / err e }` → `has_value()` 分支(穷尽性 = 恰好一 ok 一 err);`if x := f() { } else e := it { }` 同构展开;`err("消息")` 自动附 `.cppm:行` 源位置。**编译器强制处理**:错误通道值出现在裸调用/`if`/`while` 条件/二元运算等未处理位置一律 sema 报错(DESIGN §8.1 "调用方必须处理"由类型系统背书)。契约:`pre:`/`post:`(函数与方法),`old()` 入口求值缓存,`result` 绑定返回值;post 时体包进 lambda——throws 函数 lambda 返回 `expected<R>`(`return R` 隐式转换、`?` 传播同型直达出口,失败跳过 post),非 throws 函数返回 `R` 本身;契约违反 → trap 不可捕获。audit 新增 contract 计数。接口哈希:方法签名补 `throws` 标记(签名变更触发依赖者重编)。过程中修复一个存量词法缺陷:`!=` 从未有过双字符规则(此前所有示例恰好只用 `==`),postfix `!` 落地后暴露,已补 `Ne` 词法。
+**M2c 完成记录(2026-08-21)**:错误通道全链路落地——`throws` 函数签名降为 `cpp2::expected<R>`(`rt`:`std::expected` 单参别名 + `error{message()}` + `err(msg, loc)` + `must(e, loc)`);`?` 机械展开(求值到临时量 → 失败提前 `return std::unexpected(error)` → 解包),合法位置 = 变量初始化/赋值右值/`return`/裸语句,嵌套使用 sema 干净报错;`f()!` → `cpp2::must`(任意表达式位置);`f() or 默认` → `value_or`;`match f() { ok x / err e }` → `has_value()` 分支(穷尽性 = 恰好一 ok 一 err);`if x := f() { } else e := it { }` 同构展开;`err("消息")` 自动附 `.cpp2:行` 源位置。**编译器强制处理**:错误通道值出现在裸调用/`if`/`while` 条件/二元运算等未处理位置一律 sema 报错(DESIGN §8.1 "调用方必须处理"由类型系统背书)。契约:`pre:`/`post:`(函数与方法),`old()` 入口求值缓存,`result` 绑定返回值;post 时体包进 lambda——throws 函数 lambda 返回 `expected<R>`(`return R` 隐式转换、`?` 传播同型直达出口,失败跳过 post),非 throws 函数返回 `R` 本身;契约违反 → trap 不可捕获。audit 新增 contract 计数。接口哈希:方法签名补 `throws` 标记(签名变更触发依赖者重编)。过程中修复一个存量词法缺陷:`!=` 从未有过双字符规则(此前所有示例恰好只用 `==`),postfix `!` 落地后暴露,已补 `Ne` 词法。
 
 M2c 实现偏差:
 
@@ -343,8 +344,9 @@ M2d 实现偏差:
 | lambda 显式捕获 `[...]` / 禁隐式 `this`(须 `[self]`) | v0.1 隐式 `[&]`,无捕获列表语法 | 后续里程碑落地捕获语法与规则强制 |
 | UFCS 管道 `v \| filter(...)` | 未实现(仅成员形式 `x.f(a)`) | v0.x 后评估 |
 | match 表达式臂类型 | 同型或算术宽化;无用户自定义转换 | 按需扩展 |
+| if 表达式体(DESIGN §5.6 `= if ... {} else {}` 简写) | 未实现(仅语句级 if;简短体须写 return) | 与 match 表达式同批评估 |
 
-**M2e 完成记录(2026-08-21)**:CLI 补齐 `cpp2 check <root.cppm>`——模块图加载 + 全模块 sema,不发射不编译,ok 打印 `<n> module(s) ok`(快速语法/语义反馈路径,IMPLEMENTATION §2 承诺的最后一块)。`.c2i` 格式**冻结 v1**(§6 白纸黑字):自包含 SHA-256(`tool/src/sha256.hpp`,FIPS 180-4,零依赖,与 rt 同一"纯头文件"约定);src/iface/gen/deps 四处缓存哈希从 FNV-128 统一升级 SHA-256;缓存记录从文本键值改为二进制容器(magic `C2IF` + 版本 + 模块名 + 4 × 32B 摘要 + 长度前缀接口文本),magic/版本不符视为无缓存——旧文本缓存自然失效重建,迁移路径实测通过。增量三场景回归:no-op 零转译零编译、实现变更仅重编本模块(接口哈希不变 → 依赖者不动)、接口变更传播依赖者。过程中修复一个往返失真缺陷:缓存哈希在文件中存原始字节、内存中为 hex 串,非 hex 内容(如旧的空 deps 串)写出会失真为全零摘要——依赖组合现先归约为 SHA-256 hex 再入缓存,四个字段保证可无损往返。
+**M2e 完成记录(2026-08-21)**:CLI 补齐 `cpp2 check <root.cpp2>`——模块图加载 + 全模块 sema,不发射不编译,ok 打印 `<n> module(s) ok`(快速语法/语义反馈路径,IMPLEMENTATION §2 承诺的最后一块)。`.c2i` 格式**冻结 v1**(§6 白纸黑字):自包含 SHA-256(`tool/src/sha256.hpp`,FIPS 180-4,零依赖,与 rt 同一"纯头文件"约定);src/iface/gen/deps 四处缓存哈希从 FNV-128 统一升级 SHA-256;缓存记录从文本键值改为二进制容器(magic `C2IF` + 版本 + 模块名 + 4 × 32B 摘要 + 长度前缀接口文本),magic/版本不符视为无缓存——旧文本缓存自然失效重建,迁移路径实测通过。增量三场景回归:no-op 零转译零编译、实现变更仅重编本模块(接口哈希不变 → 依赖者不动)、接口变更传播依赖者。过程中修复一个往返失真缺陷:缓存哈希在文件中存原始字节、内存中为 hex 串,非 hex 内容(如旧的空 deps 串)写出会失真为全零摘要——依赖组合现先归约为 SHA-256 hex 再入缓存,四个字段保证可无损往返。
 
 M2e 实现偏差:
 
@@ -376,8 +378,9 @@ M3b 实现偏差:
 |---|---|---|
 | 导出名跨模块唯一性 | headers 后端导出名落全局命名空间,跨模块同名导出会冲突(modules 后端无此限制) | 文档约束 v0.x;长期评估按模块命名空间 + using 提升 |
 | 模板函数体变更 | 整定义进头 → 触发下游重编(无法线外) | C++23 可变模板特化外移评估 |
-| sema 跨模块调用点数 | 未检查(改导出函数参数个数,调用方漏到 C++ 编译期才报错) | M5 前补:sema 对导入函数做 arity/类型核对 |
+| sema 跨模块调用点数 | **M3c 已修复**:调用点核对(参数个数含默认值 + 宽松类型相容:结构体名/expected/optional 包装不符才拦,算术宽化/泛型放行;被调函数自身类型参数整参放行防误报);方法调用同款核对;"方法不是值"(成员访问位置引用方法,如赋值目标)干净诊断 | — |
 | sema 未声明名调用 | 已补诊断(M3b 过程中发现:未声明函数调用静默放行,漏到 C++ 才报错;现 sema 干净报错,泛型值实参如 lambda 放行) | — |
+| 后端诊断呈现 | **M3c**:漏到 C++ 编译期的错误经 diagfilter 归一化降噪(include 栈/实例化链/候选列表丢弃,生成码帧标 `[generated]`、摘录只留映射回 .cpp2 的),横幅声明"后端层错误,位置已映射";concept 违反等设计上委托 C++ 的错误由此路径呈现 | 错误消息的 C++2 话术翻译(如 "no matching function" → 参数不符提示)随错误类别体系评估 |
 | cxx20-modules 深图扩展性 | BMI 映射需传递闭包(O(N²) 旗标增长);Windows cmd.exe 8191 字符上限经响应文件(@file)绕过;链式深图串行编译 121 模块 600s+ 且随深度变慢 | headers 后端为默认后规避;modules 后端留作 opt-in,不再深调 |
 | TU 预算度量 | 生成码字节数(非编译时间模型);默认值来自上表 8 核实测 | 千单元压测后按核数自适应 |
 | part 内 #include 重复 | part 头部与各片段各自 include 同一 .h(#pragma once 兜底) | 纯观感问题,暂不处理 |

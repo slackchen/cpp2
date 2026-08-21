@@ -137,7 +137,7 @@ Outcome run(std::vector<std::string> const& corpus_files, unsigned seed, int ite
         if (run_one(input, "<fuzz>") != 0) {
             ++out.crashes;
             fs::path crash = fs::path(crash_dir)
-                / ("crash-" + std::to_string(out.crashes) + ".cppm");
+                / ("crash-" + std::to_string(out.crashes) + ".cpp2");
             fs::create_directories(crash_dir);
             if (write_file(crash, input)) out.crash_files.push_back(crash.string());
             std::fprintf(stderr, "fuzz: CRASH input saved to %s\n", crash.string().c_str());

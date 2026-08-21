@@ -1,4 +1,4 @@
-// errors.cppm — 错误通道:? 传播 / ! 断言 / or 默认 / match ok-err / if-let(DESIGN §8)
+// errors.cpp2 — 错误通道:? 传播 / ! 断言 / or 默认 / match ok-err / if-let(DESIGN §8)
 // 错误是值(throws + expected),bug 是 trap(! 断言失败、契约违反)。
 module errors;
 import std;

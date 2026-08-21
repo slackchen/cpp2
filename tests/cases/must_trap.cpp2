@@ -1,4 +1,4 @@
-// must_trap.cppm — f()!:调用方确信必成功,失败即 bug → trap
+// must_trap.cpp2 — f()!:调用方确信必成功,失败即 bug → trap
 module musttrap;
 import std;
 

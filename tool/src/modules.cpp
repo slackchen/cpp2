@@ -75,7 +75,7 @@ private:
 
     fs::path resolve(std::string const& name, fs::path const& importer)
     {
-        // app.util → app/util.cppm、app.util.cppm、util.cppm(末段)
+        // app.util → app/util.cpp2、app.util.cpp2、util.cpp2(末段)
         std::string tail = name;
         size_t dot = tail.rfind('.');
         if (dot != std::string::npos) tail = tail.substr(dot + 1);
@@ -84,9 +84,9 @@ private:
             std::vector<fs::path> cands;
             std::string slashed;
             for (char c : name) slashed += (c == '.') ? '/' : c;
-            cands.push_back(d / (slashed + ".cppm"));
-            cands.push_back(d / (name + ".cppm"));
-            cands.push_back(d / (tail + ".cppm"));
+            cands.push_back(d / (slashed + ".cpp2"));
+            cands.push_back(d / (name + ".cpp2"));
+            cands.push_back(d / (tail + ".cpp2"));
             for (auto const& c : cands)
                 if (fs::exists(c)) return fs::weakly_canonical(c);
         }

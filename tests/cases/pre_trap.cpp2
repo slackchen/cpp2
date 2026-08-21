@@ -1,4 +1,4 @@
-// pre_trap.cppm — 契约违反 = bug → trap(带 .cppm 源位置,不可捕获)
+// pre_trap.cpp2 — 契约违反 = bug → trap(带 .cpp2 源位置,不可捕获)
 module pretrap;
 import std;
 

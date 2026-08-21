@@ -1,4 +1,4 @@
-// point.cppm — 类型定义、方法、mutates、const 接收者、struct 字面量
+// point.cpp2 — 类型定义、方法、mutates、const 接收者、struct 字面量
 module point;
 import std;
 

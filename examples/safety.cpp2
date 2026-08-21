@@ -1,4 +1,4 @@
-// safety.cppm — 溢出/越界检查默认开启,@unchecked 块级退出
+// safety.cpp2 — 溢出/越界检查默认开启,@unchecked 块级退出
 module safety;
 import std;
 

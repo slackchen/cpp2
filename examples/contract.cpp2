@@ -1,4 +1,4 @@
-// contract.cppm — 契约:pre / post / old() / result(DESIGN §6.5)
+// contract.cpp2 — 契约:pre / post / old() / result(DESIGN §6.5)
 // 契约违反 = bug → trap,不可捕获(与错误值通道严格分离)。
 module contract;
 import std;
