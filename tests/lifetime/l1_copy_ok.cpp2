@@ -1,0 +1,5 @@
+// expect-ok — L1:按值返回拷贝不是视图,安全
+module lt_l1b;
+import std;
+copy_back: (in s: string) -> string = s;
+main: () -> int = { return 0; }

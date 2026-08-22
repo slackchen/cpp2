@@ -48,7 +48,7 @@ namespace fuzz  = cpp2::fuzz;
 
 namespace {
 
-constexpr char const* kVersion = "cpp2 0.1.0-m3b (headers backend default, no C++20 modules; cxx20-modules opt-in)";
+constexpr char const* kVersion = "cpp2 0.1.0-m5a (lifetime Lite L1/L2: use-after-move, view-of-in-param escape)";
 
 std::optional<std::string> read_file(fs::path const& p)
 {

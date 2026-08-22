@@ -1,0 +1,9 @@
+// expect-error: used after being moved
+module lt_l2c;
+import std;
+f: (move s: string) -> int = s.size();
+g: () -> int = {
+    x: string = "z";
+    r := f(move x);
+    return x.size();
+}

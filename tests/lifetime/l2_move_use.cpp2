@@ -1,0 +1,10 @@
+// expect-error: used after being moved
+module lt_l2a;
+import std;
+consume: (move s: string) -> int = s.size();
+main: () -> int = {
+    x: string = "a";
+    n := consume(move x);
+    std::println("{0}{1}", n, x);
+    return 0;
+}

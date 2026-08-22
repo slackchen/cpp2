@@ -117,6 +117,26 @@ run_case examples/showcase.cpp2 "I: clamp=5/2 max3=9 lambda=36" ok
 run_case examples/showcase.cpp2 "K: v[2]=3 ptr=5/61 narrow=2000000000" ok
 run_case examples/showcase.cpp2 "M: for-sum=6 while-w=3"    ok
 
+# ── M5:生存期 Lite(L1/L2)悬垂捕获率(出口判据:报告)──────────
+# 语料:tests/lifetime/*.cpp2,首行 // expect-error: <片段> 或 // expect-ok
+total=0; caught=0
+for f in tests/lifetime/*.cpp2; do
+    total=$((total+1))
+    out=$("$CPP2" check "$f" 2>&1)
+    if grep -q "expect-ok" "$f"; then
+        if ! grep -q "error" <<<"$out"; then caught=$((caught+1)); fi
+    else
+        msg=$(grep -o 'expect-error: .*' "$f" | head -1 | sed 's/^.*expect-error: //')
+        if [[ -n "$msg" ]] && grep -qF -- "$msg" <<<"$out"; then caught=$((caught+1)); fi
+    fi
+done
+echo "lifetime capture rate: $caught/$total"
+if [[ $caught -eq $total && $total -gt 0 ]]; then
+    echo "PASS m5/lifetime-capture"; pass=$((pass+1))
+else
+    echo "FAIL m5/lifetime-capture ($caught/$total)"; fail=$((fail+1))
+fi
+
 # ── M4:检查器完备 / audit / fuzz ────────────────────────────────
 # audit:检查注入点计数 + @unsafe/@unchecked 位置(白纸黑字)
 audit_out="$("$CPP2" audit examples/smart.cpp2 2>/dev/null; "$CPP2" audit examples/safety.cpp2 2>/dev/null)"

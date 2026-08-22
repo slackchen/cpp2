@@ -1,0 +1,5 @@
+// expect-error: returning view of 'in' parameter
+module lt_l1c;
+import std;
+view2: (in s: string) -> string_view = s;
+main: () -> int = { return 0; }

@@ -1,0 +1,12 @@
+// expect-ok — L2:'=' 重赋值复活被 move 的名字
+module lt_l2b;
+import std;
+consume: (move s: string) -> int = s.size();
+main: () -> int = {
+    x: string = "hello";
+    n := consume(move x);
+    x = "again";
+    m := consume(move x);
+    std::println("{0}{1}", n, m);
+    return 0;
+}

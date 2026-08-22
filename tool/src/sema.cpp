@@ -142,6 +142,14 @@ private:
     // 当前函数的类型参数名(检查函数体/调用点时 T 解析为 Generic)
     std::unordered_set<std::string> generic_names_;
 
+    // ── M5 生存期 Lite ──────────────────────────────────────────────
+    // L2:已 move 的名字。语句线性近似:调用实参 move 后标记,'=' 重赋值
+    // 复活;分支内 move 保守延续;不做跨函数/循环迭代展开
+    std::unordered_set<std::string> moved_;
+    // L1:当前函数签名中 (in s: string) 形参名 —— 返回其视图即悬垂
+    std::unordered_set<std::string> in_string_params_;
+    bool cur_ret_is_view_ = false;              // 返回类型为 string_view
+
     ast::StructDecl* find_struct(std::string const& n) {
         auto it = structs_.find(n);
         return it != structs_.end() ? it->second : nullptr;
@@ -396,12 +404,25 @@ private:
             sym.is_const = p.mode == ast::ParamMode::In;   // in = 只读
             scopes_.back()[p.name] = sym;
         }
+        // M5 生存期 Lite:方法级状态复位 + L1 视图参数登记
+        moved_.clear();
+        in_string_params_.clear();
+        cur_ret_is_view_ = md.ret
+            && type_from_use(*md.ret).kind == Type::StringView;
+        for (auto& p : md.params)
+            if (p.mode == ast::ParamMode::In
+                && type_from_use(p.type).kind == Type::String)
+                in_string_params_.insert(p.name);
+
         if (md.ret) type_from_use(*md.ret);
         if (md.pre) infer(*md.pre);
         if (md.post) check_post(*md.post, md.ret);
 
         if (md.has_block_body && md.block_body) check_stmt(*md.block_body);
-        if (md.expr_body) infer_top(*md.expr_body);   // 短体可为 match 表达式 / '?'
+        if (md.expr_body) {
+            infer_top(*md.expr_body);                 // 短体可为 match 表达式 / '?'
+            check_view_escape(*md.expr_body);
+        }
 
         cur_struct_ = nullptr;
         cur_method_ = nullptr;
@@ -431,13 +452,39 @@ private:
             sym.is_const = p.mode == ast::ParamMode::In;
             scopes_.back()[p.name] = sym;
         }
+        // M5 生存期 Lite:函数级状态复位 + L1 视图参数登记
+        moved_.clear();
+        in_string_params_.clear();
+        cur_ret_is_view_ = f.ret
+            && type_from_use(*f.ret).kind == Type::StringView;
+        for (auto& p : f.params)
+            if (p.mode == ast::ParamMode::In
+                && type_from_use(p.type).kind == Type::String)
+                in_string_params_.insert(p.name);
+
         if (f.ret) type_from_use(*f.ret);
         if (f.pre) infer(*f.pre);
         if (f.post) check_post(*f.post, f.ret);
         if (f.has_block_body && f.block_body) check_stmt(*f.block_body);
-        if (f.expr_body) infer_top(*f.expr_body);
+        if (f.expr_body) {
+            infer_top(*f.expr_body);
+            check_view_escape(*f.expr_body);    // 短体同样受 L1 约束
+        }
 
         for (auto& tp : f.type_params) generic_names_.erase(tp.name);
+    }
+
+    // M5-L1:返回表达式若是 in string 参数的裸名 → 视图悬垂
+    void check_view_escape(ast::Expr& e)
+    {
+        if (!cur_ret_is_view_ || in_string_params_.empty()) return;
+        if (e.kind() == ast::Expr::Name
+            && !static_cast<ast::NameExpr&>(e).qualified()
+            && in_string_params_.count(static_cast<ast::NameExpr&>(e).parts[0]))
+            err(e.line, e.col,
+                "returning view of 'in' parameter '"
+                + static_cast<ast::NameExpr&>(e).parts[0]
+                + "' dangles after return (M5-L1)");
     }
 
     // post 契约:old() 合法、result 绑定返回值(DESIGN §6.5)
@@ -484,6 +531,7 @@ private:
                 if (t.is_expected && !cur_throws_)
                     err(r.line, r.col,
                         "cannot return an error-channel value from a function that is not 'throws'");
+                check_view_escape(*r.value);    // M5-L1
             }
             return;
         }
@@ -838,6 +886,21 @@ private:
             cur_method_->uses_members = true;
     }
 
+    // M5-L2:调用实参中的 move x → 标记(操作数此时已推断,不会自伤)
+    void note_call_moves(ast::Expr& e)
+    {
+        if (e.kind() != ast::Expr::Call) return;
+        auto& c = static_cast<ast::CallExpr&>(e);
+        for (auto& arg : c.args) {
+            if (arg->kind() != ast::Expr::Unary) continue;
+            auto& u = static_cast<ast::UnaryExpr&>(*arg);
+            if (u.op != "move") continue;
+            if (u.operand->kind() == ast::Expr::Name
+                && !static_cast<ast::NameExpr&>(*u.operand).qualified())
+                moved_.insert(static_cast<ast::NameExpr&>(*u.operand).parts[0]);
+        }
+    }
+
     // ── 表达式推断 ──────────────────────────────────────────────────
     // infer:嵌套位置——'?' 在此不合法(机械展开需要语句级拆分)
     Type infer(ast::Expr& e)
@@ -845,6 +908,7 @@ private:
         bool prev = prop_ok_;
         prop_ok_ = false;
         Type t = infer_inner(e);
+        note_call_moves(e);
         prop_ok_ = prev;
         res_.expr_types[&e] = t;
         return t;
@@ -856,6 +920,7 @@ private:
         bool prev = prop_ok_;
         prop_ok_ = true;
         Type t = infer_inner(e);
+        note_call_moves(e);
         prop_ok_ = prev;
         res_.expr_types[&e] = t;
         return t;
@@ -895,6 +960,10 @@ private:
             if (a.op != "=" && a.value->kind() == ast::Expr::Try)
                 err(a.line, a.col,
                     "'?' with compound assignment is not supported; unwrap into a variable first");
+            // M5-L2:plain '=' 重赋值复活被 move 的名字(复合赋值是使用,已在上报错)
+            if (a.op == "=" && a.target->kind() == ast::Expr::Name
+                && !static_cast<ast::NameExpr&>(*a.target).qualified())
+                moved_.erase(static_cast<ast::NameExpr&>(*a.target).parts[0]);
             Type vt = infer_top(*a.value);
             if (vt.is_expected)
                 err(a.line, a.col,
@@ -1033,6 +1102,9 @@ private:
         }
         if (auto* sym = resolve(n.parts[0])) {
             note_member_use(*sym);
+            if (moved_.count(n.parts[0]))       // M5-L2:move 后使用
+                err(n.line, n.col, "'" + n.parts[0]
+                    + "' used after being moved");
             return sym->type;
         }
         if (n.parts[0] == "none")                    // 空 optional 字面量(DESIGN §6.4)

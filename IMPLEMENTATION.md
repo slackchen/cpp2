@@ -305,7 +305,7 @@ M3 实现偏差(相对本章早先的设想,均待后续里程碑消除):
 | `export-headers` | 摊平式桥接(导出实体落在全局命名空间);限制:导出函数体不得引用跨模块未导出名 | 模块附着(attachment)语义研究后再决定是否包 `import` 式桥接 |
 | 并行编译 | 拓扑分层 + 每层线程池 | 千单元级压测后引入就绪队列调度 |
 | ~~M4~~ **已完成(M4 收口补齐)** | 检查器完备 + 故障注入 + 模糊测试 | 全部检查项验收(invariant 于收口实现) |
-| M5 | 生存期 Lite L1–L6 | 悬垂测试集编译期捕获率报告 |
+| M5 | 生存期 Lite L1–L6(**进行中**:L1/L2 已落地,悬垂捕获率报告机制就绪 6/6) | 悬垂测试集编译期捕获率报告 |
 | M6 | `cxx_legacy` 增强、`gc<T>`(保守式) | 与 zlib 双向互操作 |
 | M7+ | 自举实验、原生后端评估 | — |
 
@@ -396,6 +396,20 @@ M3b 实现偏差:
 6. **Linux CI 工作流**(`.github/workflows/ci.yml`):ubuntu 真 gcc/clang 矩阵跑全量回归 + fuzz + 千单元压测——gcc/msvc 参数实测与 libFuzzer 接入由 CI 承担(本机 llvm-mingw 的 g++ 为 clang 别名,已实测确认无法代表真 GCC)。
 
 回归 80 用例全绿(+4:invariant 正例×2、trap 注入、audit 计数)。
+
+**M5a 完成记录(2026-08-21)**:生存期 Lite 首批两条规则落地(DESIGN §7.7)——
+- **L2 use-after-move**:sema 语句线性追踪。调用实参 `consume(move x)` 的 move 标记在实参推断完成后登记(钩子置于 infer/infer_top 双包装,修复 infer_top 绕过问题);后续任何名字使用 → `'x' used after being moved`;plain `=` 重赋值复活,复合赋值视为使用照常报错。近似边界(白纸黑字):分支内 move 保守延续到汇合点;循环迭代间不展开;move 语法仅存在于调用实参位。
+- **L1 in 参数视图逃逸**:函数/方法入口登记 `(in s: string)` 形参名 + 返回类型是否 string_view;`return s`(含短体)命中即报 `returning view of 'in' parameter 's' dangles after return`。按值返回拷贝(string←string)不误报。
+- **悬垂测试集与捕获率报告**(M5 出口判据机制):`tests/lifetime/*.cpp2`,首行 `// expect-error: <诊断片段>` 或 `// expect-ok`;run.sh 逐例核对并输出 `lifetime capture rate: X/Y`(当前 **6/6 = 100%**)。
+
+M5a 挂账:
+
+| 规则 | 现状 | 计划 |
+|---|---|---|
+| L3 临时视图逃逸出语句 | 未实现 | M5 后续切片(需临时量生命周期标注) |
+| L4 成员引用 ≤ 所属对象 | 未实现 | M5 后续切片(函数粒度流分析) |
+| L5 指针算术/取局部地址限 @unsafe | 语言尚无指针/取地址语法 | **随 M6 cxx_legacy 落地同步** |
+| L6 arena 指针不逃逸 | arena 本体未实现(M6) | **随 M6 同批** |
 
 ## 10. v0.x 明确不做
 
