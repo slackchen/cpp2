@@ -842,7 +842,7 @@ private:
     {
         std::string tmp = "__c2_try_" + std::to_string(fresh_++);
         out_ += pad() + "auto " + tmp + " = (" + expr(*t.operand) + ");\n";
-        out_ += pad() + "if (!" + tmp + ") { return std::unexpected(std::move("
+        out_ += pad() + "if (!" + tmp + ") { return cpp2::unexpected(std::move("
               + tmp + ").error()); }\n";
         return tmp;
     }

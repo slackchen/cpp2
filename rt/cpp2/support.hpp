@@ -151,15 +151,43 @@ struct error {
     std::string const& message() const { return text; }
 };
 
+#ifdef __cpp_lib_expected
 template <class T>
 using expected = std::expected<T, error>;
+using std::unexpected;
+#else
+// 最小 expected 垫片(libstdc++ < 13 等无 <format>/<expected> 环境):
+// 接口面 = 生成码实际使用集(has_value/operator*/value&&/error)
+template <class E>
+struct unexpected {
+    E v_;
+    explicit unexpected(E e) : v_(std::move(e)) {}
+};
+
+template <class T>
+class [[nodiscard]] expected {
+    std::variant<T, error> v_;
+public:
+    expected(T v) : v_(std::in_place_index<0>, std::move(v)) {}
+    expected(unexpected<error> u) : v_(std::in_place_index<1>, std::move(u.v_)) {}
+    bool has_value() const { return v_.index() == 0; }
+    explicit operator bool() const { return has_value(); }
+    T& operator*() & { return std::get<0>(v_); }
+    T&& operator*() && { return std::get<0>(std::move(v_)); }
+    T const& operator*() const & { return std::get<0>(v_); }
+    T& value() & { return std::get<0>(v_); }
+    T&& value() && { return std::get<0>(std::move(v_)); }
+    error& error() & { return std::get<1>(v_); }
+    error const& error() const & { return std::get<1>(v_); }
+};
+#endif
 
 // err():throws 函数体内构造失败值 → return err("not found");
 // 位置并入消息,错误链可追溯(栈的确定性替代)。
-inline std::unexpected<error> err(std::string msg, char const* file = "", int line = 0)
+inline unexpected<error> err(std::string msg, char const* file = "", int line = 0)
 {
-    return std::unexpected(error(std::move(msg) + " (" + file + ":"
-                                 + std::to_string(line) + ")"));
+    return unexpected<error>(error(std::move(msg) + " (" + file + ":"
+                                   + std::to_string(line) + ")"));
 }
 
 // must():f()! — 调用方确信不会失败,失败即 bug → trap(DESIGN §8.2)
