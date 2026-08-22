@@ -76,6 +76,13 @@ void print_diag(std::string const& file, char const* sev, int line, int col, std
 
 std::string quote(std::string const& s) { return "\"" + s + "\""; }
 
+// 额外链接旗标(CPP2_LDFLAGS,如 "-lz"):FFI 示例的系统库注入点(M6)
+std::string ldflags_env()
+{
+    char const* l = std::getenv("CPP2_LDFLAGS");
+    return (l && *l) ? std::string(" ") + l : "";
+}
+
 // 运行命令并捕获输出(编译失败时做后端诊断过滤,替代直通 system)
 struct CmdResult { bool ok; std::string output; };
 
@@ -418,7 +425,8 @@ int cmd_run(std::vector<std::string> const& args)
 
     std::string exe_s = native(exe);
     std::string cc = cxx + " -std=c++23 -O0 -g -I" + quote(native(*rt))
-                   + " " + quote(native(cpp)) + " -o " + quote(exe_s);
+                   + " " + quote(native(cpp)) + " -o " + quote(exe_s)
+                   + ldflags_env();
     std::cerr << "[cpp2] " << cc << "\n";
     auto r = run_capture(cc);
     if (!r.ok) {
@@ -779,7 +787,7 @@ int cmd_build(std::vector<std::string> const& args)
 
     // 链接
     fs::path exe = in.parent_path() / ".cpp2build" / in.stem();
-    std::string link = tc::link_command(cxx, fam, obj_files, native(exe));
+    std::string link = tc::link_command(cxx, fam, obj_files, native(exe)) + ldflags_env();
     std::cerr << "[cpp2] " << link << "\n";
     if (std::system(link.c_str()) != 0) {
         std::cerr << "error: link failed\n";

@@ -161,12 +161,17 @@ run_case examples/gc_demo.cpp2 "kept.id=42 (survived)"      ok
 run_case examples/gc_demo.cpp2 "churn-last=998"             ok
 run_case examples/gc_demo.cpp2 "collections=1"              ok
 
-# zlib:本机无 zlib.h 时跳过(CI ubuntu 自带 zlib1g-dev 实测)
-if echo '#include <zlib.h>' | g++ -x c++ - -fsyntax-only >/dev/null 2>&1; then
+# zlib:头 + 链接双探测;可用时经 CPP2_LDFLAGS 注入 -lz(缺失则 CI 实测)
+ZLIB_OK=0
+printf '#include <zlib.h>\nint main(){return 0;}\n' > .cpp2build/zt.c
+if g++ .cpp2build/zt.c -lz -o .cpp2build/zt.bin >/dev/null 2>&1; then ZLIB_OK=1; fi
+if [[ $ZLIB_OK == 1 ]]; then
+    export CPP2_LDFLAGS="-lz"
     run_case examples/zlib_demo.cpp2 "compress rc=0"        ok
     run_case examples/zlib_demo.cpp2 "roundtrip-equal=true" ok
+    unset CPP2_LDFLAGS
 else
-    echo "SKIP m6/zlib (zlib.h not found on this host; covered by CI)"
+    echo "SKIP m6/zlib (zlib not linkable on this host; covered by CI)"
 fi
 
 # ── M4:检查器完备 / audit / fuzz ────────────────────────────────
