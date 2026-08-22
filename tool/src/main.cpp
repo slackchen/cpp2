@@ -421,8 +421,10 @@ int cmd_run(std::vector<std::string> const& args)
     std::cerr << "[cpp2] " << cc << "\n";
     auto r = run_capture(cc);
     if (!r.ok) {
-        std::cerr << diagfilter::banner
-                  << diagfilter::filter(r.output, native(build_dir));
+        std::cerr << diagfilter::banner;
+        std::string f = diagfilter::filter(r.output, native(build_dir));
+        // 过滤器一无所获时回显原始输出(诊断不能被静默吞掉)
+        std::cerr << (f.empty() ? r.output : f);
         std::cerr << "error: compilation failed\n";
         return 2;
     }
@@ -638,8 +640,9 @@ int cmd_build(std::vector<std::string> const& args)
                 auto r = run_capture(cc);
                 if (!r.ok) {
                     std::lock_guard<std::mutex> lk(err_mtx);
-                    std::cerr << diagfilter::banner
-                              << diagfilter::filter(r.output, native(build_dir));
+                    std::cerr << diagfilter::banner;
+                    std::string flt = diagfilter::filter(r.output, native(build_dir));
+                    std::cerr << (flt.empty() ? r.output : flt);
                     ++failures;
                     return;
                 }
@@ -731,8 +734,9 @@ int cmd_build(std::vector<std::string> const& args)
                 auto r = run_capture(cc);
                 if (!r.ok) {
                     std::lock_guard<std::mutex> lk(err_mtx);
-                    std::cerr << diagfilter::banner
-                              << diagfilter::filter(r.output, native(build_dir));
+                    std::cerr << diagfilter::banner;
+                    std::string flt2 = diagfilter::filter(r.output, native(build_dir));
+                    std::cerr << (flt2.empty() ? r.output : flt2);
                     ++failures;
                     return;
                 }
