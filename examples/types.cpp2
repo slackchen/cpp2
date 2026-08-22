@@ -1,4 +1,4 @@
-// types.cppm — M2d 收尾:继承(DESIGN §5.1)、命名工厂与析构器(DESIGN §5.3)
+// types.cpp2 — M2d 收尾:继承(DESIGN §5.1)、命名工厂与析构器(DESIGN §5.3)
 module types;
 import std;
 

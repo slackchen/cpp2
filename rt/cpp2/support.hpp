@@ -240,20 +240,46 @@ void println(char const* fmt, A const&... args)
 
 #else
 
+// 轻量回退(GCC13 libstdc++ 无 <format>):支持 {0} {1}… 占位替换,
+// 参数类型限标量/bool/char*/string/string_view(std::to_string 可及者)
+inline void fmt_replace(std::string& fmt, std::string const* args, size_t n)
+{
+    for (size_t idx = 0; idx < n; ++idx) {
+        std::string tok = "{" + std::to_string(idx) + "}";
+        size_t pos = fmt.find(tok);
+        if (pos != std::string::npos) fmt.replace(pos, tok.size(), args[idx]);
+    }
+}
+
+template <class T>
+std::string fmt_to_string(T const& v)
+{
+    if constexpr (std::is_same_v<std::remove_cv_t<std::remove_reference_t<T>>, std::string>)
+        return v;
+    else if constexpr (std::is_same_v<std::remove_cv_t<std::remove_reference_t<T>>, char const*>)
+        return std::string(v);
+    else if constexpr (std::is_same_v<std::remove_cv_t<std::remove_reference_t<T>>, bool>)
+        return v ? "true" : "false";
+    else
+        return std::to_string(v);
+}
+
 template <class... A>
 void print(char const* fmt, A const&... args)
 {
-    static_assert(sizeof...(args) == 0,
-                  "formatted print requires <format> support in the host compiler");
-    std::cout << fmt;
+    std::string out = fmt;
+    std::string reps[] = { fmt_to_string(args)... };
+    fmt_replace(out, reps, sizeof...(args));
+    std::cout << out;
 }
 
 template <class... A>
 void println(char const* fmt, A const&... args)
 {
-    static_assert(sizeof...(args) == 0,
-                  "formatted print requires <format> support in the host compiler");
-    std::cout << fmt << '\n';
+    std::string out = fmt;
+    std::string reps[] = { fmt_to_string(args)... };
+    fmt_replace(out, reps, sizeof...(args));
+    std::cout << out << '\n';
 }
 
 #endif

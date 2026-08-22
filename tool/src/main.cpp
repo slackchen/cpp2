@@ -78,6 +78,19 @@ std::string quote(std::string const& s) { return "\"" + s + "\""; }
 // 运行命令并捕获输出(编译失败时做后端诊断过滤,替代直通 system)
 struct CmdResult { bool ok; std::string output; };
 
+#ifdef _WIN32
+inline int sys_rc(int rc) { return rc; }            // Windows:已是进程退出码
+#else
+#include <sys/wait.h>
+inline int sys_rc(int rc)                           // POSIX:16 位 waitstatus 解码
+{
+    if (rc == -1) return 127;
+    if (WIFEXITED(rc)) return WEXITSTATUS(rc);
+    if (WIFSIGNALED(rc)) return 128 + WTERMSIG(rc); // trap(abort)= 134 等
+    return rc;
+}
+#endif
+
 CmdResult run_capture(std::string const& cmd)
 {
     // 诊断走 stderr:合并后再捕获,否则过滤形同虚设
@@ -96,7 +109,7 @@ CmdResult run_capture(std::string const& cmd)
 #else
     int rc = pclose(p);
 #endif
-    return { rc == 0, std::move(out) };
+    return { sys_rc(rc) == 0, std::move(out) };
 }
 
 std::string native(fs::path p)
@@ -372,8 +385,7 @@ int cmd_check(std::vector<std::string> const& args)
 }
 
 int cmd_run(std::vector<std::string> const& args)
-{
-    bool release = false;
+{    bool release = false;
     std::string file;
     for (auto const& a : args) {
         if (a == "--release") release = true;
@@ -414,7 +426,7 @@ int cmd_run(std::vector<std::string> const& args)
         std::cerr << "error: compilation failed\n";
         return 2;
     }
-    return std::system(quote(exe_s).c_str());
+    return sys_rc(std::system(quote(exe_s).c_str()));
 }
 
 // ── cpp2 build:并行增量构建 ───────────────────────────────────────
