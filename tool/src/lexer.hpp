@@ -22,6 +22,7 @@ enum class Tok {
     Plus, Minus, Star, Slash, Percent,
     PlusEq, MinusEq, StarEq, SlashEq, PercentEq,
     At, Underscore,
+    LegacyBlock,                            // cxx_legacy { … } 原文(M6)
     Eof
 };
 

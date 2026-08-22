@@ -94,7 +94,61 @@ private:
         int sl = line_, sc = col_;
         char c = peek();
 
-        if (is_ident_start(c)) return ident();
+        if (is_ident_start(c)) {
+            Token id = ident();
+            // cxx_legacy { … } → 原文整块(M6):括号配对 + 字符串/注释跳过,
+            // 内容不做任何词法/语法处理(块内按 C++ 规则)
+            if (id.text == "cxx_legacy") {
+                size_t p = pos_;
+                int l = line_, co = col_;
+                auto adv = [&]() {
+                    char d = src_[p++];
+                    if (d == '\n') { ++l; co = 1; } else ++co;
+                };
+                while (p < src_.size()
+                       && (src_[p] == ' ' || src_[p] == '\t' || src_[p] == '\r' || src_[p] == '\n'))
+                    adv();
+                if (p < src_.size() && src_[p] == '{') {
+                    adv();                              // 消耗 '{'
+                    int depth = 1;
+                    size_t start = p, content_end = p;
+                    while (p < src_.size()) {
+                        char ch = src_[p];
+                        if (ch == '"' || ch == '\'') {
+                            char q = ch; adv();
+                            while (p < src_.size() && src_[p] != q) {
+                                if (src_[p] == '\\') adv();
+                                adv();
+                            }
+                            adv();
+                            continue;
+                        }
+                        if (ch == '/' && p + 1 < src_.size() && src_[p + 1] == '/') {
+                            while (p < src_.size() && src_[p] != '\n') adv();
+                            continue;
+                        }
+                        if (ch == '/' && p + 1 < src_.size() && src_[p + 1] == '*') {
+                            adv(); adv();
+                            while (p + 1 < src_.size()
+                                   && !(src_[p] == '*' && src_[p + 1] == '/'))
+                                adv();
+                            adv(); adv();
+                            continue;
+                        }
+                        if (ch == '{') ++depth;
+                        else if (ch == '}') {
+                            if (--depth == 0) { content_end = p; adv(); break; }
+                        }
+                        adv();
+                    }
+                    std::string body = src_.substr(start, content_end - start);
+                    pos_ = p; line_ = l; col_ = co;
+                    return make(Tok::LegacyBlock, body, sl, sc);
+                }
+                return id;                              // 非块形式:普通标识符
+            }
+            return id;
+        }
         if (std::isdigit(static_cast<unsigned char>(c))) return number();
         if (c == '"') return string_lit();
         if (c == '\'') return char_lit();

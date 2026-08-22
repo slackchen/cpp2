@@ -200,6 +200,7 @@ std::string interface_text(ast::Module const& m)
             s += ">";
         }
         if (t.is_optional) s += "?";
+        if (t.is_pointer) s += "*";
         return s;
     };
     auto ret_sig = [&](std::optional<ast::TypeUse> const& r) {

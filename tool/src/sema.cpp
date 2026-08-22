@@ -142,6 +142,9 @@ private:
     // 当前函数的类型参数名(检查函数体/调用点时 T 解析为 Generic)
     std::unordered_set<std::string> generic_names_;
 
+    // @unsafe 域(M5-L5):块形式 @unsafe { … } 内取地址/指针算术合法
+    bool in_unsafe_ = false;
+
     // ── M5 生存期 Lite ──────────────────────────────────────────────
     // L2:已 move 的名字。语句线性近似:调用实参 move 后标记,'=' 重赋值
     // 复活;分支内 move 保守延续;不做跨函数/循环迭代展开
@@ -184,6 +187,10 @@ private:
         for (auto& g : m_.globals) {
             Sym s; s.kind = SymKind::Global;
             s.type = type_from_use(g.type);
+            if (s.type.kind == Type::ArenaPtr)
+                err(g.line, 0,
+                    "global arena_ptr escapes arena domain (M5-L6); "
+                    "arena lifetime must be owned by an enclosing scope");
             s.is_const = g.is_const;
             add(g.name, s, g.line);
         }
@@ -247,10 +254,32 @@ private:
                 t.name = last;
                 return t;
             }
+            if (tu.is_pointer) {                     // T*(M6;取地址仅 @unsafe,M5-L5)
+                ast::TypeUse inner = tu;
+                inner.is_pointer = false;
+                Type p;
+                p.kind = Type::Pointer;
+                p.pointee = std::make_shared<Type>(type_from_use(inner));
+                p.is_const = tu.is_const;
+                return p;
+            }
+            if (last == "arena") {                   // M6:不透明 C++ 对象(rt cpp2::arena)
+                t.kind = Type::NamedStruct;
+                t.name = last;
+                return t;
+            }
             if (auto s = scalar(last); s.known()) return s;
             if (last == "unique" || last == "shared" || last == "weak"
                 || last == "unique_ptr" || last == "shared_ptr" || last == "weak_ptr")
             { t = smart(); t.is_const = tu.is_const; return t; }
+            if (last == "arena_ptr" && tu.args.size() == 1) {
+                // M5-L6/M6:arena 智能指针(逃逸检查见 check_view/return/call)
+                Type p;
+                p.kind = Type::ArenaPtr;
+                p.pointee = std::make_shared<Type>(type_from_use(tu.args[0]));
+                p.is_const = tu.is_const;
+                return p;
+            }
             if (last == "vector" || last == "list" || last == "array"
                 || last == "span" || last == "map" || last == "set")
             { t = container(); t.is_const = tu.is_const; return t; }
@@ -420,7 +449,8 @@ private:
 
         if (md.has_block_body && md.block_body) check_stmt(*md.block_body);
         if (md.expr_body) {
-            infer_top(*md.expr_body);                 // 短体可为 match 表达式 / '?'
+            Type bt = infer_top(*md.expr_body);         // 短体可为 match 表达式 / '?'
+            (void)bt;                                   // M5-L6:短体 return arena_ptr 合法
             check_view_escape(*md.expr_body);
         }
 
@@ -463,11 +493,17 @@ private:
                 in_string_params_.insert(p.name);
 
         if (f.ret) type_from_use(*f.ret);
+        if (f.is_extern) {
+            // M6 无体声明:仅签名;体在外部(legacy 块 / Cpp1),按 C++ 规则解析
+            for (auto& tp : f.type_params) generic_names_.erase(tp.name);
+            return;
+        }
         if (f.pre) infer(*f.pre);
         if (f.post) check_post(*f.post, f.ret);
         if (f.has_block_body && f.block_body) check_stmt(*f.block_body);
         if (f.expr_body) {
-            infer_top(*f.expr_body);
+            Type bt = infer_top(*f.expr_body);
+            (void)bt;                           // M5-L6:短体 return arena_ptr 合法(工厂包装)
             check_view_escape(*f.expr_body);    // 短体同样受 L1 约束
         }
 
@@ -506,7 +542,16 @@ private:
     }
 
     // ── 语句 ────────────────────────────────────────────────────────
+    // @unsafe 域守卫:is_unsafe 语句(块)内取地址/指针算术合法(M5-L5)
     void check_stmt(ast::Stmt& s)
+    {
+        bool prev = in_unsafe_;
+        if (s.no_check && s.is_unsafe) in_unsafe_ = true;
+        check_stmt_impl(s);
+        if (s.no_check && s.is_unsafe) in_unsafe_ = prev;
+    }
+
+    void check_stmt_impl(ast::Stmt& s)
     {
         switch (s.kind()) {
         case ast::Stmt::Block: {
@@ -531,6 +576,8 @@ private:
                 if (t.is_expected && !cur_throws_)
                     err(r.line, r.col,
                         "cannot return an error-channel value from a function that is not 'throws'");
+                // M5-L6:return arena_ptr 本身合法(如工厂包装);
+                // 违规形态 = 流入更长命的非 arena_ptr 存储(store/global/传参)
                 check_view_escape(*r.value);    // M5-L1
             }
             return;
@@ -552,6 +599,12 @@ private:
                 err(v.line, v.col,
                     "temporary bound to view escapes statement (M5-L3); "
                     "bind to a named value first");
+            // M5-L6:arena_ptr 不得流入非 arena_ptr 存储
+            if (init_t.kind == Type::ArenaPtr && v.has_type
+                && type_from_use(v.type).kind != Type::ArenaPtr)
+                err(v.line, v.col,
+                    "arena_ptr escapes arena domain (M5-L6): "
+                    "destination must also be arena_ptr");
             Type t = v.has_type ? type_from_use(v.type) : init_t;
             t.is_const = v.is_const;
             if (v.has_type && v.init && v.init->kind() == ast::Expr::ListLit) {
@@ -958,6 +1011,22 @@ private:
         case ast::Expr::Unary: {
             auto& u = static_cast<ast::UnaryExpr&>(e);
             Type t = infer(*u.operand);
+            if (u.op == "&") {                   // 取地址:M5-L5 仅 @unsafe
+                if (!in_unsafe_)
+                    err(u.line, u.col,
+                        "address-of requires @unsafe (M5-L5); "
+                        "wrap in '@unsafe { ... }'");
+                Type p;
+                p.kind = Type::Pointer;
+                p.pointee = std::make_shared<Type>(t);
+                return p;
+            }
+            if (u.op == "*") {                   // 解引用:Pointer/ArenaPtr/SmartPtr
+                if (t.kind == Type::Pointer || t.kind == Type::ArenaPtr)
+                    return t.deref();
+                if (t.kind == Type::SmartPtr) return t.deref();
+                return {};
+            }
             if (u.op == "!") return Type::of(Type::Bool);
             return t;
         }
@@ -975,6 +1044,14 @@ private:
             if (vt.is_expected)
                 err(a.line, a.col,
                     "unhandled error-channel value; handle it with '?', '!', or 'or'");
+            // M5-L6:arena_ptr 只能存回 arena_ptr 目标
+            if (vt.kind == Type::ArenaPtr) {
+                Type tt = infer_existing(*a.target);
+                if (tt.known() && tt.kind != Type::ArenaPtr)
+                    err(a.line, a.col,
+                        "arena_ptr escapes arena domain (M5-L6): "
+                        "destination must also be arena_ptr");
+            }
             return infer_existing(*a.target);
         }
         case ast::Expr::Index: {
@@ -1276,6 +1353,11 @@ private:
                 continue;
             Type pt = type_from_use(params[i].type);
             Type at = type_of_expr(*c.args[i]);
+            // M5-L6:arena_ptr 实参只能传给 arena_ptr 形参
+            if (at.kind == Type::ArenaPtr && pt.known() && pt.kind != Type::ArenaPtr)
+                err(c.line, c.col,
+                    "arena_ptr escapes arena domain (M5-L6): callee parameter '"
+                    + params[i].name + "' is not arena_ptr");
             if (!arg_assignable(pt, at))
                 err(c.line, c.col,
                     "argument " + std::to_string(i + 1) + " of '" + name
@@ -1314,6 +1396,15 @@ private:
             if (it != subst.end()) {
                 t = it->second;
                 t.is_const = false;
+            }
+        } else if (t.kind == Type::ArenaPtr && t.pointee
+                   && t.pointee->kind == Type::Generic) {
+            // arena_ptr<T> 返回:T 由实参合一后回填点位(如 make_in 包装,M6)
+            auto it = subst.find(t.pointee->name);
+            if (it != subst.end()) {
+                auto inner = it->second;
+                inner.is_const = false;
+                t.pointee = std::make_shared<Type>(inner);
             }
         }
         for (auto& tp : fd.type_params) generic_names_.erase(tp.name);
@@ -1360,6 +1451,17 @@ private:
 
         Type obj = base;
         if (obj.is_smart()) obj = obj.deref();      // 智能指针自动解引用
+        // M6:不透明 rt 对象 arena —— create(元素)定型为 arena_ptr<元素>
+        // (供 L6 逃逸检查;其余成员按 C++ 规则放行)
+        if (obj.kind == Type::NamedStruct && obj.name == "arena") {
+            if (call && mem.name == "create" && !call->args.empty()) {
+                Type pt;
+                pt.kind = Type::ArenaPtr;
+                pt.pointee = std::make_shared<Type>(infer_existing(*call->args[0]));
+                return pt;
+            }
+            return {};
+        }
         if (obj.kind == Type::NamedStruct) {
             if (auto* sd = find_struct(obj.name)) {
                 if (auto* fd = find_field_deep(*sd, mem.name)) {
@@ -1416,6 +1518,12 @@ private:
 
         if (lit.type_parts.size() != 1) return {};  // std 聚合:放行
         std::string const& tn = lit.type_parts[0];
+        if (tn == "arena") {                        // M6:不透明 C++ 对象
+            Type t;
+            t.kind = Type::NamedStruct;
+            t.name = tn;
+            return t;
+        }
         auto* sd = find_struct(tn);
         if (!sd) {
             err(lit.line, lit.col, "unknown type '" + tn + "' in struct literal");
@@ -1477,6 +1585,23 @@ private:
                 "cannot use an error-channel value in a binary operation; "
                 "handle it first ('?', '!', 'or', match, if-let)");
             return {};
+        }
+
+        // M5-L5/M6:指针算术仅 @unsafe;arena_ptr 一律禁止
+        if (l.kind == Type::ArenaPtr || r.kind == Type::ArenaPtr) {
+            err(b.line, b.col, "arena_ptr does not support arithmetic (M5-L6)");
+            return {};
+        }
+        if (l.kind == Type::Pointer || r.kind == Type::Pointer) {
+            if (b.op != "+" && b.op != "-") {
+                err(b.line, b.col, "pointers support only '+' and '-'");
+                return {};
+            }
+            if (!in_unsafe_)
+                err(b.line, b.col,
+                    "pointer arithmetic requires @unsafe (M5-L5); "
+                    "wrap in '@unsafe { ... }'");
+            return l.kind == Type::Pointer ? l : r;
         }
 
         if (b.op == "&&" || b.op == "||"

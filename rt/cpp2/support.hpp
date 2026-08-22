@@ -21,6 +21,8 @@
     #include <format>
 #endif
 
+#include "cpp2/arena.hpp"                   // M6:arena / arena_ptr
+
 namespace cpp2 {
 
 // ── trap:检查失败的统一终止行为(DESIGN §6)────────────────────────

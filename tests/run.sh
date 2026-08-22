@@ -137,6 +137,17 @@ else
     echo "FAIL m5/lifetime-capture ($caught/$total)"; fail=$((fail+1))
 fi
 
+# ── M6:legacy 块 / @unsafe 指针(L5)/ arena(L6)────────────────
+run_case examples/unsafe_demo.cpp2 "legacy = 5"                     ok
+run_case examples/unsafe_demo.cpp2 "total=42 arena-point=145"       ok
+run_case examples/unsafe_demo.cpp2 "after reset live=0"             ok
+# audit:legacy 块白纸黑字
+if "$CPP2" audit examples/unsafe_demo.cpp2 2>/dev/null | grep -q "legacy : 1 cxx_legacy block"; then
+    echo "PASS m6/audit-legacy"; pass=$((pass+1))
+else
+    echo "FAIL m6/audit-legacy"; fail=$((fail+1))
+fi
+
 # ── M4:检查器完备 / audit / fuzz ────────────────────────────────
 # audit:检查注入点计数 + @unsafe/@unchecked 位置(白纸黑字)
 audit_out="$("$CPP2" audit examples/smart.cpp2 2>/dev/null; "$CPP2" audit examples/safety.cpp2 2>/dev/null)"

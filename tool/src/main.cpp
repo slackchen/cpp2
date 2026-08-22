@@ -48,7 +48,7 @@ namespace fuzz  = cpp2::fuzz;
 
 namespace {
 
-constexpr char const* kVersion = "cpp2 0.1.0-m5a (lifetime Lite L1/L2: use-after-move, view-of-in-param escape)";
+constexpr char const* kVersion = "cpp2 0.1.0-m6a (cxx_legacy blocks, raw pointers @unsafe-only [L5], arena/arena_ptr [L6])";
 
 std::optional<std::string> read_file(fs::path const& p)
 {

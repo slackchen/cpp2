@@ -182,9 +182,13 @@ private:
         if (check(lex::Tok::Module) || check(lex::Tok::Import))
             err("module/import declarations must appear before other declarations");
 
+        if (peek().tok == lex::Tok::LegacyBlock) {          // cxx_legacy { … }(M6)
+            m.legacy_blocks.push_back({peek().line, peek().text});
+            advance();
+            return;
+        }
         if (!check(lex::Tok::Ident)) err("expected a declaration (name: kind = value)");
         if (peek(1).tok != lex::Tok::Colon) {
-            if (peek().text == "cxx_legacy") unsupported("cxx_legacy block", "M6");
             err("expected ':' after declaration name");
         }
 
@@ -419,6 +423,16 @@ private:
         parse_contracts(f.pre, f.post);
         parse_requires(f.requires_list);
 
+        // 无体声明(M6 互操作):name: (params) -> ret;
+        // 外部符号(legacy 块 / Cpp1 库),仅发射原型,体按 C++ 规则解析
+        if (accept(lex::Tok::Semi)) {
+            if (f.pre || f.post)
+                err("extern declaration cannot have pre/post contracts");
+            f.is_extern = true;
+            m.funcs.push_back(std::move(f));
+            return;
+        }
+
         expect(lex::Tok::Assign, "'=' before function body");
         if (check(lex::Tok::LBrace)) {
             f.has_block_body = true;
@@ -542,7 +556,8 @@ private:
     }
 
     // ── 类型 ────────────────────────────────────────────────────────
-    ast::TypeUse parse_type()
+    // expr_ctx:表达式内类型名(如 as 目标)——禁 ?/*/后缀,避免吞掉后续运算符
+    ast::TypeUse parse_type(bool expr_ctx = false)
     {
         DepthGuard g{*this};
         ast::TypeUse t;
@@ -561,7 +576,12 @@ private:
             }
             expect(lex::Tok::Gt, "'>' to close type arguments");
         }
-        if (accept(lex::Tok::Question)) t.is_optional = true;   // T?(DESIGN §6.4)
+        if (!expr_ctx && accept(lex::Tok::Question)) t.is_optional = true;   // T?(DESIGN §6.4)
+        if (!expr_ctx && accept(lex::Tok::Star)) {
+            if (t.is_optional) err("pointer-to-optional is not supported");
+            t.is_pointer = true;                                 // T*(M6,L5)
+            if (accept(lex::Tok::Star)) err("multi-level pointers are not supported (v0.x)");
+        }
         return t;
     }
 
@@ -1007,9 +1027,9 @@ private:
     ast::ExprP unary()
     {
         if (check(lex::Tok::Bang) || check(lex::Tok::Minus) || check(lex::Tok::Plus)
-            || check(lex::Tok::Tilde)) {
+            || check(lex::Tok::Tilde) || check(lex::Tok::Amp) || check(lex::Tok::Star)) {
             DepthGuard g{*this};                // `- - - ...` 前缀链同样可能爆栈
-            std::string op = advance().text;
+            std::string op = advance().text;    // & 取地址 / * 解引用(M6,L5)
             auto u = std::make_unique<ast::UnaryExpr>();
             u->line = peek().line; u->col = peek().col;
             u->op = op;
@@ -1070,7 +1090,7 @@ private:
                 x->line = peek().line; x->col = peek().col;
                 x->operand = std::move(e);
                 advance(); // as
-                x->target = parse_type();
+                x->target = parse_type(/*expr_ctx*/true);   // 禁 ?/*/后缀:as double * y 的 * 是乘法
                 e = std::move(x);
             } else if (check(lex::Tok::Question)) {
                 // f()? — 解包 + 失败向上传播(DESIGN §8.2;M2c)

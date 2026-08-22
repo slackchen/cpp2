@@ -25,7 +25,9 @@ struct Type {
         ErrVal,                           // err("msg") 的构造值(return 时转 unexpected)
         Variant,                          // variant 声明(name 定位 alternatives)
         Generic,                          // 泛型类型参数 T(name 即参数名)
-        NoneVal                           // none 字面量 → std::nullopt
+        NoneVal,                          // none 字面量 → std::nullopt
+        Pointer,                          // T* 裸指针(M6;产生仅限 @unsafe,M5-L5)
+        ArenaPtr                          // arena_ptr<T>(M6;不得逃逸 arena 域,M5-L6)
     };
 
     Kind kind = Unknown;
@@ -95,6 +97,8 @@ struct Type {
         case Variant: return name;
         case Generic: return name;
         case NoneVal: return "none";
+        case Pointer: return deref().display() + "*";
+        case ArenaPtr: return "arena_ptr<" + deref().display() + ">";
         }
         return "?";
     }

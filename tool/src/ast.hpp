@@ -21,6 +21,7 @@ struct TypeUse {
     int line = 0;
     bool is_const = false;
     bool is_optional = false;                // T? → std::optional<T>(M2d,DESIGN §6.4)
+    bool is_pointer = false;                 // T* → 裸指针(M6,仅 @unsafe 内可产生)
     std::vector<std::string> parts;          // 限定名,如 {std, string}
     std::vector<TypeUse> args;               // 泛型实参
 
@@ -255,6 +256,7 @@ struct FuncDecl {
     std::string name;
     std::vector<TypeParam> type_params;      // <T: Concept>(M2d)
     std::vector<RequiresItem> requires_list; // requires A<T> && B<T>(M2d)
+    bool is_extern = false;                  // 无体声明:name: (...)->ret;(M6 互操作)
     std::vector<Param> params;
     std::optional<TypeUse> ret;
     bool throws = false;
@@ -345,6 +347,11 @@ struct ImportDecl {
     std::vector<std::string> module_parts;
 };
 
+struct LegacyBlock {                          // cxx_legacy { … }(M6,DESIGN §9.1)
+    int line = 0;
+    std::string code;                         // 原文(不含花括号),逐字复制到生成码
+};
+
 struct Module {
     std::string name;                        // 可空(省略时 = 文件名)
     int name_line = 0;
@@ -355,6 +362,7 @@ struct Module {
     std::vector<ConceptDecl> concepts;
     std::vector<GlobalVar> globals;
     std::vector<FuncDecl> funcs;
+    std::vector<LegacyBlock> legacy_blocks;  // cxx_legacy {} 原文(M6):逐字复制到生成码全局域
 
     StructDecl* find_struct(std::string const& n) {
         for (auto& s : structs) if (s.name == n) return &s;

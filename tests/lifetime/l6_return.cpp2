@@ -1,0 +1,6 @@
+// expect-ok — L6:工厂包装返回 arena_ptr 合法(逃逸检查针对存储与传参)
+module lt_l6a;
+import std;
+P: type = { x: int = 0; }
+make: (inout a: arena) -> arena_ptr<P> = a.create(P{});
+main: () -> int = { return 0; }

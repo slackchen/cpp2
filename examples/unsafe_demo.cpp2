@@ -1,0 +1,46 @@
+// unsafe_demo.cpp2 — M6:cxx_legacy 原文块、@unsafe 指针(M5-L5)、arena(M5-L6)
+module unsafe_demo;
+import std;
+
+cxx_legacy {
+    // 块内是原始 C++:按 C++ 规则解析,逐字复制到生成码全局域
+    // (注意:与无体声明配对的外部符号不能是 static——外部链接须一致)
+    int legacy_add(int a, int b) { return a + b; }
+}
+
+// 无体声明(M6 互操作):外部符号,体在 legacy 块 / Cpp1 侧
+legacy_add: (a: int, b: int) -> int;
+
+// arena 工厂包装:T 由实参推导,返回 arena_ptr<T>(sema 据此做 L6 逃逸检查)
+// (inout:arena 登记对象时被修改;copy:v 按值进入,const& 会让 create 产生 const 对象)
+make_in: <T> (inout a: arena, copy v: T) -> arena_ptr<T> = a.create(v);
+
+Point: type = {
+    x: int = 0;
+    y: int = 0;
+    norm2: () -> int = x * x + y * y;
+}
+
+main: () -> int = {
+    // ── cxx_legacy:同翻译单元全局域可见 ──
+    std::println("legacy = {0}", legacy_add(2, 3));
+
+    // ── M5-L5:取地址与指针算术仅限 @unsafe 块 ──
+    v: int = 41;
+    total := 0;
+    @unsafe {
+        p: int* = &v;                // 取地址(域外 → 编译错误)
+        *p = *p + 1;                 // 解引用
+        q: int* = p + 1;             // 指针算术(域外 → 编译错误)
+        total = *p;
+    }
+
+    // ── M5-L6:arena 与 arena_ptr(不得逃逸)──
+    ar: arena = arena{};
+    ap: arena_ptr<Point> = make_in(ar, Point{.x = 8, .y = 9});
+    std::println("total={0} arena-point={1} live={2}",
+                 total, (*ap).norm2(), ar.live());
+    ar.reset();
+    std::println("after reset live={0}", ar.live());
+    return 0;
+}

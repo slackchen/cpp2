@@ -25,6 +25,7 @@ public:
 
     Report run(ast::Module& m)
     {
+        rep_.legacy_count = static_cast<int>(m.legacy_blocks.size());
         for (auto& s : m.structs) {
             if (s.invariant) expr(*s.invariant);
             for (auto& f : s.fields)
@@ -274,6 +275,7 @@ std::string format_section(std::string const& module_name, std::string const& fi
        + ", narrow " + std::to_string(rep.checked_narrow)
        + ", contract " + std::to_string(rep.checked_contract)
        + ", invariant " + std::to_string(rep.checked_invariant) + "\n";
+    s += "   legacy : " + std::to_string(rep.legacy_count) + " cxx_legacy block(s)\n";
     if (rep.opt_outs.empty()) {
         s += "   opt-out: none\n";
     } else {

@@ -1,0 +1,8 @@
+// expect-error: address-of requires @unsafe
+module lt_l5a;
+import std;
+main: () -> int = {
+    v: int = 1;
+    p: int* = &v;                // 取地址在 @unsafe 之外 → 编译错误
+    return 0;
+}

@@ -22,6 +22,7 @@ struct Report {
     int checked_narrow = 0;                 // as 收窄检查注入点
     int checked_contract = 0;               // pre/post 契约检查注入点(M2c)
     int checked_invariant = 0;              // 类型不变量守卫方法数(M4 收口,DESIGN §6.5)
+    int legacy_count = 0;                   // cxx_legacy 块数(M6,DESIGN §6.6 白纸黑字)
     std::vector<OptOut> opt_outs;
 
     int checks() const

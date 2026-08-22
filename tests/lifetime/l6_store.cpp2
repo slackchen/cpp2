@@ -1,0 +1,12 @@
+// expect-error: escapes arena domain
+module lt_l6b;
+import std;
+P: type = { x: int = 0; }
+main: () -> int = {
+    ar: arena = arena{};
+    ap: arena_ptr<P> = make_in(ar, P{});
+    keep: P = ap;                // arena_ptr 流入非 arena_ptr 存储 → 编译错误
+    return 0;
+}
+
+make_in: <T> (inout a: arena, copy v: T) -> arena_ptr<T> = a.create(v);

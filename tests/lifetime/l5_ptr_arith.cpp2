@@ -1,0 +1,9 @@
+// expect-error: pointer arithmetic requires @unsafe
+module lt_l5b;
+import std;
+main: () -> int = {
+    v: int = 1;
+    p: int* = &v;                // 先报 L5 取地址(同语句域)
+    q: int* = p + 1;             // 指针算术在 @unsafe 之外 → 编译错误
+    return 0;
+}
