@@ -101,9 +101,13 @@ CmdResult run_capture(std::string const& cmd)
 
 std::string native(fs::path p)
 {
+#ifdef _WIN32
     std::string s = p.string();
     for (auto& c : s) if (c == '/') c = '\\';
     return s;
+#else
+    return p.string();                      // POSIX:正斜杠原样
+#endif
 }
 
 // ── 编译准备:模块图 + 逐模块语义检查 ─────────────────────────────
