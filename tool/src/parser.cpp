@@ -245,6 +245,16 @@ private:
             return;
         }
 
+        // invariant: <bool 表达式>;  (DESIGN §6.5 类型不变量)
+        if (peek().text == "invariant" && peek(2).tok != lex::Tok::LParen) {
+            int ln = peek().line;
+            advance(); advance();
+            s.invariant = expression();
+            s.invariant_line = ln;
+            expect(lex::Tok::Semi, "';' after invariant");
+            return;
+        }
+
         ast::FieldDecl f;
         f.line = peek().line;
         f.name = advance().text;

@@ -21,11 +21,12 @@ struct Report {
     int checked_deref = 0;                  // 空检查注入点
     int checked_narrow = 0;                 // as 收窄检查注入点
     int checked_contract = 0;               // pre/post 契约检查注入点(M2c)
+    int checked_invariant = 0;              // 类型不变量守卫方法数(M4 收口,DESIGN §6.5)
     std::vector<OptOut> opt_outs;
 
     int checks() const
     { return checked_arith + checked_index + checked_deref + checked_narrow
-           + checked_contract; }
+           + checked_contract + checked_invariant; }
     int unchecked() const;
     int unsafe() const;
 };

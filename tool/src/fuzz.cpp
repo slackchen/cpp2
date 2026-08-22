@@ -1,6 +1,7 @@
-// C++2 模糊测试实现(M4):确定性变异 + 前端卫生检查
+// C++2 模糊测试实现(M4/M4收口):确定性变异 + 前端卫生检查 + emit 全管线
 #include "fuzz.hpp"
 
+#include "emit.hpp"
 #include "lexer.hpp"
 #include "parser.hpp"
 #include "sema.hpp"
@@ -99,7 +100,19 @@ int run_one(std::string const& src, std::string const& name)
     try {
         auto toks = lex::lex(src);
         auto ast = parse::parse(std::move(toks), name);
-        (void)sema::check(ast, {});
+        auto r = sema::check(ast, {});
+        // M4 收口:sema 通过的输入继续走发射(摊平 + headers 两模式),
+        // 覆盖降低器/生成码构造的崩溃面;失败输入止步于前端诊断
+        if (r.ok()) {
+            emit::ModuleEntry e;
+            e.m = &ast;
+            e.r = &r;
+            e.src_name = name;
+            std::string flat = emit::emit_flatten({e});
+            (void)emit::emit_headers(e);
+            if (flat.find("cpp2::trap") == std::string::npos && flat.empty())
+                throw std::runtime_error("emitter produced empty output");
+        }
         return 0;
     } catch (lex::LexError const&) {
         return 0;                       // 预期诊断:未闭合字符串/非法字符等

@@ -1,0 +1,26 @@
+// invariant.cpp2 — 类型不变量(DESIGN §6.5):公开方法出入口自动检查
+module invariant_demo;
+import std;
+
+Account: type = {
+    balance: i64 = 0;
+
+    invariant: balance >= 0;                // 入口/出口注入;违反 → trap
+
+    deposit: (amount: i64) mutates = { balance += amount; }
+
+    withdraw: (amount: i64) mutates = {
+        if amount > balance { return; }
+        balance -= amount;
+    }
+}
+
+main: () -> int = {
+    a: Account := Account{};
+    a.deposit(100);
+    std::println("balance = {0}", a.balance);
+
+    a.withdraw(30);
+    std::println("after withdraw = {0}", a.balance);
+    return 0;
+}

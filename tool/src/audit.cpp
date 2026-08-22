@@ -26,10 +26,14 @@ public:
     Report run(ast::Module& m)
     {
         for (auto& s : m.structs) {
+            if (s.invariant) expr(*s.invariant);
             for (auto& f : s.fields)
                 if (f.init) expr(*f.init);
             for (auto& md : s.methods) {
                 count_contracts(md.pre.get(), md.post.get());
+                // invariant 注入点 = 引用成员的方法(与 emit 侧 guarded 条件一致)
+                if (s.invariant && md.uses_members && md.name != "destructor")
+                    ++rep_.checked_invariant;
                 if (md.pre)  expr(*md.pre);
                 if (md.post) expr(*md.post);
                 if (md.has_block_body && md.block_body) stmt(*md.block_body);
@@ -268,7 +272,8 @@ std::string format_section(std::string const& module_name, std::string const& fi
        + ", index "  + std::to_string(rep.checked_index)
        + ", deref "  + std::to_string(rep.checked_deref)
        + ", narrow " + std::to_string(rep.checked_narrow)
-       + ", contract " + std::to_string(rep.checked_contract) + "\n";
+       + ", contract " + std::to_string(rep.checked_contract)
+       + ", invariant " + std::to_string(rep.checked_invariant) + "\n";
     if (rep.opt_outs.empty()) {
         s += "   opt-out: none\n";
     } else {

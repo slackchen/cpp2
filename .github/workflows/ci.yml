@@ -1,0 +1,36 @@
+# C++2 toolchain CI (Linux) — closes the M4 "CI 接入" gap structurally.
+# Windows 本机矩阵由 tests/run.sh 承担(llvm-mingw);此处补 Linux 真机:
+#   - 真 GCC / clang 的编译器矩阵(M4 挂账:gcc 分支参数实测)
+#   - libFuzzer 可用性(-fsanitize=fuzzer 在 Linux clang 下可用,M4 挂账)
+name: cpp2-ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    strategy:
+      matrix:
+        cxx: [g++, clang++]
+    runs-on: ubuntu-latest
+    env:
+      CPP2_CXX: ${{ matrix.cxx }}
+      CPP2_RT: ${{ github.workspace }}/rt
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build toolchain
+        run: bash build.sh
+      - name: Full regression (examples + traps + modules + audit + fuzz)
+        run: bash tests/run.sh
+      - name: Fuzz with emit pipeline (libFuzzer-independent deterministic fuzzer)
+        run: |
+          ./.cpp2build/cpp2 fuzz examples/*.cpp2 examples/multimod/*.cpp2 \
+              tests/cases/*.cpp2 --seed 20260821 --iters 20000
+      - name: Thousand-module stress (M3 exit criteria)
+        run: |
+          pwsh -NoProfile -File tests/bench_gen.ps1 -Count 1000 -Funcs 24
+          ./.cpp2build/cpp2 build tests/bench/main.cpp2
+          ./.cpp2build/cpp2 build tests/bench/main.cpp2 | grep -q "0 transpiled.*0 compiled"
+          ./tests/bench/.cpp2build/main

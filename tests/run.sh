@@ -97,6 +97,26 @@ else
     echo "FAIL m3/cpp1-interop"; fail=$((fail+1))
 fi
 
+# ── M4 收口:invariant 类型不变量(DESIGN §6.5)──────────────────
+run_case examples/invariant.cpp2 "balance = 100"            ok
+run_case examples/invariant.cpp2 "after withdraw = 70"      ok
+# 故障注入:出口违反不变量 → trap(带源位置)
+run_case tests/cases/invariant_trap.cpp2 "invariant violated: Box" trap "invariant_trap.cpp2:7"
+# audit 计数:Account 两个 mutates 方法受守卫
+if "$CPP2" audit examples/invariant.cpp2 2>/dev/null | grep -q "invariant 2"; then
+    echo "PASS m4/audit-invariant"; pass=$((pass+1))
+else
+    echo "FAIL m4/audit-invariant"; fail=$((fail+1))
+fi
+
+# ── 全特性展示(showcase):语言面冒烟 ───────────────────────────
+run_case examples/showcase.cpp2 "A: a=42 b=84 c=7 norm2=25" ok
+run_case examples/showcase.cpp2 "E: area = 12.56636"        ok
+run_case examples/showcase.cpp2 "G: or=7/-1 must=5"         ok
+run_case examples/showcase.cpp2 "I: clamp=5/2 max3=9 lambda=36" ok
+run_case examples/showcase.cpp2 "K: v[2]=3 ptr=5/61 narrow=2000000000" ok
+run_case examples/showcase.cpp2 "M: for-sum=6 while-w=3"    ok
+
 # ── M4:检查器完备 / audit / fuzz ────────────────────────────────
 # audit:检查注入点计数 + @unsafe/@unchecked 位置(白纸黑字)
 audit_out="$("$CPP2" audit examples/smart.cpp2 2>/dev/null; "$CPP2" audit examples/safety.cpp2 2>/dev/null)"

@@ -1,0 +1,211 @@
+// ============================================================================
+// showcase.cpp2 — C++2 语言全特性一览(≤M4 已实现项,可编译可运行)
+// 每个区块对应一组语言特性;运行输出即特性验证结果。
+// 未含:M6 的 cxx_legacy、$param 编译期开关(v0.x 未实现)。
+// ============================================================================
+
+module showcase;
+import std;
+
+// ── 1. 类型定义:字段必须带默认值(强制初始化),方法默认只读 ──
+Point: type = {
+    x: int = 0;
+    y: int = 0;
+
+    // 只读方法(等价 const 成员函数)
+    norm2: () -> int = x * x + y * y;
+
+    // mutates:修改自身必须写进签名(与参数 inout 对齐)
+    translate: (dx: int, dy: int) mutates = {
+        x += dx;
+        y += dy;
+    }
+
+    // 不引用成员 → 自动 static(类型内工具函数)
+    answer: () -> int = 42;
+
+    // 类型不变量(DESIGN §6.5):公开方法出入口自动检查,违反 → trap
+    invariant: x >= -1000000 && y >= -1000000;
+}
+
+// ── 2. 继承(仅公有):字段查找沿基类链 ──
+Animal: type = {
+    name: string = "";
+    speak: () -> string = "...";
+}
+
+Dog: type: Animal = {
+    tricks: int = 0;
+
+    // 同名隐藏基类版本(C++ 静态语义;虚分发挂 M5+)
+    speak: () -> string = "woof";
+
+    destructor: () mutates = { }          // 确定性析构,顺序与构造相反
+}
+
+// ── 3. enum:默认 scoped,无隐式整型转换,可指定底层类型 ──
+Signal: enum = { red, green, yellow }
+Tiny: enum: u8 = { a, b, c }
+
+// ── 4. variant:类型安全联合;match 是唯一合法访问,穷尽性编译器保证 ──
+Shape: variant = { Point, Circle }
+Circle: type = {
+    r: double = 0;
+}
+
+// ── 5. concept + 泛型 + requires 子句(DESIGN §5.6)──
+Ordered: concept = {
+    operator<: (that: self) -> bool;
+}
+
+clamp: <T: Ordered> (v: T, lo: T, hi: T) -> T = {
+    if v < lo { return lo; }
+    if hi < v { return hi; }
+    return v;
+}
+
+// 复杂约束用 requires 子句
+max3: <T> (a: T, b: T, c: T) -> T
+    requires Ordered<T>
+= {
+    m: T := a;
+    if b > m { m = b; }
+    if c > m { m = c; }
+    return m;
+}
+
+// ── 6. 错误通道:throws 函数返回 expected,'?' 机械传播 ──
+parse_digit: (c: char) -> int throws = {
+    if c >= '0' && c <= '9' { return c as int - ('0' as int); }
+    return err("not a digit");
+}
+
+// 契约:pre/post;old() 入口求值缓存,result 绑定返回值
+withdraw_style: (balance: i64, amount: i64) -> i64
+    pre:  amount > 0
+    post: result == balance - amount
+= {
+    return balance - amount;
+}
+
+// 参数模式:in(默认,接口统一)/ inout / out / copy / forward
+add_into: (inout total: int, add: int) = { total += add; }
+divmod: (a: int, b: int, out q: int, out r: int) = {
+    q = a / b;                          // 除零 → trap(M4)
+    r = a - q * b;
+}
+copy_param: (copy s: string) -> int = s.size();
+call_forward: <F> (forward f: F, v: int) -> int = f(v);
+
+main: () -> int = {
+
+    // ── A. 变量声明黄金法则:name: Type = init(不可变)| := 推断 | const ──
+    a: int = 42;                         // 不可变绑定
+    b: int := a * 2;                     // 推断初始化(可变)
+    c: const int = 7;                    // 显式 const
+    d := Point{.x = 3, .y = 4};          // 聚合构造(指定初始化器)
+    std::println("A: a={0} b={1} c={2} norm2={3}", a, b, c, d.norm2());
+
+    // ── B. 方法与 mutates;UFCS:x.f() ≡ f(x) ──
+    d.translate(1, 1);
+    std::println("B: translated norm2={0}, ufcs={1}", d.norm2(), a.to_string());
+
+    // ── C. 继承与同名隐藏 ──
+    an: Animal := Animal{.name = "generic"};
+    dg: Dog := Dog{};
+    dg.name = "rex";
+    std::println("C: {0} says {1} / dog says {2}", an.name, an.speak(), dg.speak());
+
+    // ── D. enum:成员经 :: 访问;显式 as 才能取底层值 ──
+    sig: Signal = Signal::green;
+    tiny: Tiny = Tiny::b;
+    std::println("D: sig-as-int={0}, tiny={1}", sig as int, tiny as int);
+
+    // ── E. variant + 模式匹配:类型模式 / 解构 / 守卫 / 通配;match 表达式产值 ──
+    v1: Shape := Point{.x = 3, .y = 4};          // 候选字面量隐式转 variant
+    v2: Shape := Circle{.r = 2.0};
+    shapes: vector<Shape> := {v1, v2};
+    for s in shapes {
+        area: double = match s {
+            Point(x, y) if x > 0 => x as double * y as double;   // 解构 + 守卫
+            Point(_)             => 0.0;                          // 通配解构
+            Circle(r)            => 3.14159 * r * r;              // 单绑定
+        };
+        std::println("E: area = {0}", area);
+    }
+
+    // match 语句(enum 成员模式 + _ 兜底)
+    match sig {
+        .red   => std::println("F: stop");
+        .green => std::println("F: go");
+        _      => std::println("F: slow");
+    }
+
+    // ── G. 错误通道:'?' 传播 / '!' 断言必成功 / or 默认值 / if-let ──
+    good := parse_digit('7') or (-1);            // 失败取默认
+    bad  := parse_digit('x') or (-1);
+    sure := parse_digit('5')!;                   // 确信成功,失败即 trap
+    std::println("G: or={0}/{1} must={2}", good, bad, sure);
+
+    if n := parse_digit('3') {                   // if-let:存在分支绑定解包值
+        std::println("G: if-let got {0}", n);
+    } else e := it {                             // else 分支 it 绑定错误值
+        std::println("G: if-let failed: {0}", e.message());
+    }
+
+    match parse_digit('9') {                     // match ok/err 双臂
+        ok v => std::println("G: match ok {0}", v);
+        err e => std::println("G: match err {0}", e.message());
+    }
+
+    // ── H. 契约:pre/post 在签名处可见 ──
+    left := withdraw_style(100, 30);
+    std::println("H: withdraw_style = {0}", left);
+
+    // ── I. 泛型实例化(多类型单态化)+ lambda 实参 ──
+    ia := clamp(5, 1, 10);
+    da := clamp(2.5, 0.0, 2.0);
+    ma := max3(7, 3, 9);
+    sq := call_forward((x: int) -> int = x * x, 6);       // lambda + forward 形参
+    std::println("I: clamp={0}/{1} max3={2} lambda={3}", ia, da, ma, sq);
+
+    // ── J. 参数模式:inout / out / copy ──
+    total: int = 10;
+    add_into(total, 5);
+    q: int = 0;
+    r: int = 0;
+    divmod(17, 5, q, r);
+    copied: int = copy_param("hello");
+    std::println("J: total={0} q={1} r={2} copy_len={3}", total, q, r, copied);
+
+    // ── K. 安全检查(正常路径零感知)+ optional 空安全 ──
+    v: vector<int> := {1, 2, 3};
+    p: unique<Point> := make_unique(Point{.x = 1, .y = 2});   // 智能指针 . 自动解引用+空检
+    sh: shared<Point> := make_shared(Point{.x = 5, .y = 6});
+    n: int = v[2];                               // 越界 → trap(M4)
+    wide: i64 = 2000000000;
+    narrowed: i32 = wide as i32;                 // 显式收窄;溢出值会 trap
+    maybe: int? = none;                          // optional(T?)
+    std::println("K: v[2]={0} ptr={1}/{2} narrow={3} maybe-empty={4}",
+                 n, p.norm2(), sh.norm2(), narrowed, !maybe.has_value());
+
+    // ── L. @unchecked/@unsafe:局部退出检查,白纸黑字可审计 ──
+    raw: int = 0;
+    @unchecked {
+        raw = v[1];                              // 此块内无越界检查
+    }
+    std::println("L: unchecked raw={0}", raw);
+
+    // ── M. 控制流全家桶 ──
+    sum := 0;
+    for i in v { sum += i; }
+    w := 0;
+    while w < 3 {
+        w += 1;
+        if w == 2 { continue; }
+        if w == 3 { break; }
+    }
+    std::println("M: for-sum={0} while-w={1}", sum, w);
+
+    return 0;
+}

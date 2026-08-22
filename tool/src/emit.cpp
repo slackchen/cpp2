@@ -76,6 +76,8 @@ public:
 
     std::string take() { return std::move(out_); }
 
+    void set_release(bool r) { release_ = r; }
+
     // ═══ 模式一:摊平(命名空间块,main 除外)═══════════════════════
     std::string flatten_block()
     {
@@ -325,6 +327,7 @@ private:
     int last_line_ = -1;
     int fresh_ = 0;
     bool checks_on_ = true;
+    bool release_ = false;                // §6.7 Release 档位:溢出检查关、post/old 关
     bool suppress_line_ = false;      // 表达式内嵌语句序列(lambda/match 体)禁用 #line
     // post 契约发射状态:old(...) → 入口缓存变量;result → __c2_result
     // (throws 函数包 expected 需解引用;普通函数直接引用)
@@ -483,8 +486,10 @@ private:
         }
         case ast::Expr::Binary: {
             auto& b = static_cast<ast::BinaryExpr&>(e);
-            if (checks_on_ && (b.op == "+" || b.op == "-" || b.op == "*"
-                            || b.op == "/" || b.op == "%")) {
+            // §6.7:Release 档位关闭有符号算术溢出检查(越界/空/契约保留)
+            if (checks_on_ && !release_
+                && (b.op == "+" || b.op == "-" || b.op == "*"
+                 || b.op == "/" || b.op == "%")) {
                 sema::Type l = type_of(*b.lhs), r = type_of(*b.rhs);
                 if (l.is_signed() && r.is_signed()) {
                     std::string fn = b.op == "+" ? "checked_add"
@@ -569,7 +574,11 @@ private:
             std::string inner = expr(*x.operand);
             if (expr_prec(*x.operand) < 8) inner = "(" + inner + ")";
             std::string t = type_str(x.target);
-            if (checks_on_ && src.is_arith() && dst.is_arith())
+            // 整型 → 浮点是宽化(值域安全):发 static_cast。走 narrow_cast 会
+            // 命中整数重载,其边界 static_cast<From>(To::max()) 对大浮点回卷,
+            // 导致任何值都被判越界(M4 收口发现)
+            bool to_float = dst.kind == sema::Type::Double || dst.kind == sema::Type::Float;
+            if (checks_on_ && !to_float && src.is_arith() && dst.is_arith())
                 return "cpp2::narrow_cast<" + t + ">(" + inner + check_loc(x.line) + ")";
             return "static_cast<" + t + ">(" + inner + ")";
         }
@@ -703,7 +712,7 @@ private:
                     out_ += pad() + "}\n";
                     break;
                 }
-                if (a.op != "=" && checks_on_) {
+                if (a.op != "=" && checks_on_ && !release_) {
                     sema::Type t = type_of(*a.target);
                     if (t.is_signed()) {
                         std::string fn = a.op == "+=" ? "checked_add"
@@ -1185,7 +1194,14 @@ private:
         case ast::ParamMode::Out:     res = type_str(p.type) + "& " + p.name; break;
         case ast::ParamMode::Move:    res = type_str(p.type) + "&& " + p.name; break;
         case ast::ParamMode::Copy:    res = type_str(p.type) + " " + p.name; break;
-        case ast::ParamMode::Forward: res = std::string("auto&& ") + p.name; break;
+        case ast::ParamMode::Forward: {
+            // forward f: F(F 为本函数类型参数)→ "F&&"(转发引用,可推导);
+            // 具体类型的 forward → auto&&
+            bool tp = generic_params_ && p.type.parts.size() == 1
+                   && generic_params_->count(p.type.parts[0]);
+            res = (tp ? type_str(p.type) : std::string("auto")) + "&& " + p.name;
+            break;
+        }
         }
         if (with_default && p.default_value) res += " = " + expr(*p.default_value);
         return res;
@@ -1349,12 +1365,17 @@ private:
     // 非 throws 函数返回 R 本身——失败只可能来自 trap,不存在错误传播。
     void emit_body_of(std::string const& name, bool throws, ast::Expr* pre, ast::Expr* post,
                       bool has_block, ast::Stmt* block, ast::Expr* body_expr,
-                      std::optional<ast::TypeUse> const& ret, int line)
+                      std::optional<ast::TypeUse> const& ret, int line,
+                      ast::Expr* inv = nullptr, int inv_line = 0,
+                      std::string const& inv_label = "")
     {
         ++indent_;
         bool returns = ret.has_value() && type_str(*ret) != "void";
+        // §6.7:Release 关 post/old(廉价断言 pre/invariant 保留)
+        ast::Expr* epost = release_ ? nullptr : post;
+        bool has_exit = epost || inv;
 
-        if (!pre && !post) {                   // 快路径:零额外代码
+        if (!pre && !has_exit) {               // 快路径:零额外代码
             emit_body_core(has_block, block, body_expr, ret, line);
             --indent_;
             return;
@@ -1362,7 +1383,7 @@ private:
 
         // old() 入口缓存(post 中的 old(expr) 在函数入口求值并暂存)
         std::unordered_map<ast::Expr*, std::string> olds;
-        if (post) collect_olds(*post, olds);
+        if (epost) collect_olds(*epost, olds);
         for (auto& [call, var] : olds) {
             auto& oc = static_cast<ast::CallExpr&>(*call);
             sync_line(oc.line);
@@ -1375,7 +1396,13 @@ private:
                   + name + "\"" + check_loc(pre->line) + "); }\n";
         }
 
-        if (!post) {
+        if (inv) {                             // invariant 入口(DESIGN §6.5)
+            sync_line(inv_line);
+            out_ += pad() + "if (!(" + expr(*inv) + ")) { cpp2::trap(\"invariant violated: "
+                  + (inv_label.empty() ? std::string(name) : inv_label) +  "\"" + check_loc(inv_line) + "); }\n";
+        }
+
+        if (!has_exit) {
             emit_body_core(has_block, block, body_expr, ret, line);
             --indent_;
             return;
@@ -1392,14 +1419,21 @@ private:
             out_ += pad() + "}();\n";
             if (throws)
                 out_ += pad() + "if (!__c2_result) { return __c2_result; }\n";
-            old_names_ = &olds;
-            in_post_ = true;
-            result_wrapped_ = throws;
-            sync_line(post->line);
-            out_ += pad() + "if (!(" + expr(*post) + ")) { cpp2::trap(\"postcondition failed: "
-                  + name + "\"" + check_loc(post->line) + "); }\n";
-            in_post_ = false;
-            old_names_ = nullptr;
+            if (inv) {                         // 出口:先不变量后 post
+                sync_line(inv_line);
+                out_ += pad() + "if (!(" + expr(*inv) + ")) { cpp2::trap(\"invariant violated: "
+                      + (inv_label.empty() ? std::string(name) : inv_label) +  "\"" + check_loc(inv_line) + "); }\n";
+            }
+            if (epost) {
+                old_names_ = &olds;
+                in_post_ = true;
+                result_wrapped_ = throws;
+                sync_line(epost->line);
+                out_ += pad() + "if (!(" + expr(*epost) + ")) { cpp2::trap(\"postcondition failed: "
+                      + name + "\"" + check_loc(epost->line) + "); }\n";
+                in_post_ = false;
+                old_names_ = nullptr;
+            }
             out_ += pad() + "return __c2_result;\n";
         } else {
             out_ += pad() + "[&] {\n";
@@ -1407,13 +1441,20 @@ private:
             emit_body_core(has_block, block, body_expr, ret, line);
             --indent_;
             out_ += pad() + "}();\n";
-            old_names_ = &olds;
-            in_post_ = true;
-            sync_line(post->line);
-            out_ += pad() + "if (!(" + expr(*post) + ")) { cpp2::trap(\"postcondition failed: "
-                  + name + "\"" + check_loc(post->line) + "); }\n";
-            in_post_ = false;
-            old_names_ = nullptr;
+            if (inv) {
+                sync_line(inv_line);
+                out_ += pad() + "if (!(" + expr(*inv) + ")) { cpp2::trap(\"invariant violated: "
+                      + (inv_label.empty() ? std::string(name) : inv_label) +  "\"" + check_loc(inv_line) + "); }\n";
+            }
+            if (epost) {
+                old_names_ = &olds;
+                in_post_ = true;
+                sync_line(epost->line);
+                out_ += pad() + "if (!(" + expr(*epost) + ")) { cpp2::trap(\"postcondition failed: "
+                      + name + "\"" + check_loc(epost->line) + "); }\n";
+                in_post_ = false;
+                old_names_ = nullptr;
+            }
         }
         --indent_;
     }
@@ -1621,9 +1662,14 @@ private:
         if (!md.uses_members) sig = "static " + sig;
         else if (!md.mutates) sig += " const";
         if (md.ret) sig += " -> " + ret_type_str(md.ret, md.throws);
+        // invariant:仅注入引用成员的方法(静态方法无对象;析构器跳过)
+        bool guarded = md.uses_members && s.invariant;
         out_ += pad() + sig + "\n" + pad() + "{\n";
         emit_body_of(md.name, md.throws, md.pre.get(), md.post.get(),
-                     md.has_block_body, md.block_body.get(), md.expr_body.get(), md.ret, md.line);
+                     md.has_block_body, md.block_body.get(), md.expr_body.get(), md.ret, md.line,
+                     guarded ? s.invariant.get() : nullptr,
+                     guarded ? s.invariant_line : 0,
+                     guarded ? s.name : "");
         out_ += pad() + "}\n";
     }
 
@@ -1680,16 +1726,20 @@ private:
                         + params_str(md.params, /*with_defaults*/false) + ")";
         if (md.uses_members && !md.mutates) sig += " const";
         if (md.ret) sig += " -> " + ret_type_str(md.ret, md.throws);
+        bool guarded = md.uses_members && s.invariant;   // invariant 出入口注入
         out_ += sig + "\n{\n";
         emit_body_of(md.name, md.throws, md.pre.get(), md.post.get(),
-                     md.has_block_body, md.block_body.get(), md.expr_body.get(), md.ret, md.line);
+                     md.has_block_body, md.block_body.get(), md.expr_body.get(), md.ret, md.line,
+                     guarded ? s.invariant.get() : nullptr,
+                     guarded ? s.invariant_line : 0,
+                     guarded ? s.name : "");
         out_ += "}\n\n";
     }
 };
 
 } // namespace
 
-std::string emit_flatten(std::vector<ModuleEntry> const& units)
+std::string emit_flatten(std::vector<ModuleEntry> const& units, bool release)
 {
     std::string out = "// Generated by cpp2c (whole-program flatten). DO NOT EDIT.\n"
                       + prelude_includes() + "\n";
@@ -1697,6 +1747,7 @@ std::string emit_flatten(std::vector<ModuleEntry> const& units)
     for (auto const& e : units) {
         Emitter em;
         em.set(*e.m, *e.r, e.src_name);
+        em.set_release(release);
         out += em.flatten_block();
         out += em.flatten_usings(e.is_root);
         out += "\n";
@@ -1705,22 +1756,25 @@ std::string emit_flatten(std::vector<ModuleEntry> const& units)
         if (!e.is_root) continue;
         Emitter em;
         em.set(*e.m, *e.r, e.src_name);
+        em.set_release(release);
         out += em.main_definition();
     }
     return out;
 }
 
-std::string emit_module_unit(ModuleEntry const& e)
+std::string emit_module_unit(ModuleEntry const& e, bool release)
 {
     Emitter em;
     em.set(*e.m, *e.r, e.src_name);
+    em.set_release(release);
     return em.module_unit(e);
 }
 
-std::pair<std::string, std::string> emit_headers(ModuleEntry const& e)
+std::pair<std::string, std::string> emit_headers(ModuleEntry const& e, bool release)
 {
     Emitter em;
     em.set(*e.m, *e.r, e.src_name);
+    em.set_release(release);
     std::string h = em.headers_header(e.imports);
     std::string cpp = em.headers_impl(e.is_root);
     return {h, cpp};

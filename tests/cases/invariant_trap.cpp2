@@ -1,0 +1,15 @@
+// invariant_trap — 不变量出口违反 → trap(消息带 .cpp2 源位置)
+module invariant_trap;
+import std;
+
+Box: type = {
+    v: int = 1;
+    invariant: v > 0;                       // ← 行 5:trap 位置锚点
+    reset_to: (n: int) mutates = { v = n; }
+}
+
+main: () -> int = {
+    b: Box := Box{};
+    b.reset_to(-5);                          // 出口检查:v = -5 < 0 → trap
+    return 0;
+}

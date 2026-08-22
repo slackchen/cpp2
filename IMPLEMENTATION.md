@@ -149,7 +149,7 @@ std::string text = *std::move(__c2_try_0);
 | 有符号算术 | `cpp2::checked_add(a, b)` 等;gcc/clang 用 `__builtin_*_overflow`,MSVC 用可移植预检 |
 | `n as i32` | `cpp2::narrow_cast<i32>(n)`,溢出 trap;浮点→整型经 2^N 边界重载(NaN/越界 trap) |
 | pre / post | 入口/出口 `if (!(...)) cpp2::trap(...)`;`old()` 入口求值缓存;post 时体包进 lambda(throws 函数 lambda 返回 `expected<R>`,`?` 传播同型直达出口),`result` 绑定返回值(M2c 已落地) |
-| invariant | 注入公开成员函数出入口(v0.3) |
+| invariant | 注入公开成员函数出入口(**M4 收口已接入**,DESIGN §6.5 原样语法) |
 | 空安全 | 智能指针解引用 → `cpp2::deref(p)->m` 空检 trap(M4 已接入);`T?` 解包经 `has_value()` 显式路径(M2d);legacy 指针解引用 → 空检 trap(M6) |
 
 `@unchecked` 块内不注入;`@unsafe` 块内容逐字转译并登记 audit。
@@ -292,7 +292,7 @@ load(cpp2::in<std::string> path)
 | M2c | ~~错误通道(expected / `?` / `!` / match ok-err / `or`)、契约~~ **已完成** | DESIGN §8 示例全绿 |
 | M2d | ~~泛型 + concept、UFCS、variant/optional、模式匹配~~ **已完成** | ~~DESIGN §4.5–§5.6 示例全绿~~ |
 | M2e | ~~`.c2i` 产出、`cpp2 audit`、`cpp2 run` / `check` CLI~~ **已完成** | ~~`.c2i` 格式冻结 v1~~ |
-| M3 | C++20 模块发射、`cpp2 build` 并行增量、`export-headers` | 千单元项目增量构建正确 |
+| M3 | C++20 模块发射、`cpp2 build` 并行增量、`export-headers` | 千单元项目增量构建正确(**M4 收口实测达成**:1001 模块,见收口记录) |
 
 **M3 完成记录(2026-08-20)**:模块图加载(import 点分名解析、拓扑、环检测)、跨模块 sema 可见性(直接 import 的导出符号,非传递)、三种发射模式(摊平命名空间 / C++20 named module / 桥接头)、`cpp2 build`(拓扑分层 `std::thread` 并行、源哈希跳过转译、接口哈希控制下游重编)、`export-headers` 生成 `.h`/`.cpp` 并经 Cpp1 消费者实测互操作。增量语义三场景实测:no-op 零编译、实现变更仅重编本模块、接口变更传播至依赖者。
 
@@ -304,7 +304,7 @@ M3 实现偏差(相对本章早先的设想,均待后续里程碑消除):
 | 模块编译参数 | ~~仅 clang 族~~ M4 起按家族分派(toolchain.cpp;clang 实测,gcc/msvc 为文档形态参数) | 有 gcc/MSVC 的环境实测并修正 |
 | `export-headers` | 摊平式桥接(导出实体落在全局命名空间);限制:导出函数体不得引用跨模块未导出名 | 模块附着(attachment)语义研究后再决定是否包 `import` 式桥接 |
 | 并行编译 | 拓扑分层 + 每层线程池 | 千单元级压测后引入就绪队列调度 |
-| M4 | 检查器完备 + 故障注入 + 模糊测试 | 全部检查项验收 |
+| ~~M4~~ **已完成(M4 收口补齐)** | 检查器完备 + 故障注入 + 模糊测试 | 全部检查项验收(invariant 于收口实现) |
 | M5 | 生存期 Lite L1–L6 | 悬垂测试集编译期捕获率报告 |
 | M6 | `cxx_legacy` 增强、`gc<T>`(保守式) | 与 zlib 双向互操作 |
 | M7+ | 自举实验、原生后端评估 | — |
@@ -316,9 +316,9 @@ M4 实现偏差:
 | 偏差 | 现状 | 计划 |
 |---|---|---|
 | ~~契约检查项~~ | ~~audit 不含 pre/post/invariant~~ **M2c 已落地**:pre/post 注入 + audit 计数 + 故障注入用例;invariant 仍挂账 | invariant v0.3 注入公开成员函数出入口 |
-| gcc/msvc 模块参数 | 文档形态,未实测(本机无对应编译器) | 取得环境后跑 `tests/run.sh` 修正 |
-| libFuzzer | llvm-mingw(windows-gnu)不支持 `-fsanitize=fuzzer`(实测报错);harness 已备(`tool/fuzz/`),内置变异 fuzzer 承担本机与 CI 职责 | Linux/MSVC CI 接入 |
-| fuzz 覆盖 | 词法/语法/sema;emit 未入 fuzz(其崩溃面小且有快照测试) | M5 起纳入 emit 与模块图加载 |
+| gcc/msvc 模块参数 | 文档形态;真机验证由 `.github/workflows/ci.yml` 承担(ubuntu 真 gcc/clang 矩阵;本机 llvm-mingw 的 g++ 实为 clang 别名) | CI 首跑后按实际输出修正 |
+| libFuzzer | llvm-mingw(windows-gnu)不支持 `-fsanitize=fuzzer`(实测报错);harness 已备(`tool/fuzz/`),内置变异 fuzzer 承担本机职责;**Linux CI 工作流已就位**(M4 收口) | CI 首跑接入 libFuzzer 任务 |
+| ~~fuzz 覆盖~~ | ~~emit 未入 fuzz~~ **M4 收口已纳入**:sema 通过的输入继续过 emit_flatten + emit_headers 全管线(3000 迭代零崩溃);模块图加载仍走回归用例覆盖 | — |
 
 **M2c 完成记录(2026-08-21)**:错误通道全链路落地——`throws` 函数签名降为 `cpp2::expected<R>`(`rt`:`std::expected` 单参别名 + `error{message()}` + `err(msg, loc)` + `must(e, loc)`);`?` 机械展开(求值到临时量 → 失败提前 `return std::unexpected(error)` → 解包),合法位置 = 变量初始化/赋值右值/`return`/裸语句,嵌套使用 sema 干净报错;`f()!` → `cpp2::must`(任意表达式位置);`f() or 默认` → `value_or`;`match f() { ok x / err e }` → `has_value()` 分支(穷尽性 = 恰好一 ok 一 err);`if x := f() { } else e := it { }` 同构展开;`err("消息")` 自动附 `.cpp2:行` 源位置。**编译器强制处理**:错误通道值出现在裸调用/`if`/`while` 条件/二元运算等未处理位置一律 sema 报错(DESIGN §8.1 "调用方必须处理"由类型系统背书)。契约:`pre:`/`post:`(函数与方法),`old()` 入口求值缓存,`result` 绑定返回值;post 时体包进 lambda——throws 函数 lambda 返回 `expected<R>`(`return R` 隐式转换、`?` 传播同型直达出口,失败跳过 post),非 throws 函数返回 `R` 本身;契约违反 → trap 不可捕获。audit 新增 contract 计数。接口哈希:方法签名补 `throws` 标记(签名变更触发依赖者重编)。过程中修复一个存量词法缺陷:`!=` 从未有过双字符规则(此前所有示例恰好只用 `==`),postfix `!` 落地后暴露,已补 `Ne` 词法。
 
@@ -329,7 +329,7 @@ M2c 实现偏差:
 | `?` 嵌套进更大表达式 | sema 报错(仅语句级四种位置) | M2d+ 评估语句拆分或表达式级 lowering |
 | `throws E` 显式类别 | 解析后丢弃 | v0.3 错误类型体系(DESIGN §8.4) |
 | `err()` 消息 | 纯字符串 + 位置;无类别/错误链 | v0.3 同上 |
-| invariant | 未实现(DESIGN §6.5 类型不变量) | v0.3 注入公开成员函数出入口 |
+| invariant | ~~未实现~~ **M4 收口已实现**(见收口记录) | — |
 | 契约 + 简短体外的复杂控制流 | lambda 包裹对 NRVO 有影响(post 存在时) | Release 档位裁剪 post 时零开销(M4 §6.7 规则不变) |
 
 **M2d 完成记录(2026-08-21)**:类型系统第二切片全链路落地——**泛型**:`<T: Concept>` 类型参数 + `requires A<T> && B<T>` 子句,`main` 拒绝泛型;**concept**:接口块(`self` 占位类型)降为 C++20 `template <class __c2_Self> concept ... = requires {...}`,满足性在实例化点由编译器判定,sema 负责约束名解析与"concept 不是值类型";**variant**:`Value: variant = {int, string}` → `std::variant` 别名,match 是唯一合法访问,穷尽性 sema 检查(缺臂/`_` 非末臂/重复臂均干净诊断);**optional**:`T?` → `std::optional<T>`,`none` 字面量,if-let(含 `_` 忽略绑定)/ match some-none / `or` 同构展开;**模式匹配扩展**:类型模式、解构(位置与 `.field` 命名,就地归一化为 `.field=绑定`)、`if` 守卫、通配、match **表达式**(产值,臂间公共类型 = 同型或算术宽化);**lambda**:函数声明去名字,表达式体/块体,v0.1 隐式 `[&]`;**UFCS**:成员未命中查可见自由函数,标量/char 接收者桥接 `std::to_string`(DESIGN §4.7 首例);**继承补全**:字段查找沿基类链(`find_field_deep`,派生同名隐藏基类),方法体内基类字段照常注入。示例:shapes(variant/守卫/enum 模式)、optional(if-let/some-none)、generics(concept/requires/UFCS/lambda)、types(继承/析构器/命名工厂);回归新增 16 正向 + 7 负例。
@@ -386,6 +386,16 @@ M3b 实现偏差:
 | part 内 #include 重复 | part 头部与各片段各自 include 同一 .h(#pragma once 兜底) | 纯观感问题,暂不处理 |
 
 ---
+
+**M4 收口完成记录(2026-08-21)**:≤M4 全部验收缺口与挂账清零——
+1. **invariant 类型不变量**(M2c/M4 唯一缺失检查项,DESIGN §6.5 原样语法):类型块内 `invariant: <bool 表达式>;`;sema 在成员作用域推断并校验 bool;发射注入**引用成员的方法**(静态方法/析构器跳过)入口与出口各一次,与 pre/post 组合时出口顺序 = 不变量 → post;trap 消息携带类型名与 `invariant:` 行位置;audit 新增 invariant 计数(守卫方法数);headers 后端线外定义同款注入。
+2. **千单元压测(M3 验收)**:`bench_gen -Count 1000`(1001 模块 / 4.3MB 源 / 生成码 ~30MB)。全量 24.7s(28 TU 并行);no-op 重建 1.8s(零编译);m500 接口变更传播 15 个下游 part;m700 实现变更仅 1 个 part;产物输出正确。过程中发现并修复 headers 后端深图缺陷:链式依赖使 `.h` include 链达千层(clang 上限 200)→ part 顶部平铺传递闭包,嵌套 include 经 `#pragma once` 短路。
+3. **sema 调用点核对补遗**:struct→variant 候选隐式转换(DESIGN §5.5)纳入相容规则(压测暴露);跨模块导出名冲突在 prepare() 统一检测(headers 后端全局命名空间约束从文档约定升级为编译器强制)。
+4. **--release 档位**(DESIGN §6.7):run/build/transpile 通旗标;有符号溢出检查关闭、post/old 关闭;越界/空/pre/invariant 保留("安全默认、显式退出")。
+5. **fuzz 纳入 emit 全管线**:sema 通过的变异输入继续过 flatten + headers 两模式发射;3000 迭代零崩溃。
+6. **Linux CI 工作流**(`.github/workflows/ci.yml`):ubuntu 真 gcc/clang 矩阵跑全量回归 + fuzz + 千单元压测——gcc/msvc 参数实测与 libFuzzer 接入由 CI 承担(本机 llvm-mingw 的 g++ 为 clang 别名,已实测确认无法代表真 GCC)。
+
+回归 80 用例全绿(+4:invariant 正例×2、trap 注入、audit 计数)。
 
 ## 10. v0.x 明确不做
 

@@ -295,6 +295,8 @@ struct StructDecl {
     std::optional<TypeUse> base;             // 公有继承基类
     std::vector<FieldDecl> fields;
     std::vector<MethodDecl> methods;
+    ExprP invariant;                         // 类型不变量 `invariant: <expr>;`(DESIGN §6.5)
+    int invariant_line = 0;                  // 公开方法出入口注入检查
 
     FieldDecl* find_field(std::string const& n) {
         for (auto& f : fields) if (f.name == n) return &f;

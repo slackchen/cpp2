@@ -12,6 +12,7 @@
 #include "toolchain.hpp"
 #include "util.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
@@ -128,7 +129,7 @@ std::vector<emit::ModuleEntry> Prepared::entries() const
     return out;
 }
 
-std::optional<Prepared> prepare(fs::path const& root)
+std::optional<Prepared> prepare(fs::path const& root, bool quick = false)
 {
     Prepared p;
     try {
@@ -137,7 +138,39 @@ std::optional<Prepared> prepare(fs::path const& root)
         print_diag(e.file, "error", e.line > 0 ? e.line : 1, 1, e.msg);
         return std::nullopt;
     }
+
+    // 跨模块导出名冲突检测(headers 后端导出名落全局命名空间,冲突即链接错误)
+    {
+        std::unordered_map<std::string, std::string> owner;   // 导出名 → 模块
+        bool clash = false;
+        auto claim = [&](std::string const& mod, std::string const& n, int line) {
+            auto it = owner.find(n);
+            if (it != owner.end() && it->second != mod) {
+                print_diag(p.graph.units.at(mod).file.string(), "error",
+                           line > 0 ? line : 1, 1,
+                           "exported name '" + n + "' is also exported by module '"
+                           + it->second + "' (headers backend requires cross-module "
+                           "uniqueness)");
+                clash = true;
+            } else {
+                owner.emplace(n, mod);
+            }
+        };
+        for (auto const& name : p.graph.order) {
+            auto const& m = p.graph.units.at(name).ast;
+            for (auto const& e : m.enums)    if (e.exported) claim(name, e.name, e.line);
+            for (auto const& s : m.structs)  if (s.exported) claim(name, s.name, s.line);
+            for (auto const& v : m.variants) if (v.exported) claim(name, v.name, v.line);
+            for (auto const& c : m.concepts) if (c.exported) claim(name, c.name, c.line);
+            for (auto const& g : m.globals)  if (g.exported) claim(name, g.name, g.line);
+            for (auto const& f : m.funcs)
+                if (f.exported && f.name != "main") claim(name, f.name, f.line);
+        }
+        if (clash) return std::nullopt;
+    }
+
     for (auto const& name : p.graph.order) {
+        if (quick && name != p.graph.root_name) continue;   // --quick:仅根模块检查
         auto const& u = p.graph.units.at(name);
         std::vector<ast::Module*> imported;
         for (auto const& dep : u.imports)
@@ -289,18 +322,21 @@ void write_cache(fs::path const& build_dir, std::string const& mod, CacheRec con
 int cmd_transpile(std::vector<std::string> const& args)
 {
     if (args.empty()) {
-        std::cerr << "usage: cpp2 transpile <root.cpp2> [-o out.cpp]\n";
+        std::cerr << "usage: cpp2 transpile <root.cpp2> [-o out.cpp] [--release]\n";
         return 1;
     }
     fs::path in = args[0];
     fs::path out;
-    for (size_t i = 1; i + 1 < args.size(); ++i)
-        if (args[i] == "-o") out = args[i + 1];
+    bool release = false;
+    for (size_t i = 1; i < args.size(); ++i) {
+        if (args[i] == "-o" && i + 1 < args.size()) out = args[++i];
+        else if (args[i] == "--release") release = true;
+    }
     if (out.empty()) out = in.parent_path() / ".cpp2build" / (in.stem().string() + ".cpp");
 
     auto p = prepare(in);
     if (!p) return 1;
-    auto code = emit::emit_flatten(p->entries());
+    auto code = emit::emit_flatten(p->entries(), release);
     if (!write_file(out, code)) {
         std::cerr << "error: cannot write '" << out.string() << "'\n";
         return 1;
@@ -310,25 +346,40 @@ int cmd_transpile(std::vector<std::string> const& args)
 }
 
 // ── cpp2 check:快速语义检查,不生成代码(IMPLEMENTATION §2)────────
+// --quick:只检查根模块(依赖仅作符号表,跳过其检查)——大图快速反馈
 int cmd_check(std::vector<std::string> const& args)
 {
-    if (args.empty()) {
-        std::cerr << "usage: cpp2 check <root.cpp2>\n";
+    bool quick = false;
+    std::string file;
+    for (auto const& a : args) {
+        if (a == "--quick") quick = true;
+        else file = a;
+    }
+    if (file.empty()) {
+        std::cerr << "usage: cpp2 check <root.cpp2> [--quick]\n";
         return 1;
     }
-    auto p = prepare(fs::path(args[0]));
+    fs::path in(file);
+    auto p = quick ? prepare(in, /*quick*/true) : prepare(in);
     if (!p) return 1;
-    std::cout << p->graph.order.size() << " module(s) ok\n";
+    std::cout << p->graph.order.size() << " module(s) ok"
+              << (quick ? " (quick)" : "") << "\n";
     return 0;
 }
 
 int cmd_run(std::vector<std::string> const& args)
 {
-    if (args.empty()) {
-        std::cerr << "usage: cpp2 run <root.cpp2>\n";
+    bool release = false;
+    std::string file;
+    for (auto const& a : args) {
+        if (a == "--release") release = true;
+        else file = a;
+    }
+    if (file.empty()) {
+        std::cerr << "usage: cpp2 run <root.cpp2> [--release]\n";
         return 1;
     }
-    fs::path in = args[0];
+    fs::path in(file);
     std::string cxx = find_compiler();
     if (cxx.empty()) {
         std::cerr << "error: no C++ compiler found (set CPP2_CXX)\n";
@@ -342,7 +393,7 @@ int cmd_run(std::vector<std::string> const& args)
     auto p = prepare(in);
     if (!p) return 1;
 
-    auto code = emit::emit_flatten(p->entries());
+    auto code = emit::emit_flatten(p->entries(), release);
     fs::path build_dir = in.parent_path() / ".cpp2build";
     fs::path cpp = build_dir / (in.stem().string() + ".cpp");
     fs::path exe = build_dir / in.stem();
@@ -370,10 +421,13 @@ int cmd_build(std::vector<std::string> const& args)
 {
     std::string backend = "headers";
     long long max_tu = 1024 * 1024;   // 单 TU 生成码预算(字节);横向实测最优,见 IMPL M3b
+    bool release = false;
     fs::path in;
     for (size_t i = 0; i < args.size(); ++i) {
-        if (args[i].rfind("--backend=", 0) == 0)     { backend = args[i].substr(10); continue; }
+        if (args[i] == "--backend=headers")     { backend = "headers"; continue; }
+        if (args[i].rfind("--backend=", 0) == 0){ backend = args[i].substr(10); continue; }
         if (args[i].rfind("--max-tu-size=", 0) == 0) { max_tu = std::stoll(args[i].substr(14)); continue; }
+        if (args[i] == "--release")             { release = true; continue; }
         if (!args[i].empty() && args[i][0] == '-') {
             std::cerr << "error: unknown option '" << args[i] << "'\n";
             return 1;
@@ -441,7 +495,7 @@ int cmd_build(std::vector<std::string> const& args)
         auto old = read_cache(build_dir, name);
 
         if (headers_backend) {
-            auto [h_str, frag] = emit::emit_headers(e);
+            auto [h_str, frag] = emit::emit_headers(e, release);
             std::string h_hash = sha256::hex_of(h_str);
             std::string gen_hash = sha256::hex_of(frag);
             fs::path h_path = build_dir / (util::safe_name(name) + ".h");
@@ -467,7 +521,7 @@ int cmd_build(std::vector<std::string> const& args)
                 ++cached;
                 continue;
             }
-            auto code = emit::emit_module_unit(e);
+            auto code = emit::emit_module_unit(e, release);
             write_file(gen, code);
             CacheRec r;
             r.src_hash = src_hash;
@@ -528,14 +582,18 @@ int cmd_build(std::vector<std::string> const& args)
         std::vector<PartJob> jobs;
         int idx = 0;
         for (auto const& part : parts) {
-            std::string text = "// Generated by cpp2c (headers backend). DO NOT EDIT.\n";
+            // 头依赖闭包:成员 + 传递 import;include 平铺在 part 顶部,
+            // 使 .h 内部的嵌套 include 命中 #pragma once 短路——
+            // 链式深图(m999→…→m0)否则会产生千层 include 嵌套(超编译器上限)
             std::unordered_set<std::string> closure;
             bool any_h_changed = false;
-            for (auto const& m : part.mods) {
+            for (auto const& m : part.mods) collect(m, closure);
+            std::vector<std::string> incs(closure.begin(), closure.end());
+            std::sort(incs.begin(), incs.end());
+            std::string text = "// Generated by cpp2c (headers backend). DO NOT EDIT.\n";
+            for (auto const& m : incs)
                 text += "#include \"" + util::safe_name(m) + ".h\"\n";
-                collect(m, closure);
-            }
-            for (auto const& m : closure) any_h_changed |= h_changed[m];
+            for (auto const& m : incs) any_h_changed |= h_changed[m];
             text += "\n";
             for (auto const& m : part.mods) text += frags[m];
 
@@ -744,7 +802,7 @@ int cmd_audit(std::vector<std::string> const& args)
     auto p = prepare(in);
     if (!p) return 1;
 
-    int arith = 0, index = 0, deref = 0, narrow = 0, contract = 0;
+    int arith = 0, index = 0, deref = 0, narrow = 0, contract = 0, invariant = 0;
     int unchecked = 0, unsafe = 0;
     for (auto const& name : p->graph.order) {
         auto const& u = p->graph.units.at(name);
@@ -753,11 +811,13 @@ int cmd_audit(std::vector<std::string> const& args)
         arith += rep.checked_arith; index += rep.checked_index;
         deref += rep.checked_deref; narrow += rep.checked_narrow;
         contract += rep.checked_contract;
+        invariant += rep.checked_invariant;
         unchecked += rep.unchecked(); unsafe += rep.unsafe();
     }
     std::cout << "audit: " << p->graph.order.size() << " module(s), checks: arith "
               << arith << " / index " << index << " / deref " << deref
               << " / narrow " << narrow << " / contract " << contract
+              << " / invariant " << invariant
               << "; opt-outs: @unchecked x" << unchecked
               << ", @unsafe x" << unsafe << "\n";
     return 0;

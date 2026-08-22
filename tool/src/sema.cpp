@@ -296,6 +296,27 @@ private:
                 err(md.line, 0, "duplicate method '" + md.name + "' in type '" + s.name + "'");
         }
         for (auto& md : s.methods) check_method(s, md);
+
+        // 类型不变量:bool 表达式,成员作用域内推断(字段可见;禁止 old/result)
+        if (s.invariant) {
+            cur_struct_ = &s;
+            cur_method_ = nullptr;
+            cur_throws_ = false;
+            scopes_.clear();
+            scopes_.emplace_back();
+            std::vector<ast::FieldDecl*> fields;
+            gather_fields(s, fields);
+            for (auto* f : fields) {
+                Sym sym;
+                sym.kind = SymKind::Field;
+                sym.type = type_from_use(f->type);
+                sym.is_const = f->is_const;
+                scopes_.back()[f->name] = sym;
+            }
+            Type t = infer(*s.invariant);
+            if (t.known() && t.kind != Type::Bool)
+                err(s.invariant_line, 0, "invariant must be a bool expression");
+        }
     }
 
     void gather_fields(ast::StructDecl& s, std::vector<ast::FieldDecl*>& out)
@@ -1125,6 +1146,14 @@ private:
             return t.kind == Type::String || t.kind == Type::StringView;
         };
         if (stry(param) && stry(arg)) return true;
+        // struct → variant 候选隐式转换(DESIGN §5.5)
+        if (param.kind == Type::Variant && arg.kind == Type::NamedStruct) {
+            if (auto* vd = find_variant(param.name))
+                for (auto& alt : vd->alternatives)
+                    if (!alt.parts.empty() && alt.parts.back() == arg.name)
+                        return true;
+            return false;
+        }
         if (param.is_expected == arg.is_expected && param.is_optional == arg.is_optional
             && param.value && arg.value)
             return arg_assignable(*param.value, *arg.value);
