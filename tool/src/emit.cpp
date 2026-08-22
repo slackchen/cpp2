@@ -45,8 +45,9 @@ std::string escape_path(std::string p)
 std::string prelude_includes()
 {
     return std::string("#include \"cpp2/support.hpp\"\n")
-         + "#include <cmath>\n#include <cstdint>\n#include <optional>\n"
-           "#include <string>\n#include <utility>\n#include <variant>\n#include <vector>\n";
+         + "#include <cmath>\n#include <cstdint>\n#include <filesystem>\n"
+           "#include <fstream>\n#include <optional>\n#include <string>\n"
+           "#include <utility>\n#include <variant>\n#include <vector>\n";
 }
 
 // "app.util" → {cpp2mod, app, util}(用于摊平模式的嵌套命名空间与 using)

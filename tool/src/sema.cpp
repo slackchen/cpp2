@@ -1075,6 +1075,8 @@ private:
             if (b.kind == Type::Container) return b.elem();
             if (b.kind == Type::String || b.kind == Type::StringView)
                 return Type::of(Type::Char);
+            // M6:指针下标 = 解引用语义(p[i] ≡ *(p+i);算术门禁在二元层)
+            if (b.kind == Type::Pointer) return b.deref();
             return {};                              // 未知基类型:放行
         }
         case ast::Expr::Member:
@@ -1316,6 +1318,10 @@ private:
             return t.kind == Type::String || t.kind == Type::StringView;
         };
         if (stry(param) && stry(arg)) return true;
+        // 字符串 → char* 衰减(字面量/视图传 C 接口;非 const 变量由 C++ 侧把关)
+        if (param.kind == Type::Pointer
+            && param.deref().kind == Type::Char && stry(arg))
+            return true;
         // struct → variant 候选隐式转换(DESIGN §5.5)
         if (param.kind == Type::Variant && arg.kind == Type::NamedStruct) {
             if (auto* vd = find_variant(param.name))
@@ -1601,16 +1607,25 @@ private:
             return {};
         }
 
-        // M5-L5/M6:指针算术仅 @unsafe;arena_ptr 一律禁止
+        // M5-L5/M6:指针算术仅 @unsafe;比较(含判空)合法;arena_ptr 禁算术
         if (l.kind == Type::ArenaPtr || r.kind == Type::ArenaPtr) {
-            err(b.line, b.col, "arena_ptr does not support arithmetic (M5-L6)");
-            return {};
-        }
-        if (l.kind == Type::Pointer || r.kind == Type::Pointer) {
-            if (b.op != "+" && b.op != "-") {
-                err(b.line, b.col, "pointers support only '+' and '-'");
+            bool acmp = b.op == "==" || b.op == "!=";
+            if (!acmp) {
+                err(b.line, b.col, "arena_ptr does not support arithmetic (M5-L6)");
                 return {};
             }
+            return Type::of(Type::Bool);
+        }
+        if (l.kind == Type::Pointer || r.kind == Type::Pointer) {
+            bool cmp = b.op == "==" || b.op == "!=" || b.op == "<"
+                    || b.op == ">" || b.op == "<=" || b.op == ">=";
+            if (!cmp && b.op != "+" && b.op != "-") {
+                err(b.line, b.col,
+                    "pointers support only '+', '-' and comparisons");
+                return {};
+            }
+            if (cmp)
+                return Type::of(Type::Bool);
             if (!in_unsafe_)
                 err(b.line, b.col,
                     "pointer arithmetic requires @unsafe (M5-L5); "

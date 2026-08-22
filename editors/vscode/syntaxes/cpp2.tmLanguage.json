@@ -4,6 +4,9 @@
   "scopeName": "source.cpp2",
   "patterns": [
     {
+      "include": "#legacy-block"
+    },
+    {
       "include": "#comments"
     },
     {
@@ -41,6 +44,21 @@
     }
   ],
   "repository": {
+    "legacy-block": {
+      "patterns": [
+        {
+          "name": "meta.embedded.block.cxx-legacy.cpp2",
+          "begin": "\\b(cxx_legacy)\\s*\\{",
+          "beginCaptures": {
+            "1": {
+              "name": "keyword.other.special.cpp2"
+            }
+          },
+          "end": "\\}",
+          "contentName": "meta.embedded.line.cpp"
+        }
+      ]
+    },
     "comments": {
       "patterns": [
         {
@@ -185,7 +203,7 @@
     },
     "builtin-types": {
       "name": "support.type.cpp2",
-      "match": "\\b(void|bool|char|i8|i16|i32|i64|u8|u16|u32|u64|int|float|double|string|string_view|list|vector|byte|unique|shared|weak|auto)\\b"
+      "match": "\\b(void|bool|char|i8|i16|i32|i64|u8|u16|u32|u64|int|float|double|string|string_view|list|vector|byte|unique|shared|weak|arena|arena_ptr|gc_new|auto)\\b"
     },
     "std-names": {
       "patterns": [

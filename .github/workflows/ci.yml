@@ -30,9 +30,9 @@ jobs:
         run: |
           ./.cpp2build/cpp2 fuzz examples/*.cpp2 examples/multimod/*.cpp2 \
               tests/cases/*.cpp2 --seed 20260821 --iters 20000
-      - name: Thousand-module stress (M3 exit criteria)
+      - name: Thousand-module stress (M3 exit criteria, bootstrap generator M7a)
         run: |
-          pwsh -NoProfile -File tests/bench_gen.ps1 -Count 1000 -Funcs 24
+          BENCH_COUNT=1000 BENCH_FUNCS=24 ./.cpp2build/cpp2 run tests/bench_gen.cpp2
           ./.cpp2build/cpp2 build tests/bench/main.cpp2
           ./.cpp2build/cpp2 build tests/bench/main.cpp2 | grep -q "0 transpiled.*0 compiled"
           ./tests/bench/.cpp2build/main

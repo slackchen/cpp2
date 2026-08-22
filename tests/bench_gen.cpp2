@@ -1,0 +1,141 @@
+// bench_gen.cpp2 — 千单元基准生成器(M7a 自举实验:测试基础设施用 cpp2 编写)
+// 与 tests/bench_gen.ps1 等价的产物;配置经环境变量(工具 main 暂无 argv):
+//   BENCH_COUNT(默认 120)/ BENCH_FUNCS(默认 80)/ BENCH_ROOT(默认 tests/bench)
+module bench_gen;
+import std;
+
+// ── 配置(env 优先,缺省回退)────────────────────────────────
+env_int: (k: string, d: int) -> int = {
+    v: char* = std::getenv(k.data());
+    if v == 0 { return d; }
+    n: int = d;
+    acc: int = 0;
+    neg: bool = false;
+    i: int = 0;
+    if v[0] == '-' { neg = true; i = 1; }
+    while v[i] != 0 {
+        if v[i] < '0' || v[i] > '9' { return d; }     // 非数字 → 回退默认
+        acc = acc * 10 + (v[i] as int - '0' as int);
+        i += 1;
+    }
+    if neg { acc = -acc; }
+    n = acc;
+    return n;
+}
+
+env_str: (k: string, d: string) -> string = {
+    v: char* = std::getenv(k.data());
+    if v == 0 { return d; }
+    s: string := "";
+    i: int = 0;
+    while v[i] != 0 {
+        s.push_back(v[i]);
+        i += 1;
+    }
+    if s.size() == 0 { return d; }
+    return s;
+}
+
+pad3: (i: int) -> string = {
+    s: string = std::to_string(i);
+    while s.size() < 3 { s = "0" + s; }
+    return s;
+}
+
+mod_name: (i: int) -> string = "bench.m" + pad3(i);
+
+write_file: (path: string, content: string) = {
+    f: std::ofstream := std::ofstream(path);
+    // (语言暂无 << 运算符,挂账 v0.3;write 接口等价)
+    f.write(content.data(), content.size() as int);
+}
+
+ensure_dir: (p: string) = {
+    std::filesystem::create_directories(p);
+}
+
+// ── 模块体生成(与 ps1 版逐段对齐)──────────────────────────
+gen_module: (i: int, funcs: int, root: string) = {
+    t: string := "";
+    t += "// bench module " + std::to_string(i) + " (generated; DO NOT EDIT)\n";
+    t += "module " + mod_name(i) + ";\n";
+    t += "import std;\n";
+    if i > 0 { t += "import " + mod_name(i - 1) + ";\n"; }
+    if i > 3 { t += "import " + mod_name(i - 3) + ";\n"; }
+    t += "\n";
+
+    t += "export P" + std::to_string(i) + ": type = {\n";
+    t += "    x: int = 0;\n    y: int = 0;\n";
+    t += "    norm2: () -> int = x * x + y * y;\n";
+    t += "    bump: (d: int) mutates = { x += d; }\n}\n\n";
+
+    t += "export V" + std::to_string(i) + ": variant = { P" + std::to_string(i) + ", int }\n\n";
+    t += "export describe" + std::to_string(i) + ": (s: V" + std::to_string(i)
+       + ") -> int = match s {\n";
+    t += "    P" + std::to_string(i) + " p => p.norm2();\n";
+    t += "    int n => n;\n}\n\n";
+
+    for k in 0..funcs {
+        t += "g" + std::to_string(i) + "_" + std::to_string(k)
+           + ": (v: int) -> int = v + " + std::to_string(k) + ";\n";
+    }
+    t += "\n";
+
+    for k in 0..funcs {
+        head := "export f" + std::to_string(i) + "_" + std::to_string(k)
+              + ": (a: int, b: int) -> int = {";
+        if k % 8 == 7 {
+            t += head + "\n";
+            t += "    v: vector<int> := {a, b, " + std::to_string(k) + "};\n";
+            t += "    return v[1] + v[0] * 2 + v[2];\n}\n";
+        } else if i > 0 && k % 4 == 3 {
+            t += head + "\n";
+            t += "    s: int := a + b + " + std::to_string(k) + ";\n";
+            t += "    if s > " + std::to_string(k + 10) + " { s -= b; }\n";
+            t += "    return s + g" + std::to_string(i) + "_" + std::to_string(k)
+               + "(a) + f" + std::to_string(i - 1) + "_" + std::to_string(k) + "(b, a);\n}\n";
+        } else {
+            t += head + "\n";
+            t += "    s: int := a * " + std::to_string(k + 1) + " + b;\n";
+            t += "    if s > " + std::to_string(k) + " { s -= a; }\n";
+            t += "    return s + g" + std::to_string(i) + "_" + std::to_string(k) + "(b);\n}\n";
+        }
+    }
+
+    path := root + "/m" + pad3(i) + ".cpp2";
+    write_file(path, t);
+}
+
+gen_root: (count: int, root: string) = {
+    t: string := "// bench root (generated; DO NOT EDIT)\n";
+    t += "module bench.main;\nimport std;\n";
+    for i in 0..count {
+        t += "import " + mod_name(i) + ";\n";
+    }
+    t += "\nmain: () -> int = {\n    total: int := 0;\n";
+    for i in 0..count {
+        if i % 10 == 0 {
+            t += "    total += f" + std::to_string(i) + "_1(" + std::to_string(i) + ", 2);\n";
+        }
+    }
+    t += "    p0: P0 := P0{.x = 3, .y = 4};\n";
+    t += "    total += describe0(p0);\n";
+    t += "    total += f" + std::to_string(count - 1) + "_7(5, 6);\n";
+    t += "    std::println(\"bench ok: {0}\", total);\n    return 0;\n}\n";
+    write_file(root + "/main.cpp2", t);
+}
+
+main: () -> int = {
+    count := env_int("BENCH_COUNT", 120);
+    funcs := env_int("BENCH_FUNCS", 80);
+    root  := env_str("BENCH_ROOT", "tests/bench");
+
+    ensure_dir(root);
+    for i in 0..count {
+        gen_module(i, funcs, root);
+    }
+    gen_root(count, root);
+    std::println("generated: {0} modules x {1} funcs -> {2}/main.cpp2",
+                 count, funcs, root);
+    return 0;
+}
