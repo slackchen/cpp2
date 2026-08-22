@@ -36,4 +36,10 @@ jobs:
           BENCH_COUNT=1000 BENCH_FUNCS=24 ./.cpp2build/cpp2 run tests/bench_gen.cpp2
           ./.cpp2build/cpp2 build tests/bench/main.cpp2
           ./.cpp2build/cpp2 build tests/bench/main.cpp2 | grep -q "0 transpiled.*0 compiled"
-          ./tests/bench/.cpp2build/main
+          set +e
+          out=$(./tests/bench/.cpp2build/main 2>&1); rc=$?
+          echo "$out"
+          echo "main rc=$rc"
+          ls -l tests/bench/.cpp2build/main
+          file tests/bench/.cpp2build/main || true
+          exit $rc
