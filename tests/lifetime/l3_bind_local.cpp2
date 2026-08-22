@@ -1,0 +1,9 @@
+// expect-ok — L3:绑定到具名局部(同生存期,安全)
+module lt_l3b;
+import std;
+main: () -> int = {
+    s: string = "held by name";
+    sv: string_view = s;
+    std::println("{0}", sv.size());
+    return 0;
+}

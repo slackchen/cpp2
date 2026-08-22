@@ -545,6 +545,13 @@ private:
                 && v.init->kind() == ast::Expr::ListLit
                 && static_cast<ast::ListLitExpr&>(*v.init).elements.empty())
                 err(v.line, v.col, "empty list literal '{}' needs an explicit type");
+            // M5-L3:string_view 绑定到调用返回的值语义临时 → 视图逃逸出语句
+            if (v.has_type && init_t.kind == Type::String
+                && type_from_use(v.type).kind == Type::StringView
+                && v.init && v.init->kind() == ast::Expr::Call)
+                err(v.line, v.col,
+                    "temporary bound to view escapes statement (M5-L3); "
+                    "bind to a named value first");
             Type t = v.has_type ? type_from_use(v.type) : init_t;
             t.is_const = v.is_const;
             if (v.has_type && v.init && v.init->kind() == ast::Expr::ListLit) {

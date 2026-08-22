@@ -1,0 +1,9 @@
+// expect-error: escapes statement
+module lt_l3a;
+import std;
+make: () -> string = "temporary";
+main: () -> int = {
+    sv: string_view = make();        // 临时绑定视图,语句结束即悬垂
+    std::println("{0}", sv.size());
+    return 0;
+}
