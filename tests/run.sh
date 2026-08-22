@@ -148,6 +148,20 @@ else
     echo "FAIL m6/audit-legacy"; fail=$((fail+1))
 fi
 
+# ── M6 切片二:gc<T> 保守式收集器 + zlib 双向互操作 ──────────────
+# gc:安全性断言(活对象必存活;回收率保守式非确定,不作断言)
+run_case examples/gc_demo.cpp2 "kept.id=42 (survived)"      ok
+run_case examples/gc_demo.cpp2 "churn-last=998"             ok
+run_case examples/gc_demo.cpp2 "collections=1"              ok
+
+# zlib:本机无 zlib.h 时跳过(CI ubuntu 自带 zlib1g-dev 实测)
+if echo '#include <zlib.h>' | g++ -x c++ - -fsyntax-only >/dev/null 2>&1; then
+    run_case examples/zlib_demo.cpp2 "compress rc=0"        ok
+    run_case examples/zlib_demo.cpp2 "roundtrip-equal=true" ok
+else
+    echo "SKIP m6/zlib (zlib.h not found on this host; covered by CI)"
+fi
+
 # ── M4:检查器完备 / audit / fuzz ────────────────────────────────
 # audit:检查注入点计数 + @unsafe/@unchecked 位置(白纸黑字)
 audit_out="$("$CPP2" audit examples/smart.cpp2 2>/dev/null; "$CPP2" audit examples/safety.cpp2 2>/dev/null)"

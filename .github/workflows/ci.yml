@@ -20,6 +20,8 @@ jobs:
       CPP2_RT: ${{ github.workspace }}/rt
     steps:
       - uses: actions/checkout@v4
+      - name: Install zlib (M6 interop exit criteria)
+        run: sudo apt-get update && sudo apt-get install -y zlib1g-dev
       - name: Build toolchain
         run: bash build.sh
       - name: Full regression (examples + traps + modules + audit + fuzz)

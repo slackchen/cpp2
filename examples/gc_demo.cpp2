@@ -1,0 +1,35 @@
+// gc_demo.cpp2 — M6:可选保守式 GC(显式触发;安全性断言,回收率非确定)
+module gc_demo;
+import std;
+
+Data: type = {
+    id: int = 0;
+    pad: i64 = 0;
+}
+
+// 语言面入口:泛型包装直译 rt 模板(cpp2::gc_new,T 由实参推导)
+gc_new: <T> (copy v: T) -> T* = cpp2::gc_new(v);
+
+// 垃圾制造:分配后不留引用(返回末个 id 保持计算可见)
+churn: () -> int = {
+    last: int = 0;
+    for i in 0..999 {
+        g := gc_new(Data{.id = i, .pad = i as i64});
+        last = (*g).id;
+    }
+    return last;
+}
+
+main: () -> int = {
+    kept := gc_new(Data{.id = 42, .pad = 7});     // 活对象:collect 必须存活
+    before := cpp2::gc_live_bytes();
+
+    last_used := churn();
+
+    cpp2::gc_collect();
+    std::println("kept.id={0} (survived)", (*kept).id);
+    std::println("churn-last={0}", last_used);
+    std::println("live_bytes before={1} after={0}", cpp2::gc_live_bytes(), before);
+    std::println("collections={0}", cpp2::gc_collections());
+    return 0;
+}

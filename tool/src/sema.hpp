@@ -72,6 +72,21 @@ struct Type {
         }
     }
 
+    // 宽化判定(目标值域 ⊇ 源值域):宽化 as 不注入运行期检查——
+    // narrow_cast 的边界用 static_cast<From>(To::max()) 回卷,对宽化是必错路径
+    // (int→i64 / int→double 实测踩坑,M6)
+    bool is_widening_to(Type const& dst) const {
+        if (!is_arith() || !dst.is_arith()) return false;
+        if (display() == dst.display()) return true;
+        if (is_floaty()) return dst.kind == Double;      // float→double 宽;double→float 窄
+        if (dst.is_floaty()) return true;                // 整型 → 浮点:宽化
+        if (is_signed() == dst.is_signed())
+            return dst.signed_rank() >= signed_rank();
+        if (is_signed() && dst.is_unsigned())
+            return false;                                // 符号变更:显式且受检
+        return dst.signed_rank() > signed_rank();        // unsigned → 更宽 signed
+    }
+
     std::string display() const {
         if (is_expected) return "expected<" + val().display() + ">";
         if (is_optional) return val().display() + "?";

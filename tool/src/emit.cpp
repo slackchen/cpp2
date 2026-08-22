@@ -591,11 +591,10 @@ private:
             std::string inner = expr(*x.operand);
             if (expr_prec(*x.operand) < 8) inner = "(" + inner + ")";
             std::string t = type_str(x.target);
-            // 整型 → 浮点是宽化(值域安全):发 static_cast。走 narrow_cast 会
-            // 命中整数重载,其边界 static_cast<From>(To::max()) 对大浮点回卷,
-            // 导致任何值都被判越界(M4 收口发现)
-            bool to_float = dst.kind == sema::Type::Double || dst.kind == sema::Type::Float;
-            if (checks_on_ && !to_float && src.is_arith() && dst.is_arith())
+            // 宽化(值域变大)发 static_cast:narrow_cast 的边界回卷对宽化必错
+            // (int→i64 边界回卷 -1、int→double 回卷 INT_MIN,实测踩坑 M6)
+            bool widening = src.is_widening_to(dst);
+            if (checks_on_ && src.is_arith() && dst.is_arith() && !widening)
                 return "cpp2::narrow_cast<" + t + ">(" + inner + check_loc(x.line) + ")";
             return "static_cast<" + t + ">(" + inner + ")";
         }
@@ -1557,6 +1556,11 @@ private:
         if (!f.type_params.empty())
             out_ += template_header(f) + "\n";
         out_ += signature(f, /*with_defaults*/false) + "\n{\n";
+        if (f.name == "main") {
+            // M6:GC 栈顶锚点——锚变量在 main 帧内,覆盖全部调用帧
+            out_ += pad() + "char __c2_gc_top;\n";
+            out_ += pad() + "cpp2::gc_set_stack_top(&__c2_gc_top);\n";
+        }
         emit_body_of(f.name, f.throws, f.pre.get(), f.post.get(),
                      f.has_block_body, f.block_body.get(), f.expr_body.get(), f.ret, f.line);
         out_ += "}\n\n";

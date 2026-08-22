@@ -214,8 +214,10 @@ private:
         }
         case ast::Expr::AsCast: {
             auto& x = static_cast<ast::AsCastExpr&>(e);
+            // 与 emit 侧一致:仅收窄计数(宽化发 static_cast,无检查注入)
             if (checks_on_ && type_of(*x.operand).is_arith()
-                          && target_kind(x.target).is_arith())
+                           && target_kind(x.target).is_arith()
+                           && !type_of(*x.operand).is_widening_to(target_kind(x.target)))
                 ++rep_.checked_narrow;
             expr(*x.operand);
             break;

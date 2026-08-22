@@ -1,0 +1,16 @@
+// expect-ok — L4:@unsafe 显式担责的成员视图返回(调用方保证对象生存期)
+module lt_l4b;
+import std;
+User: type = {
+    name: string = "";
+    name_view: () -> string_view = {
+        @unsafe {
+            return name;
+        }
+    }
+}
+main: () -> int = {
+    u: User := User{.name = "ada"};
+    std::println("{0}", u.name_view().size());
+    return 0;
+}

@@ -510,17 +510,31 @@ private:
         for (auto& tp : f.type_params) generic_names_.erase(tp.name);
     }
 
-    // M5-L1:返回表达式若是 in string 参数的裸名 → 视图悬垂
+    // M5-L1/L4:返回表达式视图逃逸检查(return 与短体共用)
     void check_view_escape(ast::Expr& e)
     {
-        if (!cur_ret_is_view_ || in_string_params_.empty()) return;
-        if (e.kind() == ast::Expr::Name
-            && !static_cast<ast::NameExpr&>(e).qualified()
-            && in_string_params_.count(static_cast<ast::NameExpr&>(e).parts[0]))
+        if (!cur_ret_is_view_) return;
+        if (e.kind() != ast::Expr::Name
+            || static_cast<ast::NameExpr&>(e).qualified())
+            return;
+        auto& n = static_cast<ast::NameExpr&>(e);
+        // L1:in string 参数的视图随返回悬垂
+        if (in_string_params_.count(n.parts[0])) {
             err(e.line, e.col,
                 "returning view of 'in' parameter '"
-                + static_cast<ast::NameExpr&>(e).parts[0]
-                + "' dangles after return (M5-L1)");
+                + n.parts[0] + "' dangles after return (M5-L1)");
+            return;
+        }
+        // L4:成员字段的视图逃逸——所属对象生存期未知;@unsafe 显式担责
+        if (!in_unsafe_) {
+            if (auto* sym = resolve(n.parts[0]);
+                sym && sym->kind == SymKind::Field
+                && sym->type.kind == Type::String)
+                err(e.line, e.col,
+                    "'" + n.parts[0]
+                    + "' is a member field; returning its view escapes the "
+                    "owner's lifetime (M5-L4); wrap the return in @unsafe");
+        }
     }
 
     // post 契约:old() 合法、result 绑定返回值(DESIGN §6.5)

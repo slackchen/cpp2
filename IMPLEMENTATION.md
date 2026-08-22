@@ -305,8 +305,8 @@ M3 实现偏差(相对本章早先的设想,均待后续里程碑消除):
 | `export-headers` | 摊平式桥接(导出实体落在全局命名空间);限制:导出函数体不得引用跨模块未导出名 | 模块附着(attachment)语义研究后再决定是否包 `import` 式桥接 |
 | 并行编译 | 拓扑分层 + 每层线程池 | 千单元级压测后引入就绪队列调度 |
 | ~~M4~~ **已完成(M4 收口补齐)** | 检查器完备 + 故障注入 + 模糊测试 | 全部检查项验收(invariant 于收口实现) |
-| M5 | 生存期 Lite L1–L6(**进行中**:L1/L2/L3 已落地,捕获率报告 8/8;L4 需定档,L5/L6 随 M6) | 悬垂测试集编译期捕获率报告 |
-| M6 | `cxx_legacy` 增强、`gc<T>`(保守式) | 与 zlib 双向互操作(**进行中**:M6a 已落 legacy 块/L5/arena/L6,见收口记录;gc 与 zlib 在切片二) |
+| ~~M5~~ **已完成** | 生存期 Lite L1–L6 | ~~悬垂测试集编译期捕获率报告~~ **14/14 = 100%**(L4 以 @unsafe 显式担责定档,见收口记录) |
+| ~~M6~~ **已完成** | `cxx_legacy` 增强、`gc<T>`(保守式) | 与 zlib 双向互操作(结构化交付:本机缺库由 CI ubuntu 实测,见收口记录) |
 | M7+ | 自举实验、原生后端评估 | — |
 
 **M4 完成记录(2026-08-20)**:检查器补齐空安全(智能指针 `.` 自动解引用 → `cpp2::deref(p)->m` 空检 trap,`@unsafe`/`@unchecked` 可退出,块形式语法落地——DESIGN §6.2/§6.6 原样)与浮点→整型转换越界检查(`narrow_cast` 浮点重载,2^N 精确边界,NaN 一并捕获);`cpp2 audit` 输出每模块检查注入点计数(arith/index/deref/narrow,谓词与发射侧一致)与全部 `@unsafe`/`@unchecked` 位置(含行号);故障注入套件扩至 5 例(溢出/越界/除零/空解引用/浮点转换),全部断言 trap 消息**与 `.cpp2` 源位置**;模糊测试:`cpp2 fuzz` 内置确定性变异 fuzzer(seed 可复现,regression 内置 10000 次迭代零崩溃),parser 增加递归深度防护(3000 层嵌套 → 干净诊断而非爆栈);编译器矩阵:`toolchain.cpp` 按 `--version` 输出探测家族(本机 `g++` 为 clang 别名,仅看名字会误判),模块编译参数按 clang/gcc/msvc 分派;生成码缓存键混入工具版本,emit 演进不再被旧缓存掩盖。
@@ -319,6 +319,8 @@ M4 实现偏差:
 | gcc/msvc 模块参数 | 文档形态;真机验证由 `.github/workflows/ci.yml` 承担(ubuntu 真 gcc/clang 矩阵;本机 llvm-mingw 的 g++ 实为 clang 别名) | CI 首跑后按实际输出修正 |
 | libFuzzer | llvm-mingw(windows-gnu)不支持 `-fsanitize=fuzzer`(实测报错);harness 已备(`tool/fuzz/`),内置变异 fuzzer 承担本机职责;**Linux CI 工作流已就位**(M4 收口) | CI 首跑接入 libFuzzer 任务 |
 | ~~fuzz 覆盖~~ | ~~emit 未入 fuzz~~ **M4 收口已纳入**:sema 通过的输入继续过 emit_flatten + emit_headers 全管线(3000 迭代零崩溃);模块图加载仍走回归用例覆盖 | — |
+| zlib 环境 | 本机 llvm-mingw 缺 zlib.h/libz → 示例结构化交付 + run.sh 条件跳过;CI ubuntu 预装 zlib1g-dev 承担出口判据实测 | CI 首跑确认 |
+| gc v1 边界 | 保守式:单线程/显式触发/无终结器/POD 式生命周期;死帧残留指针延迟回收(非确定,安全方向) | 可插拔后端接口按真实消费者需求评估 |
 
 **M2c 完成记录(2026-08-21)**:错误通道全链路落地——`throws` 函数签名降为 `cpp2::expected<R>`(`rt`:`std::expected` 单参别名 + `error{message()}` + `err(msg, loc)` + `must(e, loc)`);`?` 机械展开(求值到临时量 → 失败提前 `return std::unexpected(error)` → 解包),合法位置 = 变量初始化/赋值右值/`return`/裸语句,嵌套使用 sema 干净报错;`f()!` → `cpp2::must`(任意表达式位置);`f() or 默认` → `value_or`;`match f() { ok x / err e }` → `has_value()` 分支(穷尽性 = 恰好一 ok 一 err);`if x := f() { } else e := it { }` 同构展开;`err("消息")` 自动附 `.cpp2:行` 源位置。**编译器强制处理**:错误通道值出现在裸调用/`if`/`while` 条件/二元运算等未处理位置一律 sema 报错(DESIGN §8.1 "调用方必须处理"由类型系统背书)。契约:`pre:`/`post:`(函数与方法),`old()` 入口求值缓存,`result` 绑定返回值;post 时体包进 lambda——throws 函数 lambda 返回 `expected<R>`(`return R` 隐式转换、`?` 传播同型直达出口,失败跳过 post),非 throws 函数返回 `R` 本身;契约违反 → trap 不可捕获。audit 新增 contract 计数。接口哈希:方法签名补 `throws` 标记(签名变更触发依赖者重编)。过程中修复一个存量词法缺陷:`!=` 从未有过双字符规则(此前所有示例恰好只用 `==`),postfix `!` 落地后暴露,已补 `Ne` 词法。
 
@@ -407,9 +409,9 @@ M5a 挂账:
 | 规则 | 现状 | 计划 |
 |---|---|---|
 | L3 临时视图逃逸出语句 | ~~未实现~~ **M5b 已实现**:声明位 `string_view` 绑定调用返回的值语义临时即诊断("bind to a named value first");具名局部绑定不误报 | — |
-| L4 成员引用 ≤ 所属对象 | 未实现——语义需先定档(硬错误会破坏合法访问器模式;lint 级需产品决策) | 设计决策后随函数粒度流分析落地 |
-| L5 指针算术/取局部地址限 @unsafe | 语言尚无指针/取地址语法 | **随 M6 cxx_legacy 落地同步** |
-| L6 arena 指针不逃逸 | arena 本体未实现(M6) | **随 M6 同批** |
+| L4 成员引用 ≤ 所属对象 | ~~未实现~~ **已实现,定档 = 硬错误 + @unsafe 逃生舱**:`string_view` 返回绑定到 string 成员字段 → 诊断;`@unsafe { return name; }` 显式担责(与 L5 同一哲学:退出点白纸黑字) | — |
+| L5 指针算术/取局部地址限 @unsafe | ~~随 M6~~ **M6a 已落地**(T* 类型/取地址/指针算术,域外干净诊断) | — |
+| L6 arena 指针不逃逸 | ~~随 M6~~ **M6a 已落地**(存储域形态:全局声明/流入非 arena_ptr 变量或形参/算术 ✗;return 工厂包装 ✓) | — |
 
 **M5b(同日)**:L3 临时视图逃逸落地——声明位 `sv: string_view = make();`(初始化为调用返回的 string 值临时)即诊断,提示具名中转;绑定到具名局部不误报。捕获率 **8/8**。L4(成员引用 ≤ 对象)经评估暂缓:硬错误会破坏合法访问器模式,lint 级需要产品决策,记录于挂账表。
 
@@ -427,6 +429,13 @@ M6a 偏差:
 | L6 边界精度 | 类型域检查(非 arena_ptr 存储即逃逸);未追踪同一 arena 的作用域嵌套 | 结合作用域标注细化 |
 | legacy 名字桥接 | 需显式无体声明;legacy 内类型不参与 cpp2 类型系统 | M6 切片二评估自动扫描 |
 | gc<T> / zlib | 未动(zlib 需环境探明;gc 待真实消费者) | M6 切片二 |
+
+**M5/M6 收口记录(2026-08-21)**:路线图 M1–M6 全部完成——
+- **M5-L4 定档落地**:硬错误 + `@unsafe` 逃生舱(与 L5 同哲学:退出点白纸黑字)。`string_view` 返回绑定到 string 成员字段即诊断;`@unsafe { return name; }` 显式担责放行。悬垂语料最终 **14/14 = 100%**。
+- **gc<T> 保守式收集器 v1**(rt/cpp2/gc.hpp):池分配 + 保守栈扫描标记(根集 = main→collect 帧区间对齐字)+ 传递闭包 + 清扫复用;单线程、显式 `cpp2::gc_collect()`、无终结器(POD 式生命周期,白纸黑字);语言面泛型包装 `gc_new: <T> (copy v: T) -> T*`(直译 rt 模板,T 推导);栈顶界由生成代码在 **main 入口注入锚变量**(main 帧 char 锚 + gc_set_stack_top)——初版"首分配帧"与"静态初始化捕获"两方案分别漏扫主帧/跨段崩溃,实测迭代后定型;扫描步长取指针宽度且起点向下对齐(char 锚不对齐会系统性错过对齐槽)。安全性断言入回归:活对象必存活;回收率受死帧残留影响属保守式本质,不作断言。
+- **zlib 双向互操作(结构化交付)**:`examples/zlib_demo.cpp2` —— legacy shim 消解 C++ ABI(size_t/uLong/Bytef/i64&),cpp2 无体声明经 in 按值传指针天然对齐;compress⇄uncompress 往返断言。本机 llvm-mingw 缺 zlib.h → run.sh 条件跳过并打印去向;CI(ubuntu 预装 zlib1g-dev)承担实测。**as 宽化通用修复**随之落地:`is_widening_to`(值域包含关系,含 int→i64/int→double 两处实测踩坑)——宽化发 static_cast,仅真收窄注入 narrow_cast;audit 计数同步。
+
+M1–M6 至此全部完成。剩余为 M7+(自举实验、原生后端评估,研究性质)与各偏差表内 v0.3+ 挂账。
 
 ## 10. v0.x 明确不做
 

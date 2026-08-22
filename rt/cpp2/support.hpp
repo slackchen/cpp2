@@ -22,6 +22,7 @@
 #endif
 
 #include "cpp2/arena.hpp"                   // M6:arena / arena_ptr
+#include "cpp2/gc.hpp"                      // M6:可选保守式 GC
 
 namespace cpp2 {
 

@@ -1,0 +1,8 @@
+// expect-error: escapes the owner's lifetime (M5-L4)
+module lt_l4a;
+import std;
+User: type = {
+    name: string = "";
+    name_view: () -> string_view = name;    // 成员视图逃逸 → 编译错误
+}
+main: () -> int = { return 0; }

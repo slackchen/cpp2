@@ -1,0 +1,63 @@
+// zlib_demo.cpp2 — M6 出口判据:与 zlib 双向互操作(compress ⇄ uncompress)
+// 构建需 -lz 且系统有 zlib.h;缺失环境由 run.sh 条件跳过、CI(ubuntu 自带
+// zlib1g-dev)实测。C++ ABI 细节(size_t/uLong/引用/Bytef)在 legacy shim 内消解,
+// cpp2 侧只见 char* / i64 / int。
+module zlib_demo;
+import std;
+
+cxx_legacy {
+    #include <zlib.h>
+
+    // 稳定类型 shim:签名与 cpp2 无体声明逐一对齐(char*↔char*,i64↔int64_t)
+    int z_compress(char* dest, std::int64_t& dlen,
+                   const char* src, std::int64_t slen)
+    {
+        uLongf dl = static_cast<uLongf>(dlen);
+        int rc = compress2(reinterpret_cast<Bytef*>(dest), &dl,
+                           reinterpret_cast<const Bytef*>(src),
+                           static_cast<size_t>(slen), Z_BEST_SPEED);
+        dlen = static_cast<std::int64_t>(dl);
+        return rc;
+    }
+
+    int z_uncompress(char* dest, std::int64_t& dlen,
+                     const char* src, std::int64_t slen)
+    {
+        uLongf dl = static_cast<uLongf>(dlen);
+        int rc = uncompress(reinterpret_cast<Bytef*>(dest), &dl,
+                            reinterpret_cast<const Bytef*>(src),
+                            static_cast<size_t>(slen));
+        dlen = static_cast<std::int64_t>(dl);
+        return rc;
+    }
+
+    std::int64_t z_bound(std::int64_t n)
+    {
+        return static_cast<std::int64_t>(compressBound(static_cast<uLong>(n)));
+    }
+}
+
+// 无体声明:外部符号(指针参数经 in 按值传递,与 shim 签名天然对齐)
+z_compress: (dest: char*, inout dlen: i64, src: char*, slen: i64) -> int;
+z_uncompress: (dest: char*, inout dlen: i64, src: char*, slen: i64) -> int;
+z_bound: (n: i64) -> i64;
+
+main: () -> int = {
+    msg: string = "hello zlib from cpp2 — 双向互操作往返验证 payload";
+
+    cap := z_bound(msg.size() as i64);
+
+    packed := msg;                          // 压缩输出缓冲(等长上界)
+    packed.resize(cap as int, '\0');
+    dlen: i64 = cap;
+    rc1 := z_compress(packed.data(), dlen, msg.data(), msg.size() as i64);
+
+    raw := msg;                             // 解压目标缓冲
+    raw.resize(msg.size(), '\0');
+    ulen: i64 = msg.size() as i64;
+    rc2 := z_uncompress(raw.data(), ulen, packed.data(), dlen);
+
+    std::println("compress rc={0}: {1} -> {2} bytes", rc1, msg.size(), dlen);
+    std::println("uncompress rc={0}: roundtrip-equal={1}", rc2, raw == msg);
+    return 0;
+}
