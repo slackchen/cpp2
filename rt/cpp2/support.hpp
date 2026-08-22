@@ -15,6 +15,7 @@
 #include <string_view>
 #include <type_traits>
 #include <utility>
+#include <variant>                                      // expected 垫片依赖
 
 #if defined(__cpp_lib_format)
     #include <format>
@@ -159,9 +160,13 @@ struct unexpected {
     explicit unexpected(E e) : v_(std::move(e)) {}
 };
 
+// GCC 将 -Wchanges-meaning 升格为 error(成员函数名 error 遮蔽类型名),
+// 接口名由生成码固定,局部压制:
+#pragma GCC diagnostic push
+#pragma GCC diagnostic ignored "-Wchanges-meaning"
 template <class T>
 class [[nodiscard]] expected {
-    std::variant<T, error> v_;
+    std::variant<T, ::cpp2::error> v_;
 public:
     expected(T v) : v_(std::in_place_index<0>, std::move(v)) {}
     expected(unexpected<error> u) : v_(std::in_place_index<1>, std::move(u.v_)) {}
@@ -177,6 +182,7 @@ public:
     // or 默认值(f() or d,DESIGN §8.3)
     T value_or(T def) const { return has_value() ? **this : std::move(def); }
 };
+#pragma GCC diagnostic pop
 
 // err():throws 函数体内构造失败值 → return err("not found");
 // 位置并入消息,错误链可追溯(栈的确定性替代)。
