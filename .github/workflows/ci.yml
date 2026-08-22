@@ -12,6 +12,7 @@ on:
 jobs:
   linux:
     strategy:
+      fail-fast: false
       matrix:
         cxx: [g++, clang++]
     runs-on: ubuntu-latest

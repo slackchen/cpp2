@@ -14,6 +14,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -440,8 +441,11 @@ int cmd_build(std::vector<std::string> const& args)
     std::string backend = "headers";
     long long max_tu = 1024 * 1024;   // 单 TU 生成码预算(字节);横向实测最优,见 IMPL M3b
     bool release = false;
+    int max_jobs = (int)std::thread::hardware_concurrency();
+    if (max_jobs < 1) max_jobs = 2;
     fs::path in;
     for (size_t i = 0; i < args.size(); ++i) {
+        if (args[i].rfind("--max-jobs=", 0) == 0) { max_jobs = std::max(1, std::stoi(args[i].substr(11))); continue; }
         if (args[i] == "--backend=headers")     { backend = "headers"; continue; }
         if (args[i].rfind("--backend=", 0) == 0){ backend = args[i].substr(10); continue; }
         if (args[i].rfind("--max-tu-size=", 0) == 0) { max_tu = std::stoll(args[i].substr(14)); continue; }
@@ -627,17 +631,31 @@ int cmd_build(std::vector<std::string> const& args)
             jobs.push_back({pname, obj});
         }
 
-        // part 间无编译依赖(接口全在 .h)→ 全量并行
+        // part 间无编译依赖(接口全在 .h)→ 并行编译
+        // 并发上限默认 = 硬件线程数(--max-jobs 覆盖):低配 runner 全量并发会 OOM
         std::mutex err_mtx;
+        int live = 0;
+        std::mutex live_mtx;
+        std::condition_variable slot_cv;
         std::vector<std::thread> workers;
         for (size_t i = 0; i < jobs.size(); ++i) {
             if (fs::exists(jobs[i].obj)) continue;    // 未被判定为 needed
+            {
+                std::unique_lock<std::mutex> lk(live_mtx);
+                slot_cv.wait(lk, [&] { return live < max_jobs; });
+                ++live;
+            }
             workers.emplace_back([&, i] {
                 fs::path cpp = build_dir / (jobs[i].name + ".cpp");
                 std::string cc = tc::plain_compile_command(
                     cxx, fam, native(*rt), native(cpp), native(jobs[i].obj));
                 std::cerr << "[cpp2] " << cc << "\n";
                 auto r = run_capture(cc);
+                {
+                    std::lock_guard<std::mutex> lk(live_mtx);
+                    --live;
+                }
+                slot_cv.notify_all();
                 if (!r.ok) {
                     std::lock_guard<std::mutex> lk(err_mtx);
                     std::cerr << diagfilter::banner;
