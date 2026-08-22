@@ -8,7 +8,6 @@
 #include <concepts>
 #include <cstdio>
 #include <cstdlib>
-#include <expected>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -151,13 +150,9 @@ struct error {
     std::string const& message() const { return text; }
 };
 
-#ifdef __cpp_lib_expected
-template <class T>
-using expected = std::expected<T, error>;
-using std::unexpected;
-#else
-// 最小 expected 垫片(libstdc++ < 13 等无 <format>/<expected> 环境):
-// 接口面 = 生成码实际使用集(has_value/operator*/value&&/error)
+// v1 决策(M6 收口):无条件使用自有 expected 实现。
+// 曾按 __cpp_lib_expected 双轨,但 runner 环境组合(llvm-mingw / libstdc++12 /
+// libc++ 版本差)证明宏探测不可靠且接口面完全可控;偏差表记录。
 template <class E>
 struct unexpected {
     E v_;
@@ -177,10 +172,11 @@ public:
     T const& operator*() const & { return std::get<0>(v_); }
     T& value() & { return std::get<0>(v_); }
     T&& value() && { return std::get<0>(std::move(v_)); }
-    error& error() & { return std::get<1>(v_); }
-    error const& error() const & { return std::get<1>(v_); }
+    ::cpp2::error& error() & { return std::get<1>(v_); }
+    ::cpp2::error const& error() const & { return std::get<1>(v_); }
+    // or 默认值(f() or d,DESIGN §8.3)
+    T value_or(T def) const { return has_value() ? **this : std::move(def); }
 };
-#endif
 
 // err():throws 函数体内构造失败值 → return err("not found");
 // 位置并入消息,错误链可追溯(栈的确定性替代)。
