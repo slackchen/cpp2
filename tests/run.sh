@@ -17,13 +17,15 @@ run_case() { # $1=cpp2路径 $2=期望片段 $3=是否期望 trap [$4=期望位�
         if [[ $code -ne 0 && "$out" == *"$2"* && ( -z "${4:-}" || "$out" == *"$4"* ) ]]; then
             echo "PASS $1"; pass=$((pass+1))
         else
-            echo "FAIL $1 (exit $code, want trap: $2 ${4:-})"; fail=$((fail+1))
+            echo "FAIL $1 (exit $code, want trap: $2 ${4:-})"
+            printf '%s\n' "$out" | head -12
         fi
     else
         if [[ $code -eq 0 && "$out" == *"$2"* ]]; then
             echo "PASS $1"; pass=$((pass+1))
         else
-            echo "FAIL $1 (exit $code, want output: $2)"; fail=$((fail+1))
+            echo "FAIL $1 (exit $code, want output: $2)"
+            printf '%s\n' "$out" | head -12
         fi
     fi
 }
