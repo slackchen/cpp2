@@ -4,7 +4,9 @@
 #   trap 用例:期望非零退出且 stderr 含 trap 消息(可选断言 #line 位置映射)
 set -u
 cd "$(dirname "$0")/.."
-CPP2="./.cpp2build/cpp2.exe"
+# 跨平台:Linux 构建产物无 .exe 后缀(与 build.sh 的命名规则一致)
+CPP2="./.cpp2build/cpp2"
+[[ -x "./.cpp2build/cpp2.exe" ]] && CPP2="./.cpp2build/cpp2.exe"
 pass=0; fail=0
 
 # ── 示例(期望输出)──────────────────────────────────────────────
