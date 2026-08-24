@@ -1,0 +1,25 @@
+// errchain.cpp2 — M7:错误链(err_caused 包装底层错误,chain() 全链可读)
+module errchain;
+import std;
+
+read_config: (path: string) -> string throws = {
+    return err("file missing", 404);
+}
+
+load_settings: () -> string throws = {
+    inner := read_config("app.conf") or "FALLBACK_SENTINEL";
+    if inner == "FALLBACK_SENTINEL" {
+        // 捕获底层失败,包装为新错误并保留因果链
+        e0: cpp2::error = cpp2::error("file missing");
+        return cpp2::err_caused(e0, "settings unavailable");
+    }
+    return inner;
+}
+
+main: () -> int = {
+    match load_settings() {
+        ok v      => std::println("{0}", v);
+        err e     => std::println("failed:\n{0}", e.chain());
+    }
+    return 0;
+}

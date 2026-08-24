@@ -211,6 +211,21 @@ else
     echo "FAIL m7d/recursive-variant-diag"; fail=$((fail+1))
 fi
 
+# ── M7 自举第二批:基础设施工具 cpp2 化 ─────────────────────────
+# lifetime_runner(替代 bash 捕获率逻辑;CPP2_TOOL 传实际工具路径)
+if CPP2_TOOL="$PWD/.cpp2build/cpp2.exe" "$CPP2" run tools/lifetime_runner.cpp2 2>&1 | grep -q "capture rate: 14/14"; then
+    echo "PASS m7/bootstrap-lifetime-runner"; pass=$((pass+1))
+else
+    echo "FAIL m7/bootstrap-lifetime-runner"; fail=$((fail+1))
+fi
+# c2i_verify(.c2i v1 结构校验)
+"$CPP2" build examples/multimod/app.cppm >/dev/null 2>&1
+if CPP2_C2I_DIR=examples/multimod/.cpp2build/hdr/cpp2cache "$CPP2" run tools/c2i_verify.cpp2 2>&1 | grep -q "all OK"; then
+    echo "PASS m7/c2i-verify"; pass=$((pass+1))
+else
+    echo "FAIL m7/c2i-verify"; fail=$((fail+1))
+fi
+
 # ── M4:检查器完备 / audit / fuzz ────────────────────────────────
 # audit:检查注入点计数 + @unsafe/@unchecked 位置(白纸黑字)
 audit_out="$("$CPP2" audit examples/smart.cpp2 2>/dev/null; "$CPP2" audit examples/safety.cpp2 2>/dev/null)"

@@ -1,0 +1,84 @@
+// lifetime_runner.cpp2 — M7a 自举第二批:生存期语料捕获率 runner(替代 bash 逻辑)
+// 用法:CPP2_TOOL=<cpp2 路径> CPP2_LIFETIME_DIR=<语料目录> cpp2 run tools/lifetime_runner.cpp2
+// 语料约定:首行 "// expect-error: <诊断片段>" 或 "// expect-ok"
+module lifetime_runner;
+import std;
+
+tool: string = "cpp2";
+dir: string = "tests/lifetime";
+
+env_str: (k: string, d: string) -> string = {
+    v: char* = std::getenv(k.data());
+    if v == 0 { return d; }
+    s: string := "";
+    i: int = 0;
+    while v[i] != 0 {
+        s.push_back(v[i]);
+        i += 1;
+    }
+    if s.size() == 0 { return d; }
+    return s;
+}
+
+read_all: (p: string) -> string = {
+    buf: string := "";
+    fin: std::ifstream := std::ifstream(p);
+    ch: char = '\0';
+    while fin.get(ch) { buf.push_back(ch); }
+    return buf;
+}
+
+first_line: (text: string) -> string = {
+    out: string := "";
+    for c in text {
+        if c == '\n' { break; }
+        out.push_back(c);
+    }
+    return out;
+}
+
+run_capture: (cmd: string) -> string = {
+    tmp: string = ".cpp2build/lifetime_last.txt";
+    {
+        f: std::ofstream := std::ofstream(tmp);   // 截断并**先关闭**
+        f << "";
+    }
+    std::system((cmd + " > \"" + tmp + "\" 2>&1").data());
+    return read_all(tmp);
+}
+
+main: () -> int = {
+    tool = env_str("CPP2_TOOL", tool);
+    dir  = env_str("CPP2_LIFETIME_DIR", dir);
+
+    total: int = 0;
+    caught: int = 0;
+    for entry in std::filesystem::directory_iterator(dir) {
+        p := entry.path().string();
+        if p.size() < 5 || p.substr(p.size() - 5) != ".cpp2" { continue; }
+
+        src := read_all(p);
+        marker := first_line(src);
+        want_ok := marker.find("expect-ok") != std::string::npos;
+        emsg: string := "";
+        empos := marker.find("expect-error: ");
+        if empos != std::string::npos {
+            emsg = marker.substr(empos + 14);
+        }
+
+        total += 1;
+        // 逐文件调用工具的 check(快速语义检查)
+        out := run_capture(tool + " check \"" + p + "\" 2>&1");
+        has_err := out.find("error") != std::string::npos;
+
+        ok := false;
+        if want_ok      { ok = !has_err; }
+        else            { ok = has_err && (emsg.size() == 0 || out.find(emsg) != std::string::npos); }
+        if ok { caught += 1; std::println("PASS " + p); }
+        else  { std::println("FAIL " + p); }
+    }
+    std::println("lifetime capture rate: {0}/{1}", caught, total);
+    all_ok := caught == total && total > 0;
+    if all_ok { return 0; }
+    return 1;
+}

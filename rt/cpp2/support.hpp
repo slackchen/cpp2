@@ -145,13 +145,26 @@ inline T checked_mod(T a, T b, char const* file = "", int line = 0)
 // throws 函数降为返回 cpp2::expected<R, cpp2::error>(IMPL §4.3)。
 // v0.1 错误体 = 消息 + 类别 + 源位置;类别体系 v0.3(DESIGN §8.4)。
 // category:库自定义整数码(0 = 通用);match 守卫可按类别过滤。
+// cause:错误链(M7 收口)——err_caused 包装底层错误,chain() 全链可读。
 struct error {
     std::string text;
     std::int64_t category = 0;
+    std::shared_ptr<error> cause;
     error() = default;
     explicit error(std::string s) : text(std::move(s)) {}
     error(std::string s, std::int64_t cat) : text(std::move(s)), category(cat) {}
     std::string const& message() const { return text; }
+    std::string chain() const
+    {
+        std::string out = text;
+        std::shared_ptr<error> c = cause;
+        int depth = 0;
+        while (c && depth++ < 16) {
+            out += "\n  caused by: " + c->text;
+            c = c->cause;
+        }
+        return out;
+    }
 };
 
 // v1 决策(M6 收口):无条件使用自有 expected 实现。
@@ -207,6 +220,16 @@ inline unexpected<error> err(std::int64_t category, std::string msg,
 {
     return unexpected<error>(error(msg + " (" + file + ":" + std::to_string(line) + ")",
                                    category));
+}
+
+// 错误链(M7 收口):包装底层错误为新失败,chain() 全链可读
+inline unexpected<error> err_caused(const error& cause, std::string msg,
+                                    char const* file = "", int line = 0)
+{
+    auto e = error(std::move(msg) + " (" + file + ":" + std::to_string(line) + ")",
+                   cause.category);
+    e.cause = std::make_shared<error>(cause);
+    return unexpected<error>(std::move(e));
 }
 
 // must():f()! — 调用方确信不会失败,失败即 bug → trap(DESIGN §8.2)

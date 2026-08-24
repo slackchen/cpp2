@@ -1,0 +1,109 @@
+// c2i_verify.cpp2 — M7a 自举第二批:.c2i v1 结构校验工具
+// 用法:CPP2_C2I_DIR=<目录> cpp2 run tools/c2i_verify.cpp2
+// 校验:magic "C2IF" / version=1 / 模块名可读 / 4×32B 摘要存在 / 长度字段与实际吻合
+module c2i_verify;
+import std;
+
+dir: string = ".";
+
+env_str: (k: string, d: string) -> string = {
+    v: char* = std::getenv(k.data());
+    if v == 0 { return d; }
+    s: string := "";
+    i: int = 0;
+    while v[i] != 0 { s.push_back(v[i]); i += 1; }
+    if s.size() == 0 { return d; }
+    return s;
+}
+
+u32_at: (b: string, off: int) -> int = {
+    r: int = 0;
+    for k in 0..4 {
+        c: int = b[off + k] as int;
+        if c < 0 { c += 256; }
+        r = r + c * (1 << (k * 8));
+    }
+    return r;
+}
+
+u64_at: (b: string, off: int) -> i64 = {
+    r: i64 = 0;
+    for k in 0..8 {
+        c: int = b[off + k] as int;
+        if c < 0 { c += 256; }
+        mul: i64 = 1;
+        for m in 0..k { mul = mul * 256; }
+        r = r + c as i64 * mul;
+    }
+    return r;
+}
+
+hex_at: (b: string, off: int, n: int) -> string = {
+    digits: string = "0123456789abcdef";
+    out: string := "";
+    for k in 0..n {
+        c: int = b[off + k] as int;
+        if c < 0 { c += 256; }
+        out.push_back(digits[c / 16]);
+        out.push_back(digits[c % 16]);
+    }
+    return out;
+}
+
+verify_one: (p: string) -> bool = {
+    b := read_all(p);
+    std::println("verify " + p + " size=" + std::to_string(b.size()));
+    if b.size() < 40 { std::println("FAIL short: " + p); return false; }
+
+    // magic
+    if b[0] != 'C' || b[1] != '2' || b[2] != 'I' || b[3] != 'F' {
+        std::println("FAIL magic: " + p);
+        return false;
+    }
+    ver := u32_at(b, 4);
+    if ver != 1 { std::println("FAIL version=" + std::to_string(ver) + ": " + p); return false; }
+
+    nl := u32_at(b, 8);
+    name_pos := 12;
+    if name_pos + nl > b.size() as int { std::println("FAIL name range: " + p); return false; }
+    name := b.substr(name_pos, nl);
+
+    hash_pos := name_pos + nl;
+    iface_hash := hex_at(b, hash_pos + 32, 32);   // 第 2 个摘要 = iface
+
+    text_len64 := u64_at(b, hash_pos + 128);
+    expect_total := hash_pos + 128 + 8 + text_len64;
+    ok_size := b.size() as i64 == expect_total;
+    tag: string = "BAD-LEN ";
+    if ok_size { tag = "OK   "; }
+
+    std::println(tag + name
+               + " iface=" + iface_hash.substr(0, 16)
+               + " text=" + std::to_string(text_len64));
+    return ok_size;
+}
+
+read_all: (p: string) -> string = {
+    buf: string := "";
+    fin: std::ifstream := std::ifstream(p, std::ios::binary);   // 哈希含任意字节,必须二进制读
+    ch: char = '\0';
+    while fin.get(ch) { buf.push_back(ch); }
+    return buf;
+}
+
+main: () -> int = {
+    dir = env_str("CPP2_C2I_DIR", dir);
+    all_ok := true;
+    count := 0;
+    for entry in std::filesystem::directory_iterator(dir) {
+        p := entry.path().string();
+        if p.size() < 5 || p.substr(p.size() - 4) != ".c2i" { continue; }
+        count += 1;
+        if !verify_one(p) { all_ok = false; }
+    }
+    verdict: string = "ERRORS";
+    if all_ok { verdict = "all OK"; }
+    std::println("c2i verify: {0} file(s), {1}", count, verdict);
+    if all_ok && count > 0 { return 0; }
+    return 1;
+}
