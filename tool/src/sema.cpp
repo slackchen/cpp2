@@ -380,7 +380,26 @@ private:
 
     void check_variant(ast::VariantDecl& v)
     {
-        for (auto& alt : v.alternatives) type_from_use(alt);
+        // 自引用候选(直接或经容器/指针嵌套引用自身)→ 需要装箱间接层,
+        // v1 不做自动装箱,给清晰诊断与替代写法指引
+        std::function<bool(ast::TypeUse const&)> self_ref =
+            [&](ast::TypeUse const& t) -> bool {
+                for (auto& p : t.parts)
+                    if (p == v.name) return true;
+                for (auto& a : t.args)
+                    if (self_ref(a)) return true;
+                return false;
+            };
+        for (auto& alt : v.alternatives) {
+            if (self_ref(alt))
+                err(v.line, 0,
+                    "variant '" + v.name + "' alternative '"
+                    + (alt.parts.empty() ? "?" : alt.parts.back())
+                    + "' references the variant itself; "
+                    "box it explicitly via a pointer wrapper (e.g. unique<"
+                    + v.name + ">), or restructure without recursion");
+            type_from_use(alt);
+        }
     }
 
     // concept 检查:要求签名可解析(self 占位类型);语义满足由降低后的
@@ -407,6 +426,8 @@ private:
         cur_struct_ = &s;
         cur_method_ = &md;
         cur_throws_ = md.throws;
+        // virtual 方法必须非静态(多态派发需要对象)
+        if (md.is_virtual) md.uses_members = true;
         if (md.name == "destructor" && (md.pre || md.post))
             err(md.line, 0, "destructor cannot have pre/post contracts");
 
@@ -785,10 +806,11 @@ private:
                 if (sc != Scrut::Expected) {
                     err(arm.line, 0, "'ok'/'err' patterns require an error-channel scrutinee");
                 } else {
-                    bind_type = arm.pat == ast::MatchArm::Pat::Ok
-                              ? t.val() : Type::of(Type::Error);
-                    if (!covered.insert(arm.pat == ast::MatchArm::Pat::Ok ? "ok" : "err").second)
-                        err(arm.line, 0, "duplicate 'ok'/'err' match arm");
+                    std::string key = arm.pat == ast::MatchArm::Pat::Ok ? "ok" : "err";
+                    if (arm.guard) key += "#guard";   // 带守卫的 err 臂可多条(类别过滤)
+                    bind_type = key == "ok" ? t.val() : Type::of(Type::Error);
+                    if (!covered.insert(key).second)
+                        err(arm.line, 0, "duplicate '" + key + "' match arm");
                 }
                 break;
             case ast::MatchArm::Pat::Some:
@@ -1277,11 +1299,16 @@ private:
                     return {};
                 }
                 if (name.parts[0] == "err" && !resolve("err")) {
-                    if (c.args.size() != 1)
-                        err(c.line, c.col, "'err(...)' takes exactly one message argument");
+                    if (c.args.size() != 1 && c.args.size() != 2)
+                        err(c.line, c.col, "'err(...)' takes a message and an optional category");
                     else if (Type t = infer_existing(*c.args[0]);
                              t.kind != Type::String && t.kind != Type::StringView)
                         err(c.line, c.col, "'err(...)' message must be a string");
+                    else if (c.args.size() == 2) {
+                        Type cat = infer_existing(*c.args[1]);
+                        if (!cat.is_int())
+                            err(c.line, c.col, "'err(...)' category must be an integer");
+                    }
                     Type t;
                     t.kind = Type::ErrVal;
                     return t;
@@ -1597,7 +1624,7 @@ private:
         for (auto& [name, val] : lit.fields) {
             if (!seen.insert(name).second)
                 err(lit.line, lit.col, "duplicate field '" + name + "' in struct literal");
-            if (!sd->find_field(name))
+            if (!find_field_deep(*sd, name))
                 err(lit.line, lit.col,
                     "type '" + tn + "' has no field '" + name + "'");
         }

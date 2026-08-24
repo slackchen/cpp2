@@ -194,6 +194,23 @@ else
     echo "FAIL m7c/out-exit-check"; fail=$((fail+1))
 fi
 
+# ── M7c:虚分发 / 错误类别运行时 / 递归 variant 诊断 ─────────────
+run_case examples/virtual_demo.cpp2 "generic says ..."        ok
+run_case examples/errcat.cpp2 "404: NOT_FOUND"                ok
+run_case examples/errcat.cpp2 "500: ERR[500]"                 ok
+# 负例:递归 variant → 清晰诊断(装箱方案挂账)
+cat > .cpp2build/trec.cpp2 <<'EOF'
+module trec;
+import std;
+Value: variant = { int, list<Value> }
+main: () -> int = { return 0; }
+EOF
+if "$CPP2" check .cpp2build/trec.cpp2 2>&1 | grep -q "references the variant itself"; then
+    echo "PASS m7d/recursive-variant-diag"; pass=$((pass+1))
+else
+    echo "FAIL m7d/recursive-variant-diag"; fail=$((fail+1))
+fi
+
 # ── M4:检查器完备 / audit / fuzz ────────────────────────────────
 # audit:检查注入点计数 + @unsafe/@unchecked 位置(白纸黑字)
 audit_out="$("$CPP2" audit examples/smart.cpp2 2>/dev/null; "$CPP2" audit examples/safety.cpp2 2>/dev/null)"

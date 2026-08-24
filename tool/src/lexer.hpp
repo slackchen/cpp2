@@ -10,7 +10,7 @@ enum class Tok {
     // 关键字
     Module, Import, Export, Type, Enum, Variant, Concept,
     If, Else, While, For, In, Return, Break, Continue,
-    Const, Mutates, Throws, Match, True, False,
+    Const, Mutates, Throws, Match, Virtual, True, False,
     // 字面量与名字
     Ident, IntLit, DoubleLit, StringLit, CharLit,
     // 标点
@@ -40,6 +40,7 @@ inline bool is_keyword(Tok t)
     case Tok::If: case Tok::Else: case Tok::While: case Tok::For:
     case Tok::In: case Tok::Return: case Tok::Break: case Tok::Continue:
     case Tok::Const: case Tok::Mutates: case Tok::Throws: case Tok::Match:
+    case Tok::Virtual:
     case Tok::True: case Tok::False:
         return true;
     default:

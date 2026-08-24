@@ -232,6 +232,14 @@ private:
 
     void struct_member(ast::StructDecl& s)
     {
+        // virtual 前缀修饰符:virtual 名字: (...) ... / virtual destructor: () ...
+        if (check(lex::Tok::Virtual)) {
+            advance();
+            if (!check(lex::Tok::Ident) && !check(lex::Tok::Virtual))
+                err("expected member name after 'virtual'");
+            method_decl(s);
+            return;
+        }
         if (!check(lex::Tok::Ident)) err("expected a field or method declaration");
 
         // operator 方法:operator<: (that: T) -> bool = ...(运算符成员,M2d)
@@ -277,6 +285,12 @@ private:
         ast::MethodDecl md;
         md.line = peek().line;
         md.name = advance().text;
+        if (md.name == "virtual") {                 // virtual 前缀(结构体入口已分发)
+            if (!check(lex::Tok::Ident)) err("expected member name after 'virtual'");
+            md.is_virtual = true;
+            md.name = advance().text;
+            if (md.name == "destructor") s.needs_virtual_dtor = true;
+        }
         if (md.name == "operator" && is_operator_token(peek().tok))
             md.name += advance().text;           // operator< / operator== / ...
         expect(lex::Tok::Colon, "':' after method name");
@@ -291,6 +305,11 @@ private:
             parse_error_category(md.error_categories);
         }
         if (accept(lex::Tok::Mutates)) md.mutates = true;
+        // virtual 后缀修饰:() -> ret virtual(与 C++ 声明位序对齐)
+        if (accept(lex::Tok::Virtual)) {
+            md.is_virtual = true;
+            if (md.name == "destructor") s.needs_virtual_dtor = true;
+        }
         parse_contracts(md.pre, md.post);
 
         expect(lex::Tok::Assign, "'=' before method body");

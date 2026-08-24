@@ -143,11 +143,14 @@ inline T checked_mod(T a, T b, char const* file = "", int line = 0)
 
 // ── 错误通道:错误是值,bug 是 trap(DESIGN §8)─────────────────────
 // throws 函数降为返回 cpp2::expected<R, cpp2::error>(IMPL §4.3)。
-// v0.1 错误体 = 消息 + 源位置;类别/错误码体系留待 v0.3(DESIGN §8.4)。
+// v0.1 错误体 = 消息 + 类别 + 源位置;类别体系 v0.3(DESIGN §8.4)。
+// category:库自定义整数码(0 = 通用);match 守卫可按类别过滤。
 struct error {
     std::string text;
+    std::int64_t category = 0;
     error() = default;
     explicit error(std::string s) : text(std::move(s)) {}
+    error(std::string s, std::int64_t cat) : text(std::move(s)), category(cat) {}
     std::string const& message() const { return text; }
 };
 
@@ -196,6 +199,14 @@ inline unexpected<error> err(std::string msg, char const* file = "", int line = 
 {
     return unexpected<error>(error(std::move(msg) + " (" + file + ":"
                                    + std::to_string(line) + ")"));
+}
+
+// 带类别版:err("msg", 404)(M7 挂账清偿;类别经 match 守卫过滤)
+inline unexpected<error> err(std::int64_t category, std::string msg,
+                             char const* file = "", int line = 0)
+{
+    return unexpected<error>(error(msg + " (" + file + ":" + std::to_string(line) + ")",
+                                   category));
 }
 
 // must():f()! — 调用方确信不会失败,失败即 bug → trap(DESIGN §8.2)

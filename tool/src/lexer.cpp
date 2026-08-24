@@ -244,8 +244,9 @@ private:
         if (s == "const")     return Tok::Const;
         if (s == "mutates")   return Tok::Mutates;
         if (s == "throws")    return Tok::Throws;
-        if (s == "match")     return Tok::Match;
-        if (s == "true")      return Tok::True;
+    if (s == "match")     return Tok::Match;
+    if (s == "virtual")   return Tok::Virtual;
+    if (s == "true")      return Tok::True;
         if (s == "false")     return Tok::False;
         return Tok::Ident;
     }

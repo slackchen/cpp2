@@ -49,7 +49,7 @@ namespace fuzz  = cpp2::fuzz;
 
 namespace {
 
-constexpr char const* kVersion = "cpp2 0.1.0-m6 (M1-M6 complete: lifetime Lite L1-L6, arena/gc, legacy+zlib interop)";
+constexpr char const* kVersion = "cpp2 0.1.0-m7b (virtual dispatch, error categories, pipes, shifts, captures, if-bodies)";
 
 std::optional<std::string> read_file(fs::path const& p)
 {
@@ -789,7 +789,11 @@ int cmd_build(std::vector<std::string> const& args)
     fs::path exe = in.parent_path() / ".cpp2build" / in.stem();
     std::string link = tc::link_command(cxx, fam, obj_files, native(exe)) + ldflags_env();
     std::cerr << "[cpp2] " << link << "\n";
-    if (std::system(link.c_str()) != 0) {
+    auto lr = run_capture(link);
+    if (!lr.ok) {
+        std::cerr << diagfilter::banner;
+        std::string flt = diagfilter::filter(lr.output, native(build_dir));
+        std::cerr << (flt.empty() ? lr.output : flt);
         std::cerr << "error: link failed\n";
         return 2;
     }

@@ -1,0 +1,39 @@
+// virtual_demo.cpp2 — M7:虚分发(virtual 方法经基类指针多态派发)
+module virtual_demo;
+import std;
+
+Animal: type = {
+    name: string = "";
+    speak: () -> string virtual = "...";
+    virtual destructor: () mutates = { }
+}
+
+Dog: type: Animal = {
+    tricks: int = 0;
+    speak: () -> string virtual = "woof";
+}
+
+Cat: type: Animal = {
+    speak: () -> string virtual = "meow";
+}
+
+main: () -> int = {
+    zoo: vector<unique<Animal>> := {};
+
+    a: Animal := Animal{};
+    a.name = "generic";
+    d: Dog := Dog{};
+    d.name = "rex";
+    d.tricks = 3;
+    c: Cat := Cat{};
+    c.name = "mia";
+
+    zoo.push_back(make_unique(a));
+    zoo.push_back(make_unique(d));
+    zoo.push_back(make_unique(c));
+
+    for a in zoo {
+        std::println("{0} says {1}", (*a).name, (*a).speak());
+    }
+    return 0;
+}

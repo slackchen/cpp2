@@ -284,6 +284,7 @@ struct MethodDecl {                          // 类型成员函数;name=="destru
     bool throws = false;
     std::vector<std::string> error_categories;   // throws E1, E2(M6 收口)
     bool mutates = false;
+    bool is_virtual = false;                     // 虚分发(M7,DESIGN §5.2 扩展)
     ExprP pre;                               // 契约(M2c)
     ExprP post;
     bool has_block_body = false;
@@ -301,6 +302,7 @@ struct StructDecl {
     std::vector<MethodDecl> methods;
     ExprP invariant;                         // 类型不变量 `invariant: <expr>;`(DESIGN §6.5)
     int invariant_line = 0;                  // 公开方法出入口注入检查
+    bool needs_virtual_dtor = false;         // 有 virtual 方法 → 基类析构自动虚化
 
     FieldDecl* find_field(std::string const& n) {
         for (auto& f : fields) if (f.name == n) return &f;

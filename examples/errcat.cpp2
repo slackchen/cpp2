@@ -1,0 +1,20 @@
+// errcat.cpp2 — M7:错误类别运行时(err 带类别码,match 守卫过滤)
+module errcat;
+import std;
+
+lookup: (id: int) -> string throws = {
+    if id == 404 { return err("not found", 404); }
+    if id == 500 { return err("server error", 500); }
+    return "ok:" + std::to_string(id);
+}
+
+main: () -> int = {
+    for id in { 200, 404, 500 } {
+        match lookup(id) {
+            ok v      => std::println("{0}: {1}", id, v);
+            err e if e.category == 404 => std::println("{0}: NOT_FOUND", id);
+            err e     => std::println("{0}: ERR[{1}] {2}", id, e.category, e.message());
+        }
+    }
+    return 0;
+}

@@ -478,12 +478,16 @@ private:
                 auto it = old_names_->find(&c);
                 if (it != old_names_->end()) return it->second;
             }
-            // err("msg") → cpp2::err("msg", "file", line)(sema 已标 ErrVal)
-            if (c.callee->kind() == ast::Expr::Name && c.args.size() == 1
+            // err("msg"[, category]) → cpp2::err(...)(sema 已标 ErrVal)
+            if (c.callee->kind() == ast::Expr::Name && (c.args.size() == 1 || c.args.size() == 2)
                 && type_of(c).kind == sema::Type::ErrVal) {
                 auto& name = static_cast<ast::NameExpr&>(*c.callee);
-                if (name.parts.size() == 1 && name.parts[0] == "err")
+                if (name.parts.size() == 1 && name.parts[0] == "err") {
+                    if (c.args.size() == 2)
+                        return "cpp2::err(" + expr(*c.args[1]) + ", " + expr(*c.args[0])
+                             + check_loc(c.line) + ")";
                     return "cpp2::err(" + expr(*c.args[0]) + check_loc(c.line) + ")";
+                }
             }
             // UFCS:x.f(args) → f(x, args)(DESIGN §4.7;sema 已定向)
             if (c.callee->kind() == ast::Expr::Member) {
@@ -1675,6 +1679,11 @@ private:
         }
         --indent_;
         for (auto& md : s.methods) emit_method(s, md);
+        // 有虚方法的类型:自动合成 virtual 析构(经基指针 delete 安全)
+        bool has_virt = false;
+        for (auto& md : s.methods) has_virt = has_virt || md.is_virtual;
+        if (has_virt && !s.find_method("destructor"))
+            out_ += pad() + "virtual ~" + s.name + "() = default;\n";
         out_ += "};\n";
     }
 
@@ -1683,7 +1692,8 @@ private:
         sync_line(md.line);
         out_ += "\n";
         if (md.name == "destructor") {
-            out_ += pad() + "~" + s.name + "()\n{\n";
+            bool vdtor = md.is_virtual || s.needs_virtual_dtor;
+            out_ += pad() + (vdtor ? "virtual " : "") + "~" + s.name + "()\n{\n";
             emit_body_of(md.name, false, nullptr, nullptr,
                          md.has_block_body, md.block_body.get(), md.expr_body.get(),
                          std::nullopt, md.line);
@@ -1691,6 +1701,7 @@ private:
             return;
         }
         std::string sig = "auto " + md.name + "(" + params_str(md.params, false) + ")";
+        if (md.is_virtual) sig = "virtual " + sig;
         if (!md.uses_members) sig = "static " + sig;
         else if (!md.mutates) sig += " const";
         if (md.ret) sig += " -> " + ret_type_str(md.ret, md.throws);
@@ -1721,16 +1732,23 @@ private:
         for (auto& md : s.methods) {
             sync_line(md.line);
             if (md.name == "destructor") {
-                out_ += pad() + "~" + s.name + "();\n";
+                bool vdtor = md.is_virtual || s.needs_virtual_dtor;
+                out_ += pad() + (vdtor ? "virtual " : "") + "~" + s.name + "();\n";
                 continue;
             }
             std::string sig = "auto " + md.name + "("
                             + params_str(md.params, /*with_defaults*/true) + ")";
+            if (md.is_virtual) sig = "virtual " + sig;
             if (!md.uses_members) sig = "static " + sig;
             else if (!md.mutates) sig += " const";
             if (md.ret) sig += " -> " + ret_type_str(md.ret, md.throws);
             out_ += pad() + sig + ";\n";
         }
+        // 有虚方法的类型:自动合成 virtual 析构声明
+        bool has_virt_hdr = false;
+        for (auto& md : s.methods) has_virt_hdr = has_virt_hdr || md.is_virtual;
+        if (has_virt_hdr && !s.find_method("destructor"))
+            out_ += pad() + "virtual ~" + s.name + "() = default;\n";
         out_ += "};\n";
     }
 
