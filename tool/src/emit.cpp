@@ -17,8 +17,8 @@ int bin_prec(std::string const& op)
     if (op == "=")  return 2;
     if (op == "==" || op == "!=") return 3;
     if (op == "<" || op == ">" || op == "<=" || op == ">=") return 4;
-    if (op == "+" || op == "-") return 5;
-    if (op == "*" || op == "/" || op == "%") return 6;
+    if (op == "<<" || op == ">>") return 5;
+    if (op == "+" || op == "-" || op == "*" || op == "/" || op == "%") return 6;
     return 0;
 }
 
@@ -1118,7 +1118,16 @@ private:
     // 块体经缓冲交换用语句发射器生成;体在表达式中间多行合法。
     std::string emit_lambda(ast::LambdaExpr& l)
     {
-        std::string header = "[&](" + params_str(l.params, /*with_defaults*/true) + ")";
+        std::string caps = "[&]";
+        if (!l.captures.empty()) {
+            caps = "[";
+            for (size_t i = 0; i < l.captures.size(); ++i) {
+                if (i) caps += ",";
+                caps += l.captures[i];
+            }
+            caps += "]";
+        }
+        std::string header = caps + "(" + params_str(l.params, /*with_defaults*/true) + ")";
         if (l.ret) header += " -> " + type_str(*l.ret);
 
         std::string buf;

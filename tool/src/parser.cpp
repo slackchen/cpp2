@@ -46,6 +46,7 @@ private:
     // 条件/迭代位置守卫:禁止 `Ident{}` 解析为空 struct 字面量,
     // 否则 `if x { }` / `for e in items { }` 会被吞掉块括号
     bool cond_like_ = false;
+    bool lenient_semi_ = false;             // if 表达式体作用域:块尾裸值免分号
     // 递归深度防护:fuzz/畸形输入下递归下降会爆栈(M4);
     // 超限按语法错误报告,而不是进程崩溃
     static constexpr int kMaxDepth = 200;
@@ -287,7 +288,7 @@ private:
         if (check(lex::Tok::Throws)) {
             advance();
             md.throws = true;
-            parse_error_category();
+            parse_error_category(md.error_categories);
         }
         if (accept(lex::Tok::Mutates)) md.mutates = true;
         parse_contracts(md.pre, md.post);
@@ -296,6 +297,16 @@ private:
         if (check(lex::Tok::LBrace)) {
             md.has_block_body = true;
             md.block_body = block();
+        } else if (check(lex::Tok::If)) {
+            // 'if 表达式体'(挂账清偿:方法同函数形态;不预支 if——if_stmt 自耗)
+            lenient_semi_ = true;
+            auto ifs = [&]{ auto s = if_stmt(); return std::unique_ptr<ast::IfStmt>(static_cast<ast::IfStmt*>(s.release())); }();
+            lenient_semi_ = false;
+            if (!if_to_value_block(*ifs))
+                err("if body needs an else branch (value bodies must be total)");
+            md.has_block_body = true;
+            md.block_body = std::move(ifs);
+            accept(lex::Tok::Semi);
         } else {
             md.expr_body = expression();
             // match 表达式以 '}' 结尾,分号可省(与 func_decl 一致)
@@ -385,6 +396,35 @@ private:
         m.concepts.push_back(std::move(c));
     }
 
+    // 'if 表达式体'挂账清偿:= if cond { 值 } else { 值 }
+    // 转换为块体 + 分支尾 return(复用既有 sema/emit 机制;else 必需)
+    void tail_expr_to_return(ast::StmtP& s)
+    {
+        if (!s) return;
+        if (s->kind() == ast::Stmt::Block) {     // 深入块:仅转换块尾裸值
+            auto& b = static_cast<ast::BlockStmt&>(*s);
+            if (!b.stmts.empty()) tail_expr_to_return(b.stmts.back());
+            return;
+        }
+        if (s->kind() == ast::Stmt::ExprStmt) {
+            auto& es = static_cast<ast::ExprStmt&>(*s);
+            auto r = std::make_unique<ast::ReturnStmt>();
+            r->line = es.line; r->col = es.col;
+            r->value = std::move(es.expr);
+            s = std::move(r);
+        }
+    }
+
+    bool if_to_value_block(ast::IfStmt& i)
+    {
+        if (!i.else_block) return false;        // 值体必须双分支
+        tail_expr_to_return(i.then_block);
+        if (i.else_block->kind() == ast::Stmt::If)
+            return if_to_value_block(static_cast<ast::IfStmt&>(*i.else_block));
+        tail_expr_to_return(i.else_block);
+        return true;
+    }
+
     void func_decl(ast::Module& m, bool exported)
     {
         ast::FuncDecl f;
@@ -416,7 +456,7 @@ private:
         if (check(lex::Tok::Throws)) {
             advance();
             f.throws = true;
-            parse_error_category();
+            parse_error_category(f.error_categories);
         }
         if (accept(lex::Tok::Mutates))
             err("'mutates' is only valid on type member methods");
@@ -437,6 +477,16 @@ private:
         if (check(lex::Tok::LBrace)) {
             f.has_block_body = true;
             f.block_body = block();
+        } else if (check(lex::Tok::If)) {
+            // 'if 表达式体'(挂账清偿)
+            lenient_semi_ = true;
+            auto ifs = [&]{ auto s = if_stmt(); return std::unique_ptr<ast::IfStmt>(static_cast<ast::IfStmt*>(s.release())); }();
+            lenient_semi_ = false;
+            if (!if_to_value_block(*ifs))
+                err("if body needs an else branch (value bodies must be total)");
+            f.has_block_body = true;
+            f.block_body = std::move(ifs);
+            accept(lex::Tok::Semi);
         } else {
             f.expr_body = expression();
             // match 表达式以 '}' 结尾,分号可省(DESIGN §5.5 形式)
@@ -471,13 +521,21 @@ private:
     }
 
     // throws E 的错误类别:v0.1 解析后丢弃(§8.4 错误类型体系 v0.3 落地);
-    // "pre:"/"post:" 不是类别(后跟 ':'),不能吞掉
-    void parse_error_category()
+    // "pre:"/"post:" 不是类别(后跟 ':'),不能吞掉。
+    // M6 收口:类别列表(E1, E2)存档至 FuncDecl/MethodDecl(audit/BMI 可见)
+    void parse_error_category(std::vector<std::string>& out)
     {
         if (check(lex::Tok::Ident)
             && !(peek(1).tok == lex::Tok::Colon
                  && (peek().text == "pre" || peek().text == "post"))) {
-            parse_type();
+            auto t = parse_type();
+            std::string s;
+            for (size_t i = 0; i < t.parts.size(); ++i) {
+                if (i) s += "::";
+                s += t.parts[i];
+            }
+            if (!s.empty()) out.push_back(s);
+            while (accept(lex::Tok::Comma)) parse_error_category(out);
         }
     }
 
@@ -659,7 +717,9 @@ private:
             expect(lex::Tok::Semi, "';' after assignment");
             return wrap_stmt(std::move(a));
         }
-        expect(lex::Tok::Semi, "';' after expression statement");
+        // if 表达式体作用域:块尾裸值("many")免分号(DESIGN §4.x 形式)
+        if (!(lenient_semi_ && check(lex::Tok::RBrace)))
+            expect(lex::Tok::Semi, "';' after expression statement");
         auto s = std::make_unique<ast::ExprStmt>();
         s->line = e->line; s->col = e->col;
         s->expr = std::move(e);
@@ -904,7 +964,32 @@ private:
     ast::ExprP expression()
     {
         DepthGuard g{*this};
-        return or_default();
+        return pipe_expr();
+    }
+
+    // 管道:v | f(a, b) ≡ f(v, a, b);v | f ≡ f(v)(DESIGN §4.7 UFCS 管道)
+    // 最低优先级(低于 or 默认值);纯解析层重写,sema/emit 按普通调用处理
+    ast::ExprP pipe_expr()
+    {
+        auto l = or_default();
+        while (check(lex::Tok::Pipe)) {
+            int ln = peek().line, cl = peek().col;
+            advance();
+            auto rhs = postfix();                    // 函数名(+可选调用实参)
+            ast::CallExpr* call = nullptr;
+            if (rhs->kind() == ast::Expr::Call) {
+                call = static_cast<ast::CallExpr*>(rhs.get());
+                call->args.insert(call->args.begin(), std::move(l));
+                l = std::move(rhs);
+            } else {
+                auto c = std::make_unique<ast::CallExpr>();
+                c->line = ln; c->col = cl;
+                c->callee = std::move(rhs);
+                c->args.push_back(std::move(l));
+                l = std::move(c);
+            }
+        }
+        return l;
     }
 
     // 最低优先级:err-or-default(f() or "fallback",DESIGN §8.3)
@@ -983,10 +1068,30 @@ private:
 
     ast::ExprP relational()
     {
-        auto l = additive();
+        auto l = shift_expr();
         while (check(lex::Tok::Lt) || check(lex::Tok::Gt)
             || check(lex::Tok::Le) || check(lex::Tok::Ge)) {
             std::string op = advance().text;
+            int ln = peek().line, cl = peek().col;
+            auto b = std::make_unique<ast::BinaryExpr>();
+            b->line = ln; b->col = cl; b->op = op;
+            b->lhs = std::move(l); b->rhs = shift_expr();
+            l = std::move(b);
+        }
+        return l;
+    }
+
+    // 移位:词法层无 Shl/Shr 词元(保护嵌套泛型 '>>' 闭合),
+    // 在表达式上下文以双 Lt/Gt 识别(v0.3 挂账清偿)
+    ast::ExprP shift_expr()
+    {
+        auto l = additive();
+        for (;;) {
+            bool shl = check(lex::Tok::Lt) && peek(1).tok == lex::Tok::Lt;
+            bool shr = check(lex::Tok::Gt) && peek(1).tok == lex::Tok::Gt;
+            if (!shl && !shr) break;
+            std::string op = advance().text;
+            op += advance().text;
             int ln = peek().line, cl = peek().col;
             auto b = std::make_unique<ast::BinaryExpr>();
             b->line = ln; b->col = cl; b->op = op;
@@ -1113,13 +1218,28 @@ private:
         return e;
     }
 
-    // 匿名函数:函数声明去掉名字(DESIGN §4.6)。捕获:v0.1 隐式 [&] 按引用
-    // (显式捕获列表与 [self] 约定随后续里程碑落地,见 IMPLEMENTATION 偏差表)。
-    ast::ExprP lambda_expr()
+    // 匿名函数:函数声明去掉名字(DESIGN §4.6)。
+    // 捕获:v0.1 无列表 = 隐式 [&];显式 [a, &b] / [=] / [&] 直译 C++
+    // (M7 挂账清偿;[self]/禁隐式 this 规则待方法内 lambda 用例落地时强制)
+    ast::ExprP lambda_expr(bool with_captures)
     {
         auto l = std::make_unique<ast::LambdaExpr>();
         l->line = peek().line; l->col = peek().col;
-        advance(); // (
+        if (with_captures) {
+            advance();                              // '['
+            while (!check(lex::Tok::RBracket)) {
+                std::string cap;
+                if (accept(lex::Tok::Amp)) cap = "&";
+                if (!check(lex::Tok::RBracket)) {
+                    cap += advance().text;          // 名字 / '=' / '&'
+                }
+                if (cap.empty()) err("expected capture name in '[...]'");
+                else l->captures.push_back(cap);
+                if (!accept(lex::Tok::Comma)) break;
+            }
+            expect(lex::Tok::RBracket, "']' to end capture list");
+        }
+        expect(lex::Tok::LParen, "'(' to start lambda parameters");
         l->params = param_list();
         expect(lex::Tok::RParen, "')' to end lambda parameters");
         if (accept(lex::Tok::Arrow)) l->ret = parse_type();
@@ -1197,7 +1317,7 @@ private:
                  && peek(3).tok != lex::Tok::Colon)
                 || (peek(1).tok == lex::Tok::RParen
                     && peek(2).tok == lex::Tok::Arrow)) {
-                return lambda_expr();
+                return lambda_expr(false);
             }
             advance();
             auto p = std::make_unique<ast::ParenExpr>();
@@ -1228,6 +1348,20 @@ private:
         }
         case lex::Tok::LBracket:
         case lex::Tok::LBrace: {
+            // 消歧:捕获列表([...](params) → lambda,DESIGN §4.6)vs
+            // 列表字面量([1,2,3] / {1,2})。捕获特征 = 内容仅 名字/&/=/逗号
+            // 且 ']' 后紧跟 '('。
+            if (peek().tok == lex::Tok::LBracket) {
+                bool looks_capture = false;
+                for (size_t k = 1;; ++k) {
+                    lex::Tok t = peek(k).tok;
+                    if (t == lex::Tok::RBracket) { looks_capture = (peek(k+1).tok == lex::Tok::LParen); break; }
+                    if (t == lex::Tok::Ident || t == lex::Tok::Amp || t == lex::Tok::Comma || t == lex::Tok::Eq) continue;
+                    break;
+                }
+                if (looks_capture)
+                    return lambda_expr(/*with_captures*/true);
+            }
             // 列表字面量:[1, 2, 3] 或 {1, 2, 3};空 {} 常用作容器默认值。
             // (struct 字面量在 Ident 分支以 Name{.field 形式处理,不冲突;
             //  语句/条件位置的块括号不会进入 primary)

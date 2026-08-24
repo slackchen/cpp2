@@ -1,6 +1,7 @@
 // C++2 语义分析实现(M2d:泛型/concept、variant、optional、模式匹配、UFCS)
 #include "sema.hpp"
 
+#include <algorithm>
 #include <functional>
 #include <unordered_set>
 
@@ -152,6 +153,9 @@ private:
     // L1:当前函数签名中 (in s: string) 形参名 —— 返回其视图即悬垂
     std::unordered_set<std::string> in_string_params_;
     bool cur_ret_is_view_ = false;              // 返回类型为 string_view
+    // C1:out 参数出口检查(线性近似:任一路径赋值即视为已赋值)
+    std::vector<std::string> out_params_;
+    std::unordered_set<std::string> out_assigned_;
 
     ast::StructDecl* find_struct(std::string const& n) {
         auto it = structs_.find(n);
@@ -442,6 +446,14 @@ private:
             if (p.mode == ast::ParamMode::In
                 && type_from_use(p.type).kind == Type::String)
                 in_string_params_.insert(p.name);
+        out_params_.clear(); out_assigned_.clear();
+        for (auto& p : md.params) {
+            if (p.mode == ast::ParamMode::Out) {
+                out_params_.push_back(p.name);
+                if (!md.has_block_body)
+                    err(md.line, 1, "out parameter '" + p.name + "' requires a block body");
+            }
+        }
 
         if (md.ret) type_from_use(*md.ret);
         if (md.pre) infer(*md.pre);
@@ -450,9 +462,13 @@ private:
         if (md.has_block_body && md.block_body) check_stmt(*md.block_body);
         if (md.expr_body) {
             Type bt = infer_top(*md.expr_body);         // 短体可为 match 表达式 / '?'
-            (void)bt;                                   // M5-L6:短体 return arena_ptr 合法
+            (void)bt;
             check_view_escape(*md.expr_body);
         }
+
+        for (auto const& opn : out_params_)
+            if (!out_assigned_.count(opn))
+                err(md.line, 1, "out parameter '" + opn + "' not assigned on all exit paths");
 
         cur_struct_ = nullptr;
         cur_method_ = nullptr;
@@ -482,7 +498,7 @@ private:
             sym.is_const = p.mode == ast::ParamMode::In;
             scopes_.back()[p.name] = sym;
         }
-        // M5 生存期 Lite:函数级状态复位 + L1 视图参数登记
+        // M5 生存期 Lite:函数级状态复位 + L1/C1 参数登记
         moved_.clear();
         in_string_params_.clear();
         cur_ret_is_view_ = f.ret
@@ -491,6 +507,14 @@ private:
             if (p.mode == ast::ParamMode::In
                 && type_from_use(p.type).kind == Type::String)
                 in_string_params_.insert(p.name);
+        out_params_.clear(); out_assigned_.clear();
+        for (auto& p : f.params) {
+            if (p.mode == ast::ParamMode::Out) {
+                out_params_.push_back(p.name);
+                if (!f.has_block_body)
+                    err(f.line, 1, "out parameter '" + p.name + "' requires a block body");
+            }
+        }
 
         if (f.ret) type_from_use(*f.ret);
         if (f.is_extern) {
@@ -506,6 +530,11 @@ private:
             (void)bt;                           // M5-L6:短体 return arena_ptr 合法(工厂包装)
             check_view_escape(*f.expr_body);    // 短体同样受 L1 约束
         }
+
+        // C1:隐式末尾 return 的 out 出口检查(显式 return 已在各点检查)
+        for (auto const& opn : out_params_)
+            if (!out_assigned_.count(opn))
+                err(f.line, 1, "out parameter '" + opn + "' not assigned on all exit paths");
 
         for (auto& tp : f.type_params) generic_names_.erase(tp.name);
     }
@@ -594,6 +623,11 @@ private:
                 // 违规形态 = 流入更长命的非 arena_ptr 存储(store/global/传参)
                 check_view_escape(*r.value);    // M5-L1
             }
+            // C1:出口处 out 形参须已赋值
+            for (auto const& opn : out_params_)
+                if (!out_assigned_.count(opn))
+                    err(r.line, r.col, "out parameter '" + opn
+                        + "' not assigned on all exit paths");
             return;
         }
         case ast::Stmt::Var: {
@@ -1054,6 +1088,15 @@ private:
             if (a.op == "=" && a.target->kind() == ast::Expr::Name
                 && !static_cast<ast::NameExpr&>(*a.target).qualified())
                 moved_.erase(static_cast<ast::NameExpr&>(*a.target).parts[0]);
+            // C1:对 out 形参的赋值登记
+            if (a.op == "=" && a.target->kind() == ast::Expr::Name
+                && !static_cast<ast::NameExpr&>(*a.target).qualified()) {
+                std::string const& tn = static_cast<ast::NameExpr&>(*a.target).parts[0];
+                if (auto* sym = resolve(tn);
+                    sym && sym->kind == SymKind::Param
+                    && std::find(out_params_.begin(), out_params_.end(), tn) != out_params_.end())
+                    out_assigned_.insert(tn);
+            }
             Type vt = infer_top(*a.value);
             if (vt.is_expected)
                 err(a.line, a.col,
@@ -1269,8 +1312,9 @@ private:
                     note_member_use(*sym);
                     if (sym->kind == SymKind::Func && sym->func)
                         return infer_func_call(*sym->func, c);
-                    if (sym->type.kind == Type::Generic)
-                        return {};                 // 泛型值实参(如 lambda)可调用,C++ 判定
+                    // 泛型值实参 / 推断可调用(lambda 变量等,类型未知)→ C++ 判定
+                    if (sym->type.kind == Type::Generic || !sym->type.known())
+                        return {};
                     err(c.line, c.col,
                         "'" + name.parts[0] + "' is not a function");
                     return {};

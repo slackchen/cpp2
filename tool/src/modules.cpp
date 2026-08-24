@@ -293,8 +293,16 @@ std::string interface_text(ast::Module const& m)
             if (i) o << ",";
             o << f.params[i].name << ":" << type_sig(f.params[i].type, type_sig);
         }
-        o << ")" << ret_sig(f.ret) << (f.throws ? " throws" : "") << "\n";
-    }
+        o << ")" << ret_sig(f.ret) << (f.throws ? " throws" : "");
+        if (!f.error_categories.empty()) {           // M6 收口:类别入接口签名
+            o << "(";
+            for (size_t i = 0; i < f.error_categories.size(); ++i) {
+                if (i) o << "|";
+                o << f.error_categories[i];
+            }
+            o << ")";
+        }
+        o << "\n";    }
     return o.str();
 }
 

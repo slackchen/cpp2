@@ -1,0 +1,36 @@
+// m7b.cpp2 — 挂账清偿冒烟:移位运算符 / UFCS 管道 / lambda 显式捕获 / if 表达式体
+module m7b;
+import std;
+
+double_it: (v: int) -> int = v * 2;
+addn: (v: int, n: int) -> int = v + n;
+
+pick: (x: int) -> string = if x > 10 { "big" } else { "small" };
+
+Counter: type = {
+    n: int = 0;
+    label: () -> string = if n > 100 { "many" } else { "few" };
+}
+
+main: () -> int = {
+    // A1 移位运算符
+    sh: int = 1 << 4;
+    shr: int = 256 >> 2;
+    std::println("A1: shl={0} shr={1}", sh, shr);
+
+    // A2 UFCS 管道:v | f ≡ f(v);v | f(n) ≡ f(v, n)
+    a := 21 | double_it;
+    b := 21 | double_it | addn(100);
+    std::println("A2: pipe={0} chain={1}", a, b);
+
+    // B1 lambda 显式捕获
+    base: int = 100;
+    mk := [base](d: int) -> int = base + d;
+    std::println("B1: capture={0}", mk(5));
+
+    // B2 if 表达式体
+    p := pick(42);
+    q := pick(3);
+    std::println("B2: pick(42)={0} pick(3)={1}", p, q);
+    return 0;
+}

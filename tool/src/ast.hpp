@@ -257,6 +257,7 @@ struct FuncDecl {
     std::vector<TypeParam> type_params;      // <T: Concept>(M2d)
     std::vector<RequiresItem> requires_list; // requires A<T> && B<T>(M2d)
     bool is_extern = false;                  // 无体声明:name: (...)->ret;(M6 互操作)
+    std::vector<std::string> error_categories; // throws E1, E2(M6 收口:存档+audit)
     std::vector<Param> params;
     std::optional<TypeUse> ret;
     bool throws = false;
@@ -281,6 +282,7 @@ struct MethodDecl {                          // 类型成员函数;name=="destru
     std::vector<Param> params;
     std::optional<TypeUse> ret;
     bool throws = false;
+    std::vector<std::string> error_categories;   // throws E1, E2(M6 收口)
     bool mutates = false;
     ExprP pre;                               // 契约(M2c)
     ExprP post;

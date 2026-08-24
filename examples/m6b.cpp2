@@ -1,0 +1,24 @@
+// m6b.cpp2 — M6 收口冒烟:out 出口检查(C1)+ throws 类别存档(C2)
+module m6b;
+import std;
+
+divmod_ok: (a: int, b: int, out q: int, out r: int) = {
+    q = a / b;
+    r = a - q * b;
+}
+
+load_config: (path: string) -> string throws NotFound = {
+    return "cfg";
+}
+
+NotFound: type = { code: int = 404; }
+
+main: () -> int = {
+    q: int = 0;
+    r: int = 0;
+    divmod_ok(17, 5, q, r);
+    std::println("q={0} r={1}", q, r);
+    cfg := load_config("app.conf") or "<none>";
+    std::println("cfg={0}", cfg);
+    return 0;
+}

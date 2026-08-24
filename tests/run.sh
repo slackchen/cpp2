@@ -174,6 +174,26 @@ else
     echo "SKIP m6/zlib (zlib not linkable on this host; covered by CI)"
 fi
 
+# ── M7b:挂账清偿冒烟(移位/管道/显式捕获/if 表达式体/out 出口)──
+run_case examples/m7b.cpp2 "A1: shl=16 shr=64"              ok
+run_case examples/m7b.cpp2 "A2: pipe=42 chain=142"          ok
+run_case examples/m7b.cpp2 "B1: capture=105"                ok
+run_case examples/m7b.cpp2 "B2: pick(42)=big pick(3)=small" ok
+run_case examples/m6b.cpp2 "q=3 r=2"                        ok
+run_case examples/m6b.cpp2 "cfg=cfg"                        ok
+# 负例:out 未赋值(隐式 return 路径)
+cat > .cpp2build/negout.cppm <<'EOF'
+module negout;
+import std;
+f: (a: int, out q: int) = { a = a + 1; }
+main: () -> int = { q: int = 0; f(1, q); return 0; }
+EOF
+if "$CPP2" check .cpp2build/negout.cppm 2>&1 | grep -q "out parameter 'q' not assigned"; then
+    echo "PASS m7c/out-exit-check"; pass=$((pass+1))
+else
+    echo "FAIL m7c/out-exit-check"; fail=$((fail+1))
+fi
+
 # ── M4:检查器完备 / audit / fuzz ────────────────────────────────
 # audit:检查注入点计数 + @unsafe/@unchecked 位置(白纸黑字)
 audit_out="$("$CPP2" audit examples/smart.cpp2 2>/dev/null; "$CPP2" audit examples/safety.cpp2 2>/dev/null)"

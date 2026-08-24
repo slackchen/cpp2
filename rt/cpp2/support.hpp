@@ -169,6 +169,12 @@ class [[nodiscard]] expected {
     std::variant<T, ::cpp2::error> v_;
 public:
     expected(T v) : v_(std::in_place_index<0>, std::move(v)) {}
+    // 泛型转换构造:return "literal" → expected<string>(值语义包装)
+    template <class U>
+        requires (!std::same_as<std::remove_cvref_t<U>, expected>
+                  && !std::same_as<std::remove_cvref_t<U>, unexpected<error>>
+                  && std::constructible_from<T, U&&>)
+    expected(U&& v) : v_(std::in_place_index<0>, static_cast<T>(std::forward<U>(v))) {}
     expected(unexpected<error> u) : v_(std::in_place_index<1>, std::move(u.v_)) {}
     bool has_value() const { return v_.index() == 0; }
     explicit operator bool() const { return has_value(); }
