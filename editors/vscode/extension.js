@@ -3,6 +3,7 @@
 const vscode = require("vscode");
 const cp = require("child_process");
 const path = require("path");
+const fs = require("fs");
 
 const diagCollection = vscode.languages.createDiagnosticCollection("cpp2");
 let checkTimer = null;
@@ -342,21 +343,53 @@ class LensProvider {
 }
 
 // ── Commands ──
-async function runInTerminal(title, args, cwd) {
-    const t = vscode.window.createTerminal({ name: title, cwd });
+function workspaceOf(uri) {
+    const f = vscode.workspace.getWorkspaceFolder(uri);
+    return f ? f.uri.fsPath : path.dirname(uri.fsPath);
+}
+
+// 终端环境:注入 CPP2_RT(自动探测工作区 rt/)与 CPP2_LDFLAGS(设置项)
+function termEnv(uri) {
+    const env = Object.assign({}, process.env);
+    try {
+        const wsRoot = workspaceOf(uri);
+        if (fs.existsSync(path.join(wsRoot, "rt", "cpp2", "support.hpp")))
+            env.CPP2_RT = path.join(wsRoot, "rt");
+        const cfg = vscode.workspace.getConfiguration("cpp2");
+        const ld = cfg.get("ldflags", "");
+        if (ld) env.CPP2_LDFLAGS = ld;
+    } catch (_) { /* 尽力注入 */ }
+    return env;
+}
+
+async function runInTerminal(title, args, cwd, uri) {
+    const tp = toolPath();
+    if (!fs.existsSync(tp)) {
+        vscode.window.showErrorMessage(
+            `cpp2 tool not found: ${tp} — 请检查设置 cpp2.toolPath`);
+        return;
+    }
+    const t = vscode.window.createTerminal({
+        name: title, cwd,
+        env: termEnv(uri || (vscode.window.activeTextEditor
+            && vscode.window.activeTextEditor.document.uri)),
+    });
     t.show();
-    t.sendText([toolPath(), ...args].map(a => a.includes(" ") ? `"${a}"` : a).join(" "));
+    // 终端 shell 就绪前 sendText 会丢字:延迟发送
+    setTimeout(() => {
+        t.sendText([tp, ...args].map(a => a.includes(" ") ? `"${a}"` : a).join(" "));
+    }, 600);
 }
 
 async function cmdRun(uri) {
     uri = uri || (vscode.window.activeTextEditor && vscode.window.activeTextEditor.document.uri);
     if (!uri) return;
-    await runInTerminal("C++2 Run", ["run", uri.fsPath], path.dirname(uri.fsPath));
+    await runInTerminal("C++2 Run", ["run", uri.fsPath], path.dirname(uri.fsPath), uri);
 }
 async function cmdBuild(uri) {
     uri = uri || (vscode.window.activeTextEditor && vscode.window.activeTextEditor.document.uri);
     if (!uri) return;
-    await runInTerminal("C++2 Build", ["build", uri.fsPath], path.dirname(uri.fsPath));
+    await runInTerminal("C++2 Build", ["build", uri.fsPath], path.dirname(uri.fsPath), uri);
 }
 async function cmdCheck() {
     const ed = vscode.window.activeTextEditor;
