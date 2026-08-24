@@ -38,7 +38,7 @@ jobs:
         run: |
           BENCH_COUNT=1000 BENCH_FUNCS=24 ./.cpp2build/cpp2 run tests/bench_gen.cpp2
           ./.cpp2build/cpp2 build tests/bench/main.cpp2
-          ./.cpp2build/cpp2 build tests/bench/main.cpp2 | grep -q "0 transpiled.*0 compiled"
+          ./.cpp2build/cpp2 build tests/bench/main.cpp2 2>&1 | grep -q "0 transpiled.*0 compiled"
           test -x tests/bench/.cpp2build/main && echo "link ok" || {
             echo "PRODUCT MISSING — diagnostic:"
             pwd
@@ -64,4 +64,4 @@ jobs:
             sleep 1
           done
           echo "$out" | grep -q "bench ok"
-          ./.cpp2build/cpp2 build tests/bench/main.cpp2 | grep -q "0 transpiled.*0 compiled"
+          ./.cpp2build/cpp2 build tests/bench/main.cpp2 2>&1 | grep -q "0 transpiled.*0 compiled"
