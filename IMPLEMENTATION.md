@@ -307,7 +307,7 @@ M3 实现偏差(相对本章早先的设想,均待后续里程碑消除):
 | ~~M4~~ **已完成(M4 收口补齐)** | 检查器完备 + 故障注入 + 模糊测试 | 全部检查项验收(invariant 于收口实现) |
 | ~~M5~~ **已完成** | 生存期 Lite L1–L6 | ~~悬垂测试集编译期捕获率报告~~ **14/14 = 100%**(L4 以 @unsafe 显式担责定档,见收口记录) |
 | ~~M6~~ **已完成** | `cxx_legacy` 增强、`gc<T>`(保守式) | 与 zlib 双向互操作(结构化交付:本机缺库由 CI ubuntu 实测,见收口记录) |
-| M7+ | 自举实验、原生后端评估 | — |
+| M7+ | 自举实验、原生后端评估(**进行中**:M7a bench_gen 进 CI ✓;M7b/M7c 挂账清偿 ✓;M7 第二批 lifetime_runner/c2i_verify/ABI 文档 ✓——见各完成记录) | — |
 
 **M4 完成记录(2026-08-20)**:检查器补齐空安全(智能指针 `.` 自动解引用 → `cpp2::deref(p)->m` 空检 trap,`@unsafe`/`@unchecked` 可退出,块形式语法落地——DESIGN §6.2/§6.6 原样)与浮点→整型转换越界检查(`narrow_cast` 浮点重载,2^N 精确边界,NaN 一并捕获);`cpp2 audit` 输出每模块检查注入点计数(arith/index/deref/narrow,谓词与发射侧一致)与全部 `@unsafe`/`@unchecked` 位置(含行号);故障注入套件扩至 5 例(溢出/越界/除零/空解引用/浮点转换),全部断言 trap 消息**与 `.cpp2` 源位置**;模糊测试:`cpp2 fuzz` 内置确定性变异 fuzzer(seed 可复现,regression 内置 10000 次迭代零崩溃),parser 增加递归深度防护(3000 层嵌套 → 干净诊断而非爆栈);编译器矩阵:`toolchain.cpp` 按 `--version` 输出探测家族(本机 `g++` 为 clang 别名,仅看名字会误判),模块编译参数按 clang/gcc/msvc 分派;生成码缓存键混入工具版本,emit 演进不再被旧缓存掩盖。
 
@@ -428,7 +428,7 @@ M6a 偏差:
 | arena 分配策略 | 按对象 new + 析构登记(v1 正确性优先) | 段式池(IMPL §5"段式分配")后续切片 |
 | L6 边界精度 | 类型域检查(非 arena_ptr 存储即逃逸);未追踪同一 arena 的作用域嵌套 | 结合作用域标注细化 |
 | legacy 名字桥接 | 需显式无体声明;legacy 内类型不参与 cpp2 类型系统 | M6 切片二评估自动扫描 |
-| gc<T> / zlib | 未动(zlib 需环境探明;gc 待真实消费者) | M6 切片二 |
+| gc<T> / zlib | ~~未动~~ **M5/M6 收口已交付**(rt/cpp2/gc.hpp v1;zlib_demo 结构化交付 + CI ubuntu 实测往返,见收口记录) | — |
 
 **M5/M6 收口记录(2026-08-21)**:路线图 M1–M6 全部完成——
 - **M5-L4 定档落地**:硬错误 + `@unsafe` 逃生舱(与 L5 同哲学:退出点白纸黑字)。`string_view` 返回绑定到 string 成员字段即诊断;`@unsafe { return name; }` 显式担责放行。悬垂语料最终 **14/14 = 100%**。
@@ -450,6 +450,15 @@ M1–M6 至此全部完成。剩余为 M7+(自举实验、原生后端评估,研
 - 顺带修复:聚合初始化字段检查沿基类链(Dog{.name=…} 经继承字段);链接失败不再静默(run_capture + 过滤空回显原始输出);CI 千单元产物执行异常持续诊断(降级 continue-on-error,运行断言由 120 模块步承担)。
 
 回归 **105 用例全绿**,悬垂捕获率 14/14。
+
+回归 **105 用例全绿**,悬垂捕获率 14/14。
+
+**M7 自举第二批 + 原生后端 P0 完成记录(2026-08-24)**:
+- **ABI 冻结文档 v1(P0 交付)**:`docs/abi-freeze.md` 七节——数据表示、参数传递约定、错误通道布局(index+error 三字段)、命名与链接(cpp2mod 方案/无体声明)、运行时入口清单(trap/checked_*/gc/arena…)、版本化(CPP2_ABI_VERSION=1 混入缓存键)、明确不冻结清单。原生后端 P1(直译原型)的前置条件就此就位。
+- **错误链(库级)**:error 增 `cause`(shared_ptr 链)与 `chain()` 全链消息;`cpp2::err_caused(cause, msg)` 包装;示例 errchain(caused by 层级输出)。语言语法零改动,纯 rt 能力。
+- **自举第二批**:基础设施工具 cpp2 化——`tools/lifetime_runner.cpp2`(生存期语料捕获率 runner,替代 run.sh 内联 bash 逻辑,结果一致 14/14;CPP2_TOOL/CPP2_LIFETIME_DIR 环境驱动)与 `tools/c2i_verify.cpp2`(.c2i v1 结构校验:magic/version/name/4×32B 摘要区/长度字段全检)。run.sh 接入后回归 **107 用例全绿**。
+- **自举暴露并修复的语言工效缝隙**(偏差表同步):string 字面量推断为 char*(需显式 `: string`)、`_` 不可作循环变量名、括号内 if 表达式不支持(改语句形态)、`in` 为关键字不可作变量名。
+- **CI**:千单元产物执行异常持续降级诊断(continue-on-error);grep 管道补 `2>&1`(build ok 走 stderr 的根因);gcc/clang 双矩阵全绿含 zlib 实测。**vendored zlib**(`third_party/zlib-1.3.1`,白名单入库)使本地可复现 zlib_demo。
 
 ## 10. v0.x 明确不做
 
