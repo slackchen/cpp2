@@ -37,7 +37,11 @@ jobs:
           BENCH_COUNT=1000 BENCH_FUNCS=24 ./.cpp2build/cpp2 run tests/bench_gen.cpp2
           ./.cpp2build/cpp2 build tests/bench/main.cpp2
           ./.cpp2build/cpp2 build tests/bench/main.cpp2 | grep -q "0 transpiled.*0 compiled"
-          test -x tests/bench/.cpp2build/main && echo "link ok"
+          test -x tests/bench/.cpp2build/main && echo "link ok" || {
+            echo "PRODUCT MISSING — directory listing:"
+            ls -la tests/bench/.cpp2build | head -40
+            exit 1
+          }
       - name: Runtime verification at representative scale (120 modules)
         run: |
           BENCH_COUNT=120 BENCH_FUNCS=80 ./.cpp2build/cpp2 run tests/bench_gen.cpp2
