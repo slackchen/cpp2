@@ -1,0 +1,25 @@
+// native_demo.cpp2 — 原生后端 v0 子集演示(--backend=native):
+// 整数函数 / 递归 / 控制流。子集外构造会自动回退转译路径。
+// 运行时输出经 tools/native_rt.c 的 print_int(libc printf)。
+module native_demo;
+
+print_int: (v: int);                    // 无体声明:rt 垫片提供(M6 互操作)
+
+fib: (n: int) -> int = {
+    if n < 2 { return n; }
+    return fib(n - 1) + fib(n - 2);
+}
+
+sum_to: (n: int) -> int = {
+    s: int = 0;
+    for i in 0..=n {
+        s += i;
+    }
+    return s;
+}
+
+main: () -> int = {
+    print_int(fib(10));                 // 55
+    print_int(sum_to(100));             // 5050
+    return 0;
+}

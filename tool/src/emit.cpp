@@ -1556,7 +1556,12 @@ private:
         generic_params_ = f.type_params.empty() ? nullptr : &tp;
         if (!f.type_params.empty())
             out_ += prefix + template_header(f) + "\n";
-        out_ += prefix + signature(f, /*with_defaults*/true) + ";\n";
+        // 无返回类型的原型用 void(auto 会成为推导返回类型,
+        // extern 声明在定义可见前不可用)
+        if (!f.ret)
+            out_ += prefix + "void " + f.name + "(" + params_str(f.params, /*with_defaults*/true) + ");\n";
+        else
+            out_ += prefix + signature(f, /*with_defaults*/true) + ";\n";
         generic_params_ = nullptr;
     }
 
