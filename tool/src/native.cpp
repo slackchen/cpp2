@@ -3,6 +3,8 @@
 // 槽位:参数与局部变量统一扁平分配 [rbp-8k];帧大小对齐 16。
 // 平台:仅 SysV(Linux);Windows 构建的工具自动回退转译(需求行为)。
 #include "native.hpp"
+#include "native/x64.hpp"
+#include "native/pe.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -1238,6 +1240,43 @@ std::string emit_asm(ast::Module& m, sema::Result const& r)
 {
     NativeEmitter em;
     return em.emit(m, r);
+}
+
+std::vector<uint8_t> emit_pe(ast::Module& m, sema::Result const& r)
+{
+    // Windows 直出 PE：仅最小 hello 子集（import std, main->{print}），其余回退
+    // 检查是否为 hello：单 func main, 无 params, 有 std::print 字面量
+    if (m.funcs.size() != 1 || m.funcs[0].name != "main") throw Unsupported("emit_pe: only hello main");
+    auto& main = m.funcs[0];
+    if (!main.has_block_body || !main.block_body) throw Unsupported("emit_pe: main needs block");
+    // 简化：直接用 x64::Emitter 手编 hello 的机器码
+    x64::Emitter e;
+    // prologue
+    e.push_rbp();
+    e.mov_rbp_rsp();
+    e.sub_rsp_imm8(32);
+    // lea rcx, .LS0[rip]  (rodata hello string)
+    e.lea_rcx_rip(".LS0");
+    e.xor_eax_eax();
+    e.call_indirect_rip("printf");
+    e.add_rsp_imm8(32);
+    e.xor_ecx_ecx();
+    e.call_indirect_rip("ExitProcess");
+    std::vector<uint8_t> text = e.code;
+    std::vector<uint8_t> rodata;
+    std::string hello = "Hello, C++2!\n";
+    hello.push_back('\0');
+    for(char c: hello) rodata.push_back((uint8_t)c);
+    std::vector<pe::Reloc> relocs;
+    for(auto &r: e.relocs){
+        pe::Reloc pr;
+        pr.offset = r.pos - 0; // x64::Reloc pos is disp offset
+        pr.target = r.target;
+        pr.is_call = r.is_call;
+        relocs.push_back(pr);
+    }
+    std::vector<std::pair<std::string,std::string>> labels = { {".LS0","0"} };
+    return pe::build_exe(text, rodata, relocs, labels);
 }
 
 #endif

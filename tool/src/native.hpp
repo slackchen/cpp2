@@ -23,5 +23,7 @@ struct Unsupported : std::runtime_error {
 // 单模块 → x86-64 汇编(AT&T/GAS,intel_syntax noprefix)。
 // 抛 Unsupported 表示含子集外构造(调用方回退转译)。
 std::string emit_asm(ast::Module& m, sema::Result const& r);
+// Windows 直出 PE（不经 g++），仅 hello 等最小子集
+std::vector<uint8_t> emit_pe(ast::Module& m, sema::Result const& r);
 
 } // namespace cpp2::native
