@@ -10,12 +10,14 @@
 #include "ast.hpp"
 #include "sema.hpp"
 
+#include <stdexcept>
 #include <string>
 
 namespace cpp2::native {
 
-struct Unsupported {
+struct Unsupported : std::runtime_error {
     std::string msg;
+    explicit Unsupported(std::string m) : std::runtime_error(m), msg(std::move(m)) {}
 };
 
 // 单模块 → x86-64 汇编(AT&T/GAS,intel_syntax noprefix)。

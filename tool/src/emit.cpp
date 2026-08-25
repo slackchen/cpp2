@@ -1259,9 +1259,10 @@ private:
     {
         std::string s;
         if (f.name == "main") s = "int main(";
+        else if (!f.ret && !f.throws) s = "void " + f.name + "(";
         else                  s = "auto " + f.name + "(";
         s += params_str(f.params, with_defaults) + ")";
-        if (f.name != "main" && f.ret)
+        if (f.name != "main" && (f.ret || f.throws))
             s += " -> " + ret_type_str(f.ret, f.throws);
         return s;
     }
@@ -1557,8 +1558,8 @@ private:
         if (!f.type_params.empty())
             out_ += prefix + template_header(f) + "\n";
         // 无返回类型的原型用 void(auto 会成为推导返回类型,
-        // extern 声明在定义可见前不可用)
-        if (!f.ret)
+        // extern 声明在定义可见前不可用); throws void → expected<void>
+        if (!f.ret && !f.throws)
             out_ += prefix + "void " + f.name + "(" + params_str(f.params, /*with_defaults*/true) + ");\n";
         else
             out_ += prefix + signature(f, /*with_defaults*/true) + ";\n";

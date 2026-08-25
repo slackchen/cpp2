@@ -1,5 +1,5 @@
-// tools/native_rt.c ? native ?????????(M7 P1 ??)
-// ? libc:print_int / ?? trap???:cc main.o native_rt.o -o prog
+// tools/native_rt.c ? native backend runtime shim (M7 P1/v1)
+// libc only: print_int / div0 trap. Link: cc main.o native_rt.o -o prog
 #include <stdio.h>
 #include <stdlib.h>
 

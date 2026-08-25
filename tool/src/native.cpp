@@ -13,7 +13,7 @@
 
 namespace cpp2::native {
 
-[[noreturn]] void unsup(std::string const& msg) { throw Unsupported{msg}; }
+[[noreturn]] void unsup(std::string const& msg) { throw Unsupported(msg); }
 
 bool is_int_kind(sema::Type::Kind k)
 {
@@ -58,7 +58,7 @@ private:
     std::vector<std::string> break_labels_;
     std::vector<std::string> continue_labels_;
 
-    [[noreturn]] void unsup(std::string const& msg) { throw Unsupported{msg}; }
+    [[noreturn]] void unsup(std::string const& msg) { throw Unsupported(msg); }
 
     void ins(std::string const& s) { out_ << "    " << s << "\n"; }
     void label(std::string const& l) { out_ << l << ":\n"; }
@@ -348,11 +348,60 @@ private:
             break;
         case ast::Expr::Assign: {
             auto& a = static_cast<ast::AssignExpr&>(*e);
-            if (a.op != "=" || a.target->kind() != ast::Expr::Name)
+            if (a.target->kind() != ast::Expr::Name)
                 unsup("assignment form");
-            eval(a.value.get());
             auto& n = static_cast<ast::NameExpr&>(*a.target);
-            ins("mov QWORD PTR [rbp" + std::to_string(slot_or_new(n.parts[0])) + "], rax");
+            int off = slot_or_new(n.parts[0]);
+            if (a.op == "=") {
+                eval(a.value.get());
+            } else {
+                // compound assignment: desugar lhs op rhs -> rax
+                std::string lop = a.op.substr(0, a.op.size() - 1); // "+=" -> "+"
+                // lhs -> rcx, rhs -> rax, then compute
+                ins("mov rax, QWORD PTR [rbp" + std::to_string(off) + "]");
+                ins("push rax");
+                ++push_depth_;
+                eval(a.value.get());
+                ins("pop rcx");
+                --push_depth_;
+                if (lop == "+") { ins("add rax, rcx"); }
+                else if (lop == "-") { ins("xchg rax, rcx"); ins("sub rax, rcx"); }
+                else if (lop == "*") { ins("imul rax, rcx"); }
+                else if (lop == "/") {
+                    ins("xchg rax, rcx");
+                    ins("test rcx, rcx");
+                    std::string ok = lbl("divok");
+                    ins("jnz " + ok);
+                    ins("lea rdi, .Lfmt_div0[rip]");
+                    ins("xor eax, eax");
+                    ins("call printf");
+                    ins("mov edi, 101");
+                    ins("call exit");
+                    label(ok);
+                    ins("cqo");
+                    ins("idiv rcx");
+                } else if (lop == "%") {
+                    ins("xchg rax, rcx");
+                    ins("test rcx, rcx");
+                    std::string ok = lbl("divok");
+                    ins("jnz " + ok);
+                    ins("lea rdi, .Lfmt_div0[rip]");
+                    ins("xor eax, eax");
+                    ins("call printf");
+                    ins("mov edi, 101");
+                    ins("call exit");
+                    label(ok);
+                    ins("cqo");
+                    ins("idiv rcx");
+                    ins("mov rax, rdx");
+                } else if (lop == "&") { ins("and rax, rcx"); }
+                else if (lop == "|") { ins("or rax, rcx"); }
+                else if (lop == "^") { ins("xor rax, rcx"); }
+                else if (lop == "<<") { ins("xchg rax, rcx"); ins("shl rax, cl"); }
+                else if (lop == ">>") { ins("xchg rax, rcx"); ins("sar rax, cl"); }
+                else unsup("compound assignment '" + a.op + "'");
+            }
+            ins("mov QWORD PTR [rbp" + std::to_string(off) + "], rax");
             break;
         }
         case ast::Expr::Call:
@@ -502,7 +551,7 @@ private:
 
 std::string emit_asm(ast::Module& m, sema::Result const& r)
 {
-    cpp2::native::NativeEmitter em;
+    NativeEmitter em;
     return em.emit(m, r);
 }
 
@@ -512,12 +561,10 @@ class NativeEmitter {
 public:
     std::string emit(ast::Module&, sema::Result const&)
     {
-        unsup("native backend v0 targets System V x86-64 only "
-              "(this tool build is Windows; transpile path will be used)");
-        return "";                          // 不可达(unsup 抛出)
+        throw Unsupported(
+            "native backend v0 targets System V x86-64 only "
+            "(this tool build is Windows; transpile path will be used)");
     }
-private:
-    void unsup(std::string const&) {}
 };
 
 std::string emit_asm(ast::Module& m, sema::Result const& r)
@@ -526,6 +573,6 @@ std::string emit_asm(ast::Module& m, sema::Result const& r)
     return em.emit(m, r);
 }
 
-} // namespace native
-
 #endif
+
+} // namespace cpp2::native

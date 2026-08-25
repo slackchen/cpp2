@@ -2,8 +2,11 @@
 // 整数函数 / 递归 / 控制流。子集外构造会自动回退转译路径。
 // 运行时输出经 tools/native_rt.c 的 print_int(libc printf)。
 module native_demo;
+import std;
 
-print_int: (v: int);                    // 无体声明:rt 垫片提供(M6 互操作)
+print_int: (v: int) = {                 // 自含定义:两后端均可直连;原生经汇编直译,headers 经 C++ 转译
+    std::println("{0}", v);
+}
 
 fib: (n: int) -> int = {
     if n < 2 { return n; }
