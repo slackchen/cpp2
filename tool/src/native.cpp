@@ -60,6 +60,7 @@ private:
 
     [[noreturn]] void unsup(std::string const& msg) { throw Unsupported(msg); }
 
+    void put(std::string const& s) { out_ << s << "\n"; }
     void ins(std::string const& s) { out_ << "    " << s << "\n"; }
     void label(std::string const& l) { out_ << l << ":\n"; }
     std::string lbl(std::string const& tag) { return ".L" + tag + "_" + std::to_string(label_++); }
