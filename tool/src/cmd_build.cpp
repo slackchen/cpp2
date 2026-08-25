@@ -96,11 +96,7 @@ int cmd_build(std::vector<std::string> const& args)
     auto p = cpp2::app::prepare(in);
     if (!p) return 1;
 
-#ifdef _WIN32
-    if (backend == "native")
-        std::cerr << "[cpp2] native backend unavailable on Windows build"
-                  << " -> using headers transpile backend\n", backend = "headers";
-#endif
+    // native 后端已模块化手写（x64 + ELF/PE），与转译双轨可切换；Windows 亦直发 x64 Win64 ABI
 
     // 转译(内容寻址落盘)+ 哈希缓存;各后端构建目录隔离,互不污染
     auto& g = p->graph;
@@ -142,7 +138,11 @@ int cmd_build(std::vector<std::string> const& args)
                 std::string asmc = cxx + " -c " + quote(native(s_file))
                                  + " -o " + quote(native(prog_o));
                 write_file(s_file, asm_text);
+#ifdef _WIN32
+                std::cerr << "[cpp2] native backend: emitting x86-64 Win64\n";
+#else
                 std::cerr << "[cpp2] native backend: emitting x86-64 SysV\n";
+#endif
                 std::cerr << "[cpp2] " << shim << "\n";
                 if (!run_capture(shim).ok)
                     throw std::runtime_error("runtime shim build failed");
