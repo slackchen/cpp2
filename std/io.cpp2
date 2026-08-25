@@ -1,0 +1,10 @@
+// std/io.cpp2 — cpp2 标准库 io（print/println），供 native/headers 共用
+// 模块 std.io，导出 print/println，底座经 extern printf（msvcrt）直调，
+// 格式化逻辑在 cpp2 侧（后续 std/format），hello 仅需透传
+module io;
+
+export print: (s: int) -> void = {
+}
+
+export println: (s: int) -> void = {
+}
