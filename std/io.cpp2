@@ -1,10 +1,20 @@
-// std/io.cpp2 — cpp2 标准库 io（print/println），供 native/headers 共用
-// 模块 std.io，导出 print/println，底座经 extern printf（msvcrt）直调，
-// 格式化逻辑在 cpp2 侧（后续 std/format），hello 仅需透传
+// std/io.cpp2 — cpp2 标准库 io（print/println），native/headers 共用
 module io;
 
-export print: (s: int) -> void = {
+cxx_legacy {
+    #include <cstdio>
+    namespace cpp2mod::io {
+        int printf_wrapper(const char* s) { return ::printf("%s", s); }
+        int printf_nl_wrapper(const char* s) { return ::printf("%s\n", s); }
+    }
+}
+export printf_wrapper: (s: const char*) -> int;
+export printf_nl_wrapper: (s: const char*) -> int;
+
+export print: (s: const char*) -> void = {
+    printf_wrapper(s);
 }
 
-export println: (s: int) -> void = {
+export println: (s: const char*) -> void = {
+    printf_nl_wrapper(s);
 }
