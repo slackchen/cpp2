@@ -1,0 +1,33 @@
+// util_test.cpp2 — bootstrap verification for util.safe_name
+module util_test;
+import util;
+import std;
+
+main: () -> int = {
+    if safe_name("app.util") != "app_util" {
+        std::println("FAIL app.util -> {0}", safe_name("app.util"));
+        return 1;
+    }
+    if safe_name("hello-world") != "hello_world" {
+        std::println("FAIL hello-world -> {0}", safe_name("hello-world"));
+        return 1;
+    }
+    if safe_name("a/b") != "a_b" {
+        std::println("FAIL a/b -> {0}", safe_name("a/b"));
+        return 1;
+    }
+    if safe_name("abc_123") != "abc_123" {
+        std::println("FAIL abc_123 -> {0}", safe_name("abc_123"));
+        return 1;
+    }
+    if safe_name("") != "" {
+        std::println("FAIL empty -> {0}", safe_name(""));
+        return 1;
+    }
+    if safe_name("A-Z") != "A_Z" {
+        std::println("FAIL A-Z -> {0}", safe_name("A-Z"));
+        return 1;
+    }
+    std::println("PASS util safe_name");
+    return 0;
+}

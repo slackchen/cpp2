@@ -1,0 +1,21 @@
+// util.cpp2 — bootstrap step 1: safe_name (from util.hpp:9)
+// module util provides filesystem-safe name (a-zA-Z0-9_ -> keep, else _)
+module util;
+import std;
+
+export safe_name: (mod: std::string) -> std::string = {
+    out: std::string = "";
+    i: int = 0;
+    n: int = mod.size() as int;
+    while i < n {
+        c: char = mod[i];
+        ok: bool = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_';
+        if ok {
+            out += c;
+        } else {
+            out += '_';
+        }
+        i += 1;
+    }
+    return out;
+}
