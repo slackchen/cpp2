@@ -25,5 +25,8 @@ struct Unsupported : std::runtime_error {
 std::string emit_asm(ast::Module& m, sema::Result const& r);
 // Windows 直出 PE（不经 g++），仅 hello 等最小子集
 std::vector<uint8_t> emit_pe(ast::Module& m, sema::Result const& r);
+// 通用 native: .s 文本 → asm64 汇编 → PE/ELF 字节(零外部工具)
+// 抛 Unsupported 表示含不支持构造
+std::vector<uint8_t> emit_native(const std::string& asm_text);
 
 } // namespace cpp2::native

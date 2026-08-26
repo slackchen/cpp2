@@ -5,6 +5,7 @@
 #include "native.hpp"
 #include "sha256.hpp"
 #include "toolchain.hpp"
+#include "native/asm64.hpp"
 
 #include <algorithm>
 #include <atomic>

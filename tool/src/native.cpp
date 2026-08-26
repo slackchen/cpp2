@@ -5,6 +5,7 @@
 #include "native.hpp"
 #include "native/x64.hpp"
 #include "native/pe.hpp"
+#include "native/asm64.hpp"
 
 #include <algorithm>
 #include <iostream>
@@ -2894,6 +2895,41 @@ std::vector<uint8_t> emit_pe(ast::Module& m, sema::Result const& r)
     std::vector<std::pair<std::string,std::string>> labels = { {".LS0","0"} };
     std::vector<std::pair<std::string,size_t>> text_labels = { {"cpp2_write", thunk_off} };
     return pe::build_exe(text, rodata, relocs, labels, text_labels);
+}
+
+// ── 通用 native: .s 文本 → asm64 汇编 → PE 字节(零外部工具)────────
+std::vector<uint8_t> emit_native(const std::string& asm_text)
+{
+    auto res = asm64::assemble(asm_text);
+    if (res.text.empty()) throw Unsupported("asm64 produced no code");
+
+    // asm64 已内联回填内部 label 引用;外部符号(printf 等)需要 PE 导入表重定位。
+    // v0:外部符号引用暂不处理(需扩展 asm64 输出未解析 fixups)
+    std::vector<pe::Reloc> prelocs;
+    // 构建 rodata 标签表(label→offset in rodata blob)
+    std::vector<uint8_t> rodata_blob;
+    std::vector<std::pair<std::string,std::string>> ro_labels;
+    for (auto& [name, bytes] : res.rodata) {
+        ro_labels.push_back({name, std::to_string(rodata_blob.size())});
+        rodata_blob.insert(rodata_blob.end(), bytes.begin(), bytes.end());
+    }
+
+    // 构建 text 内标签表(函数入口等)
+    std::vector<std::pair<std::string,size_t>> text_labels;
+    for (auto& [name, off] : res.symbols) {
+        if (name[0] != '.')  // 只导出函数名,跳过 .L 局部标签
+            text_labels.push_back({name, off});
+    }
+
+    // 额外导入: printf → msvcrt.dll;其余 externs 也尝试映射到 msvcrt
+    std::vector<std::pair<std::string,std::string>> extra_imports;
+    for (auto& e : res.externs) {
+        if (e == "ExitProcess" || e == "GetStdHandle" || e == "WriteFile") continue;
+        extra_imports.push_back({e, "msvcrt.dll"});
+    }
+
+    return pe::build_exe(res.text, rodata_blob, prelocs,
+                         ro_labels, text_labels);
 }
 
 #endif
