@@ -272,7 +272,7 @@ private:
             slots_[f.params[i].name] = -(8 * (int)(i + 1));
         scan_slots(f.has_block_body ? f.block_body.get() : nullptr);
 
-        int words = (int)f.params.size() + (int)slots_.size();
+        int words = (int)f.params.size() + (int)slots_.size() + 16; // +16 = temp slots + shadow
         int frame = ((words * 8 + 15) / 16) * 16;
 
         put(".globl " + f.name);
@@ -315,7 +315,7 @@ private:
         for (size_t i = 0; i < m.params.size(); ++i)
             slots_[m.params[i].name] = -(8 * (int)(i + 2));
         if (m.has_block_body && m.block_body) scan_slots(m.block_body.get());
-        int words = 1 + (int)m.params.size() + (int)slots_.size();
+        int words = 1 + (int)m.params.size() + (int)slots_.size() + 16; // +16 temp
         int frame = ((words * 8 + 15) / 16) * 16;
         put(".globl " + mname);
         put(mname + ":");
@@ -623,8 +623,8 @@ private:
         case ast::Stmt::Match: {
             auto& m = static_cast<ast::MatchStmt&>(*s);
             eval(m.scrutinee.get());
-            ins("push rax");
-            ++push_depth_;
+            int scr_off = slot_or_new("$scr_" + std::to_string(label_++));
+            ins("mov QWORD PTR [rbp" + std::to_string(scr_off) + "], rax");
             std::string end = lbl("match_end");
             for (size_t i=0;i<m.arms.size();++i) {
                 auto& arm = m.arms[i];
@@ -640,7 +640,7 @@ private:
                         if (enum_val!=-1) break;
                     }
                     if (enum_val==-1) unsup("unknown enum member '" + arm.enum_member + "'");
-                    ins("mov rax, QWORD PTR [rsp]");
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(scr_off) + "]");
                     ins("cmp rax, " + std::to_string(enum_val));
                     ins("jne " + next);
                 } else if (arm.pat == ast::MatchArm::Pat::TypePat) {
@@ -688,17 +688,17 @@ private:
                     }
                 } else if (arm.pat == ast::MatchArm::Pat::Ok || arm.pat == ast::MatchArm::Pat::Some) {
                     // ok n => :值非 0;绑定 n = scrutinee
-                    ins("mov rax, QWORD PTR [rsp]");
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(scr_off) + "]");
                     ins("test rax, rax");
                     ins("je " + next);
                     if (!arm.binding.empty() && arm.binding != "_") {
                         int boff = slot_or_new(arm.binding);
-                        ins("mov rax, QWORD PTR [rsp]");
+                        ins("mov rax, QWORD PTR [rbp" + std::to_string(scr_off) + "]");
                         ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
                     }
                 } else if (arm.pat == ast::MatchArm::Pat::Err || arm.pat == ast::MatchArm::Pat::None) {
                     // err e => :值为 0;v0 错误消息不可用,e 绑定为 0
-                    ins("mov rax, QWORD PTR [rsp]");
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(scr_off) + "]");
                     ins("test rax, rax");
                     ins("jne " + next);
                     if (!arm.binding.empty() && arm.binding != "_") {
@@ -714,8 +714,6 @@ private:
                 if (next != end) label(next);
             }
             label(end);
-            ins("pop rax");
-            --push_depth_;
             break;
         }
         default:
@@ -1098,9 +1096,7 @@ private:
                 ins("pop " + std::string(regs[i+1]));
                 --push_depth_;
             }
-            ins("sub rsp, 32");
             ins("call " + sd->name + "_" + md->name);
-            ins("add rsp, 32");
 #endif
             return;
         }
@@ -1592,7 +1588,7 @@ private:
         for (size_t i = 0; i < f.params.size(); ++i)
             slots_[f.params[i].name] = -(8 * (int)(i + 1));
         scan_slots(f.has_block_body ? f.block_body.get() : nullptr);
-        int words = (int)f.params.size() + (int)slots_.size();
+        int words = (int)f.params.size() + (int)slots_.size() + 16; // +16 = temp slots + shadow
         int frame = ((words * 8 + 15) / 16) * 16;
         put(".globl " + f.name);
         put(f.name + ":");
@@ -1631,7 +1627,7 @@ private:
         for (size_t i = 0; i < m.params.size(); ++i)
             slots_[m.params[i].name] = -(8 * (int)(i + 2));
         if (m.has_block_body && m.block_body) scan_slots(m.block_body.get());
-        int words = 1 + (int)m.params.size() + (int)slots_.size();
+        int words = 1 + (int)m.params.size() + (int)slots_.size() + 16; // +16 temp
         int frame = ((words * 8 + 15) / 16) * 16;
         put(".globl " + mname);
         put(mname + ":");
@@ -1930,8 +1926,8 @@ private:
         case ast::Stmt::Match: {
             auto& m = static_cast<ast::MatchStmt&>(*s);
             eval(m.scrutinee.get());
-            ins("push rax");
-            ++push_depth_;
+            int scr_off = slot_or_new("$scr_" + std::to_string(label_++));
+            ins("mov QWORD PTR [rbp" + std::to_string(scr_off) + "], rax");
             std::string end = lbl("match_end");
             for (size_t i=0;i<m.arms.size();++i) {
                 auto& arm = m.arms[i];
@@ -1947,7 +1943,7 @@ private:
                         if (enum_val!=-1) break;
                     }
                     if (enum_val==-1) unsup("unknown enum member '" + arm.enum_member + "'");
-                    ins("mov rax, QWORD PTR [rsp]");
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(scr_off) + "]");
                     ins("cmp rax, " + std::to_string(enum_val));
                     ins("jne " + next);
                 } else if (arm.pat == ast::MatchArm::Pat::TypePat) {
@@ -1995,17 +1991,17 @@ private:
                     }
                 } else if (arm.pat == ast::MatchArm::Pat::Ok || arm.pat == ast::MatchArm::Pat::Some) {
                     // ok n => :值非 0;绑定 n = scrutinee
-                    ins("mov rax, QWORD PTR [rsp]");
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(scr_off) + "]");
                     ins("test rax, rax");
                     ins("je " + next);
                     if (!arm.binding.empty() && arm.binding != "_") {
                         int boff = slot_or_new(arm.binding);
-                        ins("mov rax, QWORD PTR [rsp]");
+                        ins("mov rax, QWORD PTR [rbp" + std::to_string(scr_off) + "]");
                         ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
                     }
                 } else if (arm.pat == ast::MatchArm::Pat::Err || arm.pat == ast::MatchArm::Pat::None) {
                     // err e => :值为 0;v0 错误消息不可用,e 绑定为 0
-                    ins("mov rax, QWORD PTR [rsp]");
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(scr_off) + "]");
                     ins("test rax, rax");
                     ins("jne " + next);
                     if (!arm.binding.empty() && arm.binding != "_") {
@@ -2021,8 +2017,6 @@ private:
                 if (next != end) label(next);
             }
             label(end);
-            ins("pop rax");
-            --push_depth_;
             break;
         }
         default:
@@ -2500,9 +2494,7 @@ private:
                 ins("pop " + std::string(regs[i+1]));
                 --push_depth_;
             }
-            ins("sub rsp, 32");
             ins("call " + sd->name + "_" + md->name);
-            ins("add rsp, 32");
             return;
         }
         if (c.callee->kind() != ast::Expr::Name) unsup("indirect calls");
@@ -2613,8 +2605,7 @@ private:
                 std::string cfmt = "%d";
                 if (newline) cfmt += "\n";
                 std::string fmt_lbl = intern_string(cfmt);
-                ins("sub rsp, 32");              // shadow space(Win64 必需;SysV 对齐)
-                eval(c.args[0].get());
+                                eval(c.args[0].get());
 #ifdef CPP2_NATIVE_HOST_OK
                 ins("mov rsi, rax");
                 ins("lea rdi, " + fmt_lbl + "[rip]");
@@ -2624,7 +2615,6 @@ private:
 #endif
                 ins("xor eax, eax");
                 ins("call printf");
-                ins("add rsp, 32");
                 return;
             }
         }
