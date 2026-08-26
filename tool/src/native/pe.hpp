@@ -23,7 +23,11 @@ std::vector<uint8_t> build_exe(
     const std::vector<uint8_t>& rodata,
     const std::vector<Reloc>& relocs,
     const std::vector<std::pair<std::string,std::string>>& rodata_labels,
-    const std::vector<std::pair<std::string,size_t>>& text_labels = {}
+    const std::vector<std::pair<std::string,size_t>>& text_labels = {},
+    // 动态导入表: {DLL名, 符号列表}
+    const std::vector<std::pair<std::string, std::vector<std::string>>>& imports = {
+        {"kernel32.dll", {"GetStdHandle", "WriteFile", "ExitProcess"}}
+    }
 );
 
 } // namespace cpp2::native::pe
