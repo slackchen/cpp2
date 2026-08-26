@@ -407,6 +407,53 @@ private:
                     break;
                 }
             }
+            // variant 类型变量:首槽 = tag(候选序),后续槽 = 数据
+            bool is_variant_var = false;
+            if (v.has_type && v.type.parts.size()==1) {
+                for (auto& vd : m_->variants)
+                    if (vd.name == v.type.parts[0]) { is_variant_var = true; break; }
+            }
+            if (is_variant_var) {
+                int tag_off = slot_or_new(v.name + "#tag");
+                int data_off = slot_or_new(v.name);
+                std::string dslot2 = v.name + "#d2";
+                slot_or_new(dslot2);
+                int tag = -1;
+                if (v.init && v.init->kind() == ast::Expr::StructLit) {
+                    auto& sl = static_cast<ast::StructLitExpr&>(*v.init);
+                    std::string tn = sl.type_parts.empty() ? "" : sl.type_parts[0];
+                    for (auto& vd : m_->variants) {
+                        if (vd.name != v.type.parts[0]) continue;
+                        for (size_t k=0;k<vd.alternatives.size();++k)
+                            if (vd.alternatives[k].parts.size()==1 && vd.alternatives[k].parts[0]==tn)
+                                tag = (int)k;
+                    }
+                }
+                if (tag < 0) unsup("variant init must be a candidate literal");
+                ins("mov rax, " + std::to_string(tag));
+                ins("mov QWORD PTR [rbp" + std::to_string(tag_off) + "], rax");
+                // 数据字段逐个写入(从 data_off 起)
+                ast::StructDecl* sd = nullptr;
+                if (v.init && v.init->kind() == ast::Expr::StructLit) {
+                    auto& sl = static_cast<ast::StructLitExpr&>(*v.init);
+                    std::string tn = sl.type_parts.empty() ? "" : sl.type_parts[0];
+                    for (auto& s2 : m_->structs) if (s2.name == tn) { sd = &s2; break; }
+                }
+                if (sd) {
+                    for (size_t i=0;i<sd->fields.size();++i) {
+                        bool found = false;
+                        for (auto& pr : ((ast::StructLitExpr&)*v.init).fields)
+                            if (pr.first == sd->fields[i].name) {
+                                eval(pr.second.get());
+                                found = true;
+                                break;
+                            }
+                        if (!found) eval(sd->fields[i].init.get());
+                        ins("mov QWORD PTR [rbp" + std::to_string(data_off + (int)i*8) + "], rax");
+                    }
+                }
+                break;
+            }
             int off = slot_or_new(v.name);
             if (v.init) eval(v.init.get());
             else ins("xor eax, eax");
@@ -452,7 +499,70 @@ private:
         }
         case ast::Stmt::For: {
             auto& fo = static_cast<ast::ForStmt&>(*s);
-            if (!fo.is_range) unsup("iterator for-loops");
+            if (!fo.is_range) {
+                // string 迭代降级:for c in s → i=0; while i<strlen(s) { c=s[i]; ... }
+                if (!fo.iterable || fo.iterable->kind() != ast::Expr::Name)
+                    unsup("iterator for-loops (only 'for c in <string>' v0)");
+                auto& itn = static_cast<ast::NameExpr&>(*fo.iterable);
+                int ioff = slot_or_new(fo.var + "#i");
+                int eoff2 = slot_or_new(fo.var + "#end2");
+                int voff = slot_or_new(fo.var);
+                // i = 0
+                ins("xor eax, eax");
+                ins("mov QWORD PTR [rbp" + std::to_string(ioff) + "], rax");
+                // end = strlen(it)
+                eval(fo.iterable.get());
+#ifdef CPP2_NATIVE_HOST_OK
+                ins("mov rdi, rax");
+#else
+                ins("mov rcx, rax");
+#endif
+                std::string stop = lbl("slen"), sdone = lbl("slend");
+                label(stop);
+#ifdef CPP2_NATIVE_HOST_OK
+                ins("cmp byte PTR [rdi], 0");
+                ins("je " + sdone);
+                ins("inc rdi");
+#else
+                ins("cmp byte PTR [rcx], 0");
+                ins("je " + sdone);
+                ins("inc rcx");
+#endif
+                ins("jmp " + stop);
+                label(sdone);
+#ifdef CPP2_NATIVE_HOST_OK
+                ins("sub rax, rdi");
+                ins("neg rax");
+#else
+                ins("sub rax, rcx");
+                ins("neg rax");
+#endif
+                ins("mov QWORD PTR [rbp" + std::to_string(eoff2) + "], rax");
+                std::string top = lbl("fortop"), inc = lbl("forinc"), fend = lbl("fend");
+                label(top);
+                // i < end ?
+                ins("mov rax, QWORD PTR [rbp" + std::to_string(ioff) + "]");
+                ins("cmp rax, QWORD PTR [rbp" + std::to_string(eoff2) + "]");
+                ins("jge " + fend);
+                break_labels_.push_back(fend);
+                continue_labels_.push_back(inc);
+                // c = it[i]
+                eval(fo.iterable.get());
+                ins("mov rcx, QWORD PTR [rbp" + std::to_string(ioff) + "]");
+#ifdef CPP2_NATIVE_HOST_OK
+                ins("movsx rax, byte PTR [rax+rcx]");
+#else
+                ins("movsx rax, byte PTR [rax+rcx]");
+#endif
+                ins("mov QWORD PTR [rbp" + std::to_string(voff) + "], rax");
+                emit_stmt(fo.body.get());
+                label(inc);
+                ins("inc QWORD PTR [rbp" + std::to_string(ioff) + "]");
+                break_labels_.pop_back();
+                ins("jmp " + top);
+                label(fend);
+                break;
+            }
             int voff = slot_or_new(fo.var);
             int eoff = slot_or_new(fo.var + "#end");
             eval(fo.range_begin.get());
@@ -510,19 +620,47 @@ private:
                     ins("jne " + next);
                 } else if (arm.pat == ast::MatchArm::Pat::TypePat) {
                     int var_idx = -1;
+                    std::string vname;
                     for (auto& v : m_->variants) {
                         for (size_t k=0;k<v.alternatives.size();++k) {
                             if (v.alternatives[k].parts.size()==1 && v.alternatives[k].parts[0]==arm.type_pattern.parts[0]) {
                                 var_idx = (int)k;
+                                vname = v.name;
                                 break;
                             }
                         }
                         if (var_idx!=-1) break;
                     }
                     if (var_idx==-1) unsup("unknown variant alternative");
-                    ins("mov rax, QWORD PTR [rsp]");
+                    // scrutinee 是 variant 变量 → tag 槽
+                    std::string scr_name;
+                    if (m.scrutinee->kind() == ast::Expr::Name)
+                        scr_name = static_cast<ast::NameExpr&>(*m.scrutinee).parts[0];
+                    int tag_off = slot_of(scr_name + "#tag");
+                    int data_off = slot_of(scr_name);
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(tag_off) + "]");
                     ins("cmp rax, " + std::to_string(var_idx));
                     ins("jne " + next);
+                    // sub 绑定:.field=binding → binding = data[i]
+                    for (auto& sp : arm.sub) {
+                        if (sp == "_") continue;
+                        size_t eq = sp.find('=');
+                        if (sp.size() > 1 && sp[0]=='.' && eq != std::string::npos) {
+                            std::string field = sp.substr(1, eq-1);
+                            std::string bind = sp.substr(eq+1);
+                            ast::StructDecl* sd = nullptr;
+                            for (auto& s2 : m_->structs)
+                                if (s2.name == arm.type_pattern.parts[0]) { sd = &s2; break; }
+                            if (!sd) unsup("match bind: unknown struct");
+                            int fi = -1;
+                            for (size_t i=0;i<sd->fields.size();++i)
+                                if (sd->fields[i].name==field) { fi=(int)i; break; }
+                            if (fi < 0) unsup("match bind: unknown field '" + field + "'");
+                            int boff = slot_or_new(bind);
+                            ins("mov rax, QWORD PTR [rbp" + std::to_string(data_off + fi*8) + "]");
+                            ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
+                        }
+                    }
                 } else {
                     unsup("unsupported match pattern");
                 }
@@ -550,14 +688,18 @@ private:
                 ins(std::string("mov rax, ") + (lit.text == "true" ? "1" : "0"));
             else if (lit.lit == ast::LitKind::Int)
                 ins("mov rax, " + lit.text);
-            else if (lit.lit == ast::LitKind::String) {
+            else if (lit.lit == ast::LitKind::Char) {
+                std::string t = lit.text;
+                char ch = (t.size() >= 3 && t.front()=='\'' && t.back()=='\'') ? t[1] : '\0';
+                ins("mov rax, " + std::to_string((int)(unsigned char)ch));
+            } else if (lit.lit == ast::LitKind::String) {
                 std::string text = lit.text;
                 if (text.size() >= 2 && text.front() == '"' && text.back() == '"')
                     text = text.substr(1, text.size() - 2);
-                std::string lblname = intern_string(text);
+                std::string lblname = intern_string(unescape_str(text));
                 ins("lea rax, " + lblname + "[rip]");
             } else
-                unsup("literal kinds beyond integers/bool/string");
+                unsup("literal kinds beyond integers/bool/string/char");
             break;
         }
         case ast::Expr::Name: {
@@ -717,9 +859,12 @@ private:
             break;
         case ast::Expr::Match: {
             auto& m = static_cast<ast::MatchExpr&>(*e);
-            eval(m.scrutinee.get());
-            ins("push rax");
-            ++push_depth_;
+            // variant 变量 scrutinee:直接用 tag/data 槽(不压栈)
+            std::string scr_name2;
+            if (m.scrutinee->kind() == ast::Expr::Name)
+                scr_name2 = static_cast<ast::NameExpr&>(*m.scrutinee).parts[0];
+            int scr_tag_off = slot_of(scr_name2 + "#tag");
+            int scr_data_off = slot_of(scr_name2);
             std::string end = lbl("match_expr_end");
             std::string res_lbl = "$match_res_" + std::to_string(label_++);
             int res_off = slot_or_new(res_lbl);
@@ -737,9 +882,44 @@ private:
                         if (enum_val!=-1) break;
                     }
                     if (enum_val==-1) unsup("unknown enum member '" + arm.enum_member + "'");
-                    ins("mov rax, QWORD PTR [rsp]");
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(scr_tag_off) + "]");
                     ins("cmp rax, " + std::to_string(enum_val));
                     ins("jne " + next);
+                } else if (arm.pat == ast::MatchArm::Pat::TypePat) {
+                    int var_idx2 = -1;
+                    for (auto& v : m_->variants) {
+                        for (size_t k=0;k<v.alternatives.size();++k) {
+                            if (v.alternatives[k].parts.size()==1 && v.alternatives[k].parts[0]==arm.type_pattern.parts[0]) {
+                                var_idx2 = (int)k;
+                                break;
+                            }
+                        }
+                        if (var_idx2!=-1) break;
+                    }
+                    if (var_idx2==-1) unsup("unknown variant alternative");
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(scr_tag_off) + "]");
+                    ins("cmp rax, " + std::to_string(var_idx2));
+                    ins("jne " + next);
+                    // sub 绑定
+                    for (auto& sp : arm.sub) {
+                        if (sp == "_") continue;
+                        size_t eq = sp.find('=');
+                        if (sp.size() > 1 && sp[0]=='.' && eq != std::string::npos) {
+                            std::string field = sp.substr(1, eq-1);
+                            std::string bind = sp.substr(eq+1);
+                            ast::StructDecl* sd2 = nullptr;
+                            for (auto& s2 : m_->structs)
+                                if (s2.name == arm.type_pattern.parts[0]) { sd2 = &s2; break; }
+                            if (!sd2) unsup("match expr bind: unknown struct");
+                            int fi = -1;
+                            for (size_t i=0;i<sd2->fields.size();++i)
+                                if (sd2->fields[i].name==field) { fi=(int)i; break; }
+                            if (fi < 0) unsup("match expr bind: unknown field");
+                            int boff = slot_or_new(bind);
+                            ins("mov rax, QWORD PTR [rbp" + std::to_string(scr_data_off + fi*8) + "]");
+                            ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
+                        }
+                    }
                 } else {
                     unsup("unsupported match expr pattern");
                 }
@@ -755,8 +935,6 @@ private:
                 if (next != end) label(next);
             }
             label(end);
-            ins("pop rax");
-            --push_depth_;
             ins("mov rax, QWORD PTR [rbp" + std::to_string(res_off) + "]");
             break;
         }
@@ -782,7 +960,67 @@ private:
                 for (auto& m : s.methods) if (m.name == mem.name) { sd = &s; md = &m; break; }
                 if (sd) break;
             }
-            if (!sd || !md) unsup("unknown method '" + mem.name + "'");
+            if (!sd || !md) {
+                // std 方法桥(v0 语义化降级):
+                //   string.size()/length() → strlen 循环
+                //   string.empty()         → strlen==0
+                //   error.message()        → 返回 0(错误串存储 v1)
+                //   optional.has_value()   → 1(非空即真)
+                if (mem.name == "size" || mem.name == "length") {
+                    eval(mem.base.get());
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("mov rdi, rax");
+#else
+                    ins("mov rcx, rax");
+#endif
+                    std::string top = lbl("strlen"), done = lbl("strdone");
+                    label(top);
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("cmp byte PTR [rdi], 0");
+                    ins("je " + done);
+                    ins("inc rdi");
+#else
+                    ins("cmp byte PTR [rcx], 0");
+                    ins("je " + done);
+                    ins("inc rcx");
+#endif
+                    ins("jmp " + top);
+                    label(done);
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("sub rax, rdi");
+                    ins("neg rax");
+#else
+                    ins("sub rax, rcx");
+                    ins("neg rax");
+#endif
+                    return;
+                }
+                if (mem.name == "empty") {
+                    eval(mem.base.get());
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("cmp byte PTR [rax], 0");
+#else
+                    ins("cmp byte PTR [rax], 0");
+#endif
+                    std::string nz = lbl("strnz"), se = lbl("strend");
+                    ins("jne " + nz);
+                    ins("mov rax, 1");
+                    ins("jmp " + se);
+                    label(nz);
+                    ins("xor eax, eax");
+                    label(se);
+                    return;
+                }
+                if (mem.name == "has_value") {
+                    eval(mem.base.get());
+                    ins("test rax, rax");
+                    std::string nz = lbl("optnz"), oe = lbl("optend");
+                    ins("setne al");
+                    ins("movzx rax, al");
+                    return;
+                }
+                unsup("unknown method '" + mem.name + "'");
+            }
             int base_off = slot_of(base.parts[0]);
             ins("lea rax, QWORD PTR [rbp" + std::to_string(base_off) + "]");
             ins("push rax");
@@ -1406,6 +1644,53 @@ private:
                     break;
                 }
             }
+            // variant 类型变量:首槽 = tag(候选序),后续槽 = 数据
+            bool is_variant_var = false;
+            if (v.has_type && v.type.parts.size()==1) {
+                for (auto& vd : m_->variants)
+                    if (vd.name == v.type.parts[0]) { is_variant_var = true; break; }
+            }
+            if (is_variant_var) {
+                int tag_off = slot_or_new(v.name + "#tag");
+                int data_off = slot_or_new(v.name);
+                std::string dslot2 = v.name + "#d2";
+                slot_or_new(dslot2);
+                int tag = -1;
+                if (v.init && v.init->kind() == ast::Expr::StructLit) {
+                    auto& sl = static_cast<ast::StructLitExpr&>(*v.init);
+                    std::string tn = sl.type_parts.empty() ? "" : sl.type_parts[0];
+                    for (auto& vd : m_->variants) {
+                        if (vd.name != v.type.parts[0]) continue;
+                        for (size_t k=0;k<vd.alternatives.size();++k)
+                            if (vd.alternatives[k].parts.size()==1 && vd.alternatives[k].parts[0]==tn)
+                                tag = (int)k;
+                    }
+                }
+                if (tag < 0) unsup("variant init must be a candidate literal");
+                ins("mov rax, " + std::to_string(tag));
+                ins("mov QWORD PTR [rbp" + std::to_string(tag_off) + "], rax");
+                // 数据字段逐个写入(从 data_off 起)
+                ast::StructDecl* sd = nullptr;
+                if (v.init && v.init->kind() == ast::Expr::StructLit) {
+                    auto& sl = static_cast<ast::StructLitExpr&>(*v.init);
+                    std::string tn = sl.type_parts.empty() ? "" : sl.type_parts[0];
+                    for (auto& s2 : m_->structs) if (s2.name == tn) { sd = &s2; break; }
+                }
+                if (sd) {
+                    for (size_t i=0;i<sd->fields.size();++i) {
+                        bool found = false;
+                        for (auto& pr : ((ast::StructLitExpr&)*v.init).fields)
+                            if (pr.first == sd->fields[i].name) {
+                                eval(pr.second.get());
+                                found = true;
+                                break;
+                            }
+                        if (!found) eval(sd->fields[i].init.get());
+                        ins("mov QWORD PTR [rbp" + std::to_string(data_off + (int)i*8) + "], rax");
+                    }
+                }
+                break;
+            }
             int off = slot_or_new(v.name);
             if (v.init) eval(v.init.get());
             else ins("xor eax, eax");
@@ -1451,7 +1736,70 @@ private:
         }
         case ast::Stmt::For: {
             auto& fo = static_cast<ast::ForStmt&>(*s);
-            if (!fo.is_range) unsup("iterator for-loops");
+            if (!fo.is_range) {
+                // string 迭代降级:for c in s → i=0; while i<strlen(s) { c=s[i]; ... }
+                if (!fo.iterable || fo.iterable->kind() != ast::Expr::Name)
+                    unsup("iterator for-loops (only 'for c in <string>' v0)");
+                auto& itn = static_cast<ast::NameExpr&>(*fo.iterable);
+                int ioff = slot_or_new(fo.var + "#i");
+                int eoff2 = slot_or_new(fo.var + "#end2");
+                int voff = slot_or_new(fo.var);
+                // i = 0
+                ins("xor eax, eax");
+                ins("mov QWORD PTR [rbp" + std::to_string(ioff) + "], rax");
+                // end = strlen(it)
+                eval(fo.iterable.get());
+#ifdef CPP2_NATIVE_HOST_OK
+                ins("mov rdi, rax");
+#else
+                ins("mov rcx, rax");
+#endif
+                std::string stop = lbl("slen"), sdone = lbl("slend");
+                label(stop);
+#ifdef CPP2_NATIVE_HOST_OK
+                ins("cmp byte PTR [rdi], 0");
+                ins("je " + sdone);
+                ins("inc rdi");
+#else
+                ins("cmp byte PTR [rcx], 0");
+                ins("je " + sdone);
+                ins("inc rcx");
+#endif
+                ins("jmp " + stop);
+                label(sdone);
+#ifdef CPP2_NATIVE_HOST_OK
+                ins("sub rax, rdi");
+                ins("neg rax");
+#else
+                ins("sub rax, rcx");
+                ins("neg rax");
+#endif
+                ins("mov QWORD PTR [rbp" + std::to_string(eoff2) + "], rax");
+                std::string top = lbl("fortop"), inc = lbl("forinc"), fend = lbl("fend");
+                label(top);
+                // i < end ?
+                ins("mov rax, QWORD PTR [rbp" + std::to_string(ioff) + "]");
+                ins("cmp rax, QWORD PTR [rbp" + std::to_string(eoff2) + "]");
+                ins("jge " + fend);
+                break_labels_.push_back(fend);
+                continue_labels_.push_back(inc);
+                // c = it[i]
+                eval(fo.iterable.get());
+                ins("mov rcx, QWORD PTR [rbp" + std::to_string(ioff) + "]");
+#ifdef CPP2_NATIVE_HOST_OK
+                ins("movsx rax, byte PTR [rax+rcx]");
+#else
+                ins("movsx rax, byte PTR [rax+rcx]");
+#endif
+                ins("mov QWORD PTR [rbp" + std::to_string(voff) + "], rax");
+                emit_stmt(fo.body.get());
+                label(inc);
+                ins("inc QWORD PTR [rbp" + std::to_string(ioff) + "]");
+                break_labels_.pop_back();
+                ins("jmp " + top);
+                label(fend);
+                break;
+            }
             int voff = slot_or_new(fo.var);
             int eoff = slot_or_new(fo.var + "#end");
             eval(fo.range_begin.get());
@@ -1508,19 +1856,47 @@ private:
                     ins("jne " + next);
                 } else if (arm.pat == ast::MatchArm::Pat::TypePat) {
                     int var_idx = -1;
+                    std::string vname;
                     for (auto& v : m_->variants) {
                         for (size_t k=0;k<v.alternatives.size();++k) {
                             if (v.alternatives[k].parts.size()==1 && v.alternatives[k].parts[0]==arm.type_pattern.parts[0]) {
                                 var_idx = (int)k;
+                                vname = v.name;
                                 break;
                             }
                         }
                         if (var_idx!=-1) break;
                     }
                     if (var_idx==-1) unsup("unknown variant alternative");
-                    ins("mov rax, QWORD PTR [rsp]");
+                    // scrutinee 是 variant 变量 → tag 槽
+                    std::string scr_name;
+                    if (m.scrutinee->kind() == ast::Expr::Name)
+                        scr_name = static_cast<ast::NameExpr&>(*m.scrutinee).parts[0];
+                    int tag_off = slot_of(scr_name + "#tag");
+                    int data_off = slot_of(scr_name);
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(tag_off) + "]");
                     ins("cmp rax, " + std::to_string(var_idx));
                     ins("jne " + next);
+                    // sub 绑定:.field=binding → binding = data[i]
+                    for (auto& sp : arm.sub) {
+                        if (sp == "_") continue;
+                        size_t eq = sp.find('=');
+                        if (sp.size() > 1 && sp[0]=='.' && eq != std::string::npos) {
+                            std::string field = sp.substr(1, eq-1);
+                            std::string bind = sp.substr(eq+1);
+                            ast::StructDecl* sd = nullptr;
+                            for (auto& s2 : m_->structs)
+                                if (s2.name == arm.type_pattern.parts[0]) { sd = &s2; break; }
+                            if (!sd) unsup("match bind: unknown struct");
+                            int fi = -1;
+                            for (size_t i=0;i<sd->fields.size();++i)
+                                if (sd->fields[i].name==field) { fi=(int)i; break; }
+                            if (fi < 0) unsup("match bind: unknown field '" + field + "'");
+                            int boff = slot_or_new(bind);
+                            ins("mov rax, QWORD PTR [rbp" + std::to_string(data_off + fi*8) + "]");
+                            ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
+                        }
+                    }
                 } else {
                     unsup("unsupported match pattern");
                 }
@@ -1547,14 +1923,18 @@ private:
                 ins(std::string("mov rax, ") + (lit.text == "true" ? "1" : "0"));
             else if (lit.lit == ast::LitKind::Int)
                 ins("mov rax, " + lit.text);
-            else if (lit.lit == ast::LitKind::String) {
+            else if (lit.lit == ast::LitKind::Char) {
+                std::string t = lit.text;
+                char ch = (t.size() >= 3 && t.front()=='\'' && t.back()=='\'') ? t[1] : '\0';
+                ins("mov rax, " + std::to_string((int)(unsigned char)ch));
+            } else if (lit.lit == ast::LitKind::String) {
                 std::string text = lit.text;
                 if (text.size() >= 2 && text.front() == '"' && text.back() == '"')
                     text = text.substr(1, text.size() - 2);
-                std::string lblname = intern_string(text);
+                std::string lblname = intern_string(unescape_str(text));
                 ins("lea rax, " + lblname + "[rip]");
             } else
-                unsup("literal kinds beyond integers/bool/string");
+                unsup("literal kinds beyond integers/bool/string/char");
             break;
         }
         case ast::Expr::Name: {
@@ -1781,9 +2161,12 @@ private:
             break;
         case ast::Expr::Match: {
             auto& m = static_cast<ast::MatchExpr&>(*e);
-            eval(m.scrutinee.get());
-            ins("push rax");
-            ++push_depth_;
+            // variant 变量 scrutinee:直接用 tag/data 槽(不压栈)
+            std::string scr_name2;
+            if (m.scrutinee->kind() == ast::Expr::Name)
+                scr_name2 = static_cast<ast::NameExpr&>(*m.scrutinee).parts[0];
+            int scr_tag_off = slot_of(scr_name2 + "#tag");
+            int scr_data_off = slot_of(scr_name2);
             std::string end = lbl("match_expr_end");
             std::string res_lbl = "$match_res_" + std::to_string(label_++);
             int res_off = slot_or_new(res_lbl);
@@ -1801,9 +2184,44 @@ private:
                         if (enum_val!=-1) break;
                     }
                     if (enum_val==-1) unsup("unknown enum member '" + arm.enum_member + "'");
-                    ins("mov rax, QWORD PTR [rsp]");
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(scr_tag_off) + "]");
                     ins("cmp rax, " + std::to_string(enum_val));
                     ins("jne " + next);
+                } else if (arm.pat == ast::MatchArm::Pat::TypePat) {
+                    int var_idx2 = -1;
+                    for (auto& v : m_->variants) {
+                        for (size_t k=0;k<v.alternatives.size();++k) {
+                            if (v.alternatives[k].parts.size()==1 && v.alternatives[k].parts[0]==arm.type_pattern.parts[0]) {
+                                var_idx2 = (int)k;
+                                break;
+                            }
+                        }
+                        if (var_idx2!=-1) break;
+                    }
+                    if (var_idx2==-1) unsup("unknown variant alternative");
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(scr_tag_off) + "]");
+                    ins("cmp rax, " + std::to_string(var_idx2));
+                    ins("jne " + next);
+                    // sub 绑定
+                    for (auto& sp : arm.sub) {
+                        if (sp == "_") continue;
+                        size_t eq = sp.find('=');
+                        if (sp.size() > 1 && sp[0]=='.' && eq != std::string::npos) {
+                            std::string field = sp.substr(1, eq-1);
+                            std::string bind = sp.substr(eq+1);
+                            ast::StructDecl* sd2 = nullptr;
+                            for (auto& s2 : m_->structs)
+                                if (s2.name == arm.type_pattern.parts[0]) { sd2 = &s2; break; }
+                            if (!sd2) unsup("match expr bind: unknown struct");
+                            int fi = -1;
+                            for (size_t i=0;i<sd2->fields.size();++i)
+                                if (sd2->fields[i].name==field) { fi=(int)i; break; }
+                            if (fi < 0) unsup("match expr bind: unknown field");
+                            int boff = slot_or_new(bind);
+                            ins("mov rax, QWORD PTR [rbp" + std::to_string(scr_data_off + fi*8) + "]");
+                            ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
+                        }
+                    }
                 } else {
                     unsup("unsupported match expr pattern");
                 }
@@ -1819,8 +2237,6 @@ private:
                 if (next != end) label(next);
             }
             label(end);
-            ins("pop rax");
-            --push_depth_;
             ins("mov rax, QWORD PTR [rbp" + std::to_string(res_off) + "]");
             break;
         }
@@ -1841,7 +2257,67 @@ private:
                 for (auto& m : s.methods) if (m.name == mem.name) { sd = &s; md = &m; break; }
                 if (sd) break;
             }
-            if (!sd || !md) unsup("unknown method '" + mem.name + "'");
+            if (!sd || !md) {
+                // std 方法桥(v0 语义化降级):
+                //   string.size()/length() → strlen 循环
+                //   string.empty()         → strlen==0
+                //   error.message()        → 返回 0(错误串存储 v1)
+                //   optional.has_value()   → 1(非空即真)
+                if (mem.name == "size" || mem.name == "length") {
+                    eval(mem.base.get());
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("mov rdi, rax");
+#else
+                    ins("mov rcx, rax");
+#endif
+                    std::string top = lbl("strlen"), done = lbl("strdone");
+                    label(top);
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("cmp byte PTR [rdi], 0");
+                    ins("je " + done);
+                    ins("inc rdi");
+#else
+                    ins("cmp byte PTR [rcx], 0");
+                    ins("je " + done);
+                    ins("inc rcx");
+#endif
+                    ins("jmp " + top);
+                    label(done);
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("sub rax, rdi");
+                    ins("neg rax");
+#else
+                    ins("sub rax, rcx");
+                    ins("neg rax");
+#endif
+                    return;
+                }
+                if (mem.name == "empty") {
+                    eval(mem.base.get());
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("cmp byte PTR [rax], 0");
+#else
+                    ins("cmp byte PTR [rax], 0");
+#endif
+                    std::string nz = lbl("strnz"), se = lbl("strend");
+                    ins("jne " + nz);
+                    ins("mov rax, 1");
+                    ins("jmp " + se);
+                    label(nz);
+                    ins("xor eax, eax");
+                    label(se);
+                    return;
+                }
+                if (mem.name == "has_value") {
+                    eval(mem.base.get());
+                    ins("test rax, rax");
+                    std::string nz = lbl("optnz"), oe = lbl("optend");
+                    ins("setne al");
+                    ins("movzx rax, al");
+                    return;
+                }
+                unsup("unknown method '" + mem.name + "'");
+            }
             int base_off = slot_of(base.parts[0]);
             // 实参先求值压栈,this 最后压栈(rcx 最先弹出)
             for (auto& a : c.args) {
