@@ -113,12 +113,9 @@ int cmd_build(std::vector<std::string> const& args)
     // ── native 后端(P1 原型):单模块整数子集 → x86-64 汇编 ──
     if (native_backend) {
         if (g.order.size() != 1) {
-            std::cerr << "[cpp2] native backend: multi-module program"
-                      << " -> falling back to headers transpile backend\n";
-            backend = "headers";
-            headers_backend = true;
-            native_backend = false;
-            build_dir = in.parent_path() / ".cpp2build" / "hdr";
+            std::cerr << "[cpp2] native backend error: multi-module program not supported in native v0 (only single module)\n";
+            std::cerr << "native compilation failed (no fallback)\n";
+            return 1;
         } else {
             try {
 #ifdef _WIN32
@@ -196,14 +193,9 @@ int cmd_build(std::vector<std::string> const& args)
                 return 0;
 #endif
             } catch (std::exception const& e) {
-                std::cerr << "[cpp2] native backend unavailable (" << e.what()
-                          << ") -> falling back to headers transpile backend\n";
-                backend = "headers";
-                headers_backend = true;
-                native_backend = false;
-                build_dir = in.parent_path() / ".cpp2build" / "hdr";
-                obj_dir = build_dir / "obj";
-                fs::create_directories(obj_dir);
+                std::cerr << "[cpp2] native backend error: " << e.what() << "\n";
+                std::cerr << "native compilation failed (no fallback; use --backend=headers for transpilation)\n";
+                return 1;
             }
         }
     }

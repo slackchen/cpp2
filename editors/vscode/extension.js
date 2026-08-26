@@ -384,12 +384,14 @@ async function runInTerminal(title, args, cwd, uri) {
 async function cmdRun(uri) {
     uri = uri || (vscode.window.activeTextEditor && vscode.window.activeTextEditor.document.uri);
     if (!uri) return;
-    await runInTerminal("C++2 Run", ["run", uri.fsPath], path.dirname(uri.fsPath), uri);
+    // 默认 native 后端(零 g++;Unsupported 自动回退 headers)
+    await runInTerminal("C++2 Run", ["run", uri.fsPath, "--backend=native"], path.dirname(uri.fsPath), uri);
 }
 async function cmdBuild(uri) {
     uri = uri || (vscode.window.activeTextEditor && vscode.window.activeTextEditor.document.uri);
     if (!uri) return;
-    await runInTerminal("C++2 Build", ["build", uri.fsPath], path.dirname(uri.fsPath), uri);
+    // 默认 native;构建产物与 headers 隔离(.cpp2build/native)
+    await runInTerminal("C++2 Build", ["build", uri.fsPath, "--backend=native"], path.dirname(uri.fsPath), uri);
 }
 async function cmdCheck() {
     const ed = vscode.window.activeTextEditor;

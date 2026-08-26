@@ -24,6 +24,55 @@
 #include "cpp2/arena.hpp"                   // M6:arena / arena_ptr
 #include "cpp2/gc.hpp"                      // M6:可选保守式 GC
 
+// ── cpp2_write:std/io 的零 CRT 输出原语(std 自立;跨平台在此收口)────
+// 全局域 + C 链接:与 std/io.cpp2 的 extern "C" 声明精确对齐。
+// std/io.cpp2 仅声明此符号,平台分派集中在本函数:
+//   Windows → kernel32!GetStdHandle + WriteFile(不经 msvcrt)
+//   POSIX   → unistd write()
+// native 后端不落此处:PE 由 kernel32 IAT + 手编 thunk 直供同名符号,
+// ELF(规划)由 syscall 指令对等实现 —— 语言面保持平台中立。
+#if defined(_WIN32)
+extern "C" __declspec(dllimport) void* __stdcall GetStdHandle(unsigned);
+extern "C" __declspec(dllimport) int __stdcall WriteFile(
+    void*, void const*, unsigned long, unsigned long*, void*);
+extern "C" [[noreturn]] void __stdcall ExitProcess(unsigned);
+#else
+#include <unistd.h>
+#endif
+extern "C" inline void cpp2_write(char const* s, int n)
+#if defined(_WIN32)
+{
+    unsigned long written = 0;
+    WriteFile(GetStdHandle((unsigned)-11), s, (unsigned long)n, &written, nullptr);
+}
+#else
+{
+    (void)!::write(1, s, (size_t)n);
+}
+#endif
+
+extern "C" inline void cpp2_write_char(char c)
+#if defined(_WIN32)
+{
+    cpp2_write(&c, 1);
+}
+#else
+{
+    cpp2_write(&c, 1);
+}
+#endif
+
+extern "C" [[noreturn]] inline void cpp2_exit(int code)
+#if defined(_WIN32)
+{
+    ExitProcess((unsigned)code);
+}
+#else
+{
+    ::_exit(code);
+}
+#endif
+
 namespace cpp2 {
 
 // ── trap:检查失败的统一终止行为(DESIGN §6)────────────────────────
@@ -82,10 +131,14 @@ inline T checked_mul(T a, T b, char const* file = "", int line = 0)
 #if defined(CPP2_HAS_BUILTIN_OVERFLOW)
     if (__builtin_mul_overflow(a, b, &r)) { trap("integer overflow", file, line); }
 #else
+    constexpr T mx = std::numeric_limits<T>::max();
+    constexpr T mn = std::numeric_limits<T>::min();
     if (a > 0) {
-        if (b > std::numeric_limits<T>::max() / a) { trap("integer overflow", file, line); }
+        if (b > 0) { if (b > mx / a) trap("integer overflow", file, line); }
+        else       { if (b < mn / a) trap("integer overflow", file, line); }
     } else if (a < 0) {
-        if (b < std::numeric_limits<T>::min() / a) { trap("integer overflow", file, line); }
+        if (b > 0) { if (a < mn / b) trap("integer overflow", file, line); }
+        else if (b < 0) { if (a < mx / b) trap("integer overflow", file, line); }
     }
     r = static_cast<T>(a * b);
 #endif

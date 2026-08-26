@@ -454,6 +454,20 @@ private:
              + "), static_cast<" + t + ">(" + expr(r) + ")" + check_loc(line) + ")";
     }
 
+    // ── builtin 原语 → headers(rt cpp2)实现表 ─────────────────────
+    // 单一登记点 = 语言面↔rt 的契约。native 侧对应表在 native.cpp
+    // (机器码/thunk);新增原语需两表同步 + rt 实现。
+    static std::string const* builtin_rt_name(std::string const& n)
+    {
+        static std::unordered_map<std::string, std::string> const map{
+            {"write_stdout", "cpp2_write"},        // (const char*, int)
+            {"write_char",   "cpp2_write_char"},   // (char)
+            {"sys_exit",     "cpp2_exit"},         // (int)
+        };
+        auto it = map.find(n);
+        return it != map.end() ? &it->second : nullptr;
+    }
+
     // ── 表达式 ─────────────────────────────────────────────────────
     std::string expr(ast::Expr& e)
     {
@@ -498,6 +512,19 @@ private:
                     for (auto& a : c.args) s += ", " + expr(*a);
                     return s + ")";
                 }
+            }
+            // builtin 原语调用 → rt 实现(见 builtin_rt_name 表)
+            if (c.callee->kind() == ast::Expr::Name) {
+                auto& nm0 = static_cast<ast::NameExpr&>(*c.callee);
+                if (!nm0.qualified())
+                    if (auto* rt = builtin_rt_name(nm0.parts[0])) {
+                        std::string s = *rt + "(";
+                        for (size_t i = 0; i < c.args.size(); ++i) {
+                            if (i) s += ", ";
+                            s += expr(*c.args[i]);
+                        }
+                        return s + ")";
+                    }
             }
             std::string s = expr(*c.callee) + "(";
             for (size_t i = 0; i < c.args.size(); ++i) {
@@ -1552,6 +1579,21 @@ private:
     void emit_prototype(ast::FuncDecl& f, std::string const& prefix = "")
     {
         sync_line(f.line);
+        // builtin 原语:无原型(调用点由 emit_call 按表降到 rt/后端实现)
+        if (f.builtin) return;
+        // 无体声明分两类:
+        //   extern "C" 前缀(c_linkage)→ C 链接裸参数,链接期由系统 CRT/OS 解析
+        //   普通无体声明 → C++ 链接原型,与 cxx_legacy 块内定义配对(M6)
+        if (f.is_extern && f.c_linkage) {
+            std::string rt = f.ret ? type_str(*f.ret) : "void";
+            std::string ps;
+            for (size_t i = 0; i < f.params.size(); ++i) {
+                if (i) ps += ", ";
+                ps += type_str(f.params[i].type) + " " + f.params[i].name;
+            }
+            out_ += prefix + "extern \"C\" " + rt + " " + f.name + "(" + ps + ");\n";
+            return;
+        }
         std::unordered_set<std::string> tp;
         for (auto& t : f.type_params) tp.insert(t.name);
         generic_params_ = f.type_params.empty() ? nullptr : &tp;

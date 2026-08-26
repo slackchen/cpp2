@@ -47,6 +47,9 @@ private:
     // 否则 `if x { }` / `for e in items { }` 会被吞掉块括号
     bool cond_like_ = false;
     bool lenient_semi_ = false;             // if 表达式体作用域:块尾裸值免分号
+    bool c_linkage_ = false;                // extern "C" 前缀:当前声明为 C 链接外部符号
+    bool pending_builtin_ = false;          // builtin 前缀:当前声明为编译器内建原语
+    size_t decl_start_ = 0;                 // extern "C" 回溯锚点(非函数声明时还原)
     // 递归深度防护:fuzz/畸形输入下递归下降会爆栈(M4);
     // 超限按语法错误报告,而不是进程崩溃
     static constexpr int kMaxDepth = 200;
@@ -188,8 +191,26 @@ private:
             advance();
             return;
         }
-        if (!check(lex::Tok::Ident)) err("expected a declaration (name: kind = value)");
+
+        // extern "C" name: ... — C 链接外部符号(cxx_legacy 配对等)
+        // builtin name: ...   — 编译器内建原语(std 专用;后端直接实现,不发原型)
+        c_linkage_ = false;
+        pending_builtin_ = false;
+        decl_start_ = i_;
+        if (peek().tok == lex::Tok::Ident && peek().text == "extern"
+            && peek(1).tok == lex::Tok::StringLit && peek(1).text == "\"C\"") {
+            advance(); advance();
+            c_linkage_ = true;
+        }
+        else if (peek().tok == lex::Tok::Ident && peek().text == "builtin"
+                 && peek(1).tok == lex::Tok::Ident && peek(2).tok == lex::Tok::Colon) {
+            advance();
+            pending_builtin_ = true;
+        }
+        if (!check(lex::Tok::Ident)) { i_ = decl_start_; c_linkage_ = false;
+            err("expected a declaration (name: kind = value)"); }
         if (peek(1).tok != lex::Tok::Colon) {
+            if (c_linkage_) { i_ = decl_start_; c_linkage_ = false; }
             err("expected ':' after declaration name");
         }
 
@@ -483,11 +504,15 @@ private:
         parse_requires(f.requires_list);
 
         // 无体声明(M6 互操作):name: (params) -> ret;
-        // 外部符号(legacy 块 / Cpp1 库),仅发射原型,体按 C++ 规则解析
+        // extern "C" 前缀(见 top_decl)→ C 链接;否则 C++ 链接(cxx_legacy 配对)
         if (accept(lex::Tok::Semi)) {
             if (f.pre || f.post)
                 err("extern declaration cannot have pre/post contracts");
             f.is_extern = true;
+            f.c_linkage = c_linkage_;
+            f.builtin = pending_builtin_;
+            if (pending_builtin_ && !f.is_extern)
+                err("builtin requires a bodiless declaration");
             m.funcs.push_back(std::move(f));
             return;
         }

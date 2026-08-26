@@ -18,6 +18,28 @@ namespace cpp2::native {
 
 [[noreturn]] void unsup(std::string const& msg) { throw Unsupported(msg); }
 
+// 源码级转义 → 真实字节(rodata 存真实字节;发射时 emit_rodata 再转义)
+static std::string unescape_str(std::string const& in)
+{
+    std::string out;
+    for (size_t i = 0; i < in.size(); ++i) {
+        if (in[i] == '\\' && i + 1 < in.size()) {
+            char c = in[++i];
+            switch (c) {
+            case 'n': out += '\n'; break;
+            case 't': out += '\t'; break;
+            case '\\': out += '\\'; break;
+            case '"': out += '"'; break;
+            case '0': out += '\0'; break;
+            default: out += c; break;
+            }
+        } else {
+            out += in[i];
+        }
+    }
+    return out;
+}
+
 bool is_int_kind(sema::Type::Kind k)
 {
     switch (k) {
@@ -65,6 +87,7 @@ private:
     int label_ = 0;
     int push_depth_ = 0;
     ast::FuncDecl* cur_fn_ = nullptr;
+    std::string cur_sym_name_;      // 当前发射符号(func 或 Struct_method)
     std::unordered_map<std::string, int> slots_;
     std::vector<std::string> break_labels_;
     std::vector<std::string> continue_labels_;
@@ -123,7 +146,11 @@ private:
         for (auto& s : m_->structs) {
             for (auto& f : s.fields) {
                 auto k = scalar_kind(f.type);
-                if (!is_int_kind(k)) unsup("struct field '" + f.name + "' must be int");
+                bool ok = is_int_kind(k);
+                // string/double 字段:8B 槽存指针/位模式(v0 值语义)
+                if (!ok && f.type.parts.size()==1
+                    && (f.type.parts[0]=="string" || f.type.parts[0]=="double")) ok = true;
+                if (!ok) unsup("struct field '" + f.name + "' must be int/string/double");
             }
         }
         // enum 允许：底层 int，成员按 0..n-1 分配（与 C++ enum class 一致）
@@ -237,6 +264,7 @@ private:
     void emit_func(ast::FuncDecl& f)
     {
         cur_fn_ = &f;
+        cur_sym_name_ = f.name;
         slots_.clear();
         push_depth_ = 0;
 
@@ -280,6 +308,7 @@ private:
         std::cerr << "[native] emit_method " << s.name << "_" << m.name << std::endl;
         std::string mname = s.name + "_" + m.name;
         cur_fn_ = nullptr;
+        cur_sym_name_ = mname;
         slots_.clear();
         push_depth_ = 0;
         slots_["this"] = -(8 * 1);
@@ -388,7 +417,7 @@ private:
             auto& r = static_cast<ast::ReturnStmt&>(*s);
             if (r.value) eval(r.value.get());
             else ins("xor eax, eax");
-            ins("jmp .Lret_" + cur_fn_->name);
+            ins("jmp .Lret_" + (cur_fn_ ? cur_fn_->name : cur_sym_name_));
             break;
         }
         case ast::Stmt::If: {
@@ -634,7 +663,13 @@ private:
                 else if (lop == ">>") { ins("xchg rax, rcx"); ins("sar rax, cl"); }
                 else unsup("compound assignment '" + a.op + "'");
             }
-            ins("mov QWORD PTR [rbp" + std::to_string(off) + "], rax");
+            if (via_this) {
+                ins("pop rcx");
+                --push_depth_;
+                ins("mov QWORD PTR [rcx], rax");
+            } else {
+                ins("mov QWORD PTR [rbp" + std::to_string(off) + "], rax");
+            }
             break;
         }
         case ast::Expr::Member: {
@@ -786,6 +821,62 @@ private:
             unsup("indirect calls");
         }
         auto& nm = static_cast<ast::NameExpr&>(*c.callee);
+        // builtin 原语 → native 机器码实现(headers 侧对应表见 emit.cpp
+        // builtin_rt_name)。PE: cpp2_write=thunk 符号、write_char=rodata
+        // 单字符池、sys_exit=kernel32 IAT。ELF 规划: syscall 序列。
+        if (!nm.qualified()) {
+            std::string const& bn = nm.parts[0];
+            bool declared_builtin = false;
+            for (auto& f : m_->funcs)
+                if (f.name == bn && f.builtin) { declared_builtin = true; break; }
+            if (declared_builtin) {
+                if (bn == "write_stdout") {
+                    auto* lit = dynamic_cast<ast::LiteralExpr*>(c.args[0].get());
+                    if (!(lit && lit->lit == ast::LitKind::String))
+                        unsup("native write_stdout v0: buf must be a string literal");
+                    std::string raw = lit->text;
+                    std::string text = unescape_str(raw);                    std::string lbl = intern_string(text);
+                    int len = (int)text.size();
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("lea rdi, " + lbl + "[rip]");
+                    ins("mov esi, " + std::to_string(len));
+#else
+                    ins("lea rcx, " + lbl + "[rip]");
+                    ins("mov edx, " + std::to_string(len));
+#endif
+                    ins("call cpp2_write");
+                    return;
+                }
+                if (bn == "write_char") {
+                    auto* lit = dynamic_cast<ast::LiteralExpr*>(c.args[0].get());
+                    if (!(lit && lit->lit == ast::LitKind::Char))
+                        unsup("native write_char v0: char literal only");
+                    std::string t = lit->text;
+                    char ch = (t.size() >= 3 && t.front()=='\'' && t.back()=='\'')
+                            ? t[1] : '\0';
+                    std::string lbl = intern_string(std::string(1, ch));
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("lea rdi, " + lbl + "[rip]");
+                    ins("mov esi, 1");
+#else
+                    ins("lea rcx, " + lbl + "[rip]");
+                    ins("mov edx, 1");
+#endif
+                    ins("call cpp2_write");
+                    return;
+                }
+                if (bn == "sys_exit") {
+                    eval(c.args[0].get());
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("mov edi, eax");
+#else
+                    ins("mov ecx, eax");
+#endif
+                    ins("call sys_exit");
+                    return;
+                }
+            }
+        }
         if (nm.qualified() && nm.parts[0] == "std"
             && (nm.parts[1] == "println" || nm.parts[1] == "print")) {
             emit_printf(c, nm.parts[1] == "println");
@@ -959,15 +1050,28 @@ private:
                 if (b.op == "==") j = "je";  else if (b.op == "!=") j = "jne";
                 else if (b.op == "<") j = "jl"; else if (b.op == ">") j = "jg";
                 else if (b.op == "<=") j = "jle"; else j = "jge";
-                ins(j + " " + t_true);
-                ins("jmp " + t_false);
+                static std::unordered_map<std::string,std::string> const inv{
+                    {"je","jne"},{"jne","je"},{"jl","jge"},{"jg","jle"},
+                    {"jle","jl"},{"jge","jl"}};
+                auto ji = inv.find(j);
+                std::string jinv = (ji != inv.end()) ? ji->second : ("n" + j);
+                if (!t_true.empty()) {
+                    ins(j + " " + t_true);
+                    if (!t_false.empty()) ins("jmp " + t_false);
+                } else if (!t_false.empty()) {
+                    ins(jinv + " " + t_false);
+                }
                 return;
             }
         }
         eval(e);
         ins("cmp rax, 0");
-        ins("jne " + t_true);
-        ins("jmp " + t_false);
+        if (!t_true.empty()) {
+            ins("jne " + t_true);
+            if (!t_false.empty()) ins("jmp " + t_false);
+        } else if (!t_false.empty()) {
+            ins("je " + t_false);
+        }
     }
 };
 
@@ -1011,6 +1115,7 @@ private:
     int label_ = 0;
     int push_depth_ = 0;
     ast::FuncDecl* cur_fn_ = nullptr;
+    std::string cur_sym_name_;      // 当前发射符号(func 或 Struct_method)
     std::unordered_map<std::string, int> slots_;
     std::vector<std::string> break_labels_;
     std::vector<std::string> continue_labels_;
@@ -1068,7 +1173,11 @@ private:
         for (auto& s : m_->structs) {
             for (auto& f : s.fields) {
                 auto k = scalar_kind(f.type);
-                if (!is_int_kind(k)) unsup("struct field '" + f.name + "' must be int");
+                bool ok = is_int_kind(k);
+                // string/double 字段:8B 槽存指针/位模式(v0 值语义)
+                if (!ok && f.type.parts.size()==1
+                    && (f.type.parts[0]=="string" || f.type.parts[0]=="double")) ok = true;
+                if (!ok) unsup("struct field '" + f.name + "' must be int/string/double");
             }
         }
         // enum 允许：底层 int，成员按 0..n-1 分配（与 C++ enum class 一致）
@@ -1090,14 +1199,9 @@ private:
 
     void check_func(ast::FuncDecl& f)
     {
-        if (f.throws) unsup("throws functions ('" + f.name + "')");
-        if (f.pre || f.post) unsup("contracts on '" + f.name + "'");
+        // throws:expected<R> 语义 v0 简化为值返回(err() 调用点 unsup)
         if (!f.type_params.empty()) unsup("generic functions");
         if (f.params.size() > 4) unsup("more than 4 parameters on Windows native: '" + f.name + "'");
-        for (auto& p : f.params) {
-            if (p.mode != ast::ParamMode::In)
-                unsup("parameter mode other than 'in' on '" + p.name + "' of '" + f.name + "'");
-        }
     }
 
     sema::Type::Kind scalar_kind(ast::TypeUse const& t)
@@ -1173,6 +1277,7 @@ private:
     void emit_func(ast::FuncDecl& f)
     {
         cur_fn_ = &f;
+        cur_sym_name_ = f.name;
         slots_.clear();
         push_depth_ = 0;
         for (size_t i = 0; i < f.params.size(); ++i)
@@ -1210,6 +1315,7 @@ private:
         std::cerr << "[native] emit_method " << s.name << "_" << m.name << std::endl;
         std::string mname = s.name + "_" + m.name;
         cur_fn_ = nullptr;
+        cur_sym_name_ = mname;
         slots_.clear();
         push_depth_ = 0;
         slots_["this"] = -(8 * 1);
@@ -1310,7 +1416,7 @@ private:
             auto& r = static_cast<ast::ReturnStmt&>(*s);
             if (r.value) eval(r.value.get());
             else ins("xor eax, eax");
-            ins("jmp .Lret_" + cur_fn_->name);
+            ins("jmp .Lret_" + (cur_fn_ ? cur_fn_->name : cur_sym_name_));
             break;
         }
         case ast::Stmt::If: {
@@ -1499,6 +1605,9 @@ private:
         case ast::Expr::Binary:
             eval_binary(static_cast<ast::BinaryExpr&>(*e));
             break;
+        case ast::Expr::Paren:
+            eval(static_cast<ast::ParenExpr&>(*e).inner.get());
+            break;
         case ast::Expr::AsCast: {
             auto& ac = static_cast<ast::AsCastExpr&>(*e);
             eval(ac.operand.get());
@@ -1506,14 +1615,78 @@ private:
         }
         case ast::Expr::Assign: {
             auto& a = static_cast<ast::AssignExpr&>(*e);
+            // 字段目标:p.x = v / p.x += v(方法内 x = v 已由 Name 路径处理)
+            if (a.target->kind() == ast::Expr::Member) {
+                auto& m = static_cast<ast::MemberExpr&>(*a.target);
+                if (m.base->kind() != ast::Expr::Name) unsup("assign base must be name");
+                auto& base = static_cast<ast::NameExpr&>(*m.base);
+                int field_off = -1;
+                for (auto& s : m_->structs) {
+                    for (size_t i=0;i<s.fields.size();++i) if (s.fields[i].name == m.name) {
+                        field_off = (int)i * 8;
+                        break;
+                    }
+                    if (field_off != -1) break;
+                }
+                if (field_off == -1) unsup("unknown field '" + m.name + "'");
+                int base_off = slot_of(base.parts[0]);
+                int tgt_off = base_off + field_off;
+                if (a.op == "=") {
+                    eval(a.value.get());
+                } else {
+                    std::string lop = a.op.substr(0, a.op.size() - 1);
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(tgt_off) + "]");
+                    ins("push rax");
+                    ++push_depth_;
+                    eval(a.value.get());
+                    ins("pop rcx");
+                    --push_depth_;
+                    if (lop == "+") { ins("add rax, rcx"); }
+                    else if (lop == "-") { ins("xchg rax, rcx"); ins("sub rax, rcx"); }
+                    else if (lop == "*") { ins("imul rax, rcx"); }
+                    else unsup("compound assign to field '" + a.op + "'");
+                }
+                ins("mov QWORD PTR [rbp" + std::to_string(tgt_off) + "], rax");
+                break;
+            }
             if (a.target->kind() != ast::Expr::Name) unsup("assignment form");
             auto& n = static_cast<ast::NameExpr&>(*a.target);
-            int off = slot_or_new(n.parts[0]);
+            // 方法上下文(cur_fn_==nullptr)且名字是字段 → 经 this 指针读写
+            bool fld = false;
+            int fld_off = -1;
+            for (auto& s2 : m_->structs) {
+                for (size_t i=0;i<s2.fields.size();++i) if (s2.fields[i].name == n.parts[0]) {
+                    fld_off = (int)i * 8;
+                    fld = true;
+                    break;
+                }
+                if (fld) break;
+            }
+            int off;
+            std::string tgt_addr;
+            if (fld && cur_fn_ == nullptr) {
+                off = 0;                          // 占位:实际经 this
+                tgt_addr = "*this";
+                ins("mov rax, QWORD PTR [rbp-8]");
+                ins("add rax, " + std::to_string(fld_off));
+                ins("push rax");
+                ++push_depth_;                    // 栈顶 = 字段地址
+            } else {
+                off = slot_or_new(n.parts[0]);
+                tgt_addr = "slot";
+            }
+            bool via_this = (tgt_addr == "*this");
             if (a.op == "=") {
                 eval(a.value.get());
             } else {
                 std::string lop = a.op.substr(0, a.op.size() - 1);
-                ins("mov rax, QWORD PTR [rbp" + std::to_string(off) + "]");
+                if (via_this) {
+                    // 字段复合赋值:栈顶已存字段地址;复制一份供读取
+                    ins("mov rcx, QWORD PTR [rsp]");   // addr 副本(rcx 暂存)
+                    ins("mov rax, QWORD PTR [rcx]");   // lhs = *addr
+                } else {
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(off) + "]");
+                }
                 ins("push rax");
                 ++push_depth_;
                 eval(a.value.get());
@@ -1554,7 +1727,13 @@ private:
                 else if (lop == ">>") { ins("xchg rax, rcx"); ins("sar rax, cl"); }
                 else unsup("compound assignment '" + a.op + "'");
             }
-            ins("mov QWORD PTR [rbp" + std::to_string(off) + "], rax");
+            if (via_this) {
+                ins("pop rcx");
+                --push_depth_;
+                ins("mov QWORD PTR [rcx], rax");
+            } else {
+                ins("mov QWORD PTR [rbp" + std::to_string(off) + "], rax");
+            }
             break;
         }
         case ast::Expr::Member: {
@@ -1664,16 +1843,17 @@ private:
             }
             if (!sd || !md) unsup("unknown method '" + mem.name + "'");
             int base_off = slot_of(base.parts[0]);
-            ins("lea rax, QWORD PTR [rbp" + std::to_string(base_off) + "]");
-            ins("push rax");
-            ++push_depth_;
+            // 实参先求值压栈,this 最后压栈(rcx 最先弹出)
             for (auto& a : c.args) {
                 eval(a.get());
                 ins("push rax");
                 ++push_depth_;
             }
+            ins("lea rax, QWORD PTR [rbp" + std::to_string(base_off) + "]");
+            ins("push rax");
+            ++push_depth_;
             static char const* regs[] = {"rcx","rdx","r8","r9"};
-            ins("pop rcx");
+            ins("pop rcx");                       // this
             --push_depth_;
             for (int i = (int)c.args.size() - 1; i >= 0; --i) {
                 ins("pop " + std::string(regs[i+1]));
@@ -1686,6 +1866,58 @@ private:
         }
         if (c.callee->kind() != ast::Expr::Name) unsup("indirect calls");
         auto& nm = static_cast<ast::NameExpr&>(*c.callee);
+        if (!nm.qualified()) {
+            std::string const& bn = nm.parts[0];
+            bool declared_builtin = false;
+            for (auto& f : m_->funcs)
+                if (f.name == bn && f.builtin) { declared_builtin = true; break; }
+            if (declared_builtin) {
+                if (bn == "write_stdout") {
+                    auto* lit = dynamic_cast<ast::LiteralExpr*>(c.args[0].get());
+                    if (!(lit && lit->lit == ast::LitKind::String))
+                        unsup("native write_stdout v0: buf must be a string literal");
+                    std::string text = unescape_str(lit->text);
+                    std::string lbl = intern_string(text);
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("lea rdi, " + lbl + "[rip]");
+                    ins("mov esi, " + std::to_string(text.size()));
+#else
+                    ins("lea rcx, " + lbl + "[rip]");
+                    ins("mov edx, " + std::to_string(text.size()));
+#endif
+                    ins("call cpp2_write");
+                    return;
+                }
+                if (bn == "write_char") {
+                    auto* lit = dynamic_cast<ast::LiteralExpr*>(c.args[0].get());
+                    if (!(lit && lit->lit == ast::LitKind::Char))
+                        unsup("native write_char v0: char literal only");
+                    std::string t = lit->text;
+                    char ch = (t.size() >= 3 && t.front()=='\'' && t.back()=='\'')
+                            ? t[1] : '\0';
+                    std::string lbl = intern_string(std::string(1, ch));
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("lea rdi, " + lbl + "[rip]");
+                    ins("mov esi, 1");
+#else
+                    ins("lea rcx, " + lbl + "[rip]");
+                    ins("mov edx, 1");
+#endif
+                    ins("call cpp2_write");
+                    return;
+                }
+                if (bn == "sys_exit") {
+                    eval(c.args[0].get());
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("mov edi, eax");
+#else
+                    ins("mov ecx, eax");
+#endif
+                    ins("call sys_exit");
+                    return;
+                }
+            }
+        }
         if (nm.qualified() && nm.parts[0] == "std" && (nm.parts[1] == "println" || nm.parts[1] == "print")) {
             emit_printf(c, nm.parts[1] == "println");
             return;
@@ -1719,6 +1951,7 @@ private:
                 std::string cfmt = "%d";
                 if (newline) cfmt += "\n";
                 std::string fmt_lbl = intern_string(cfmt);
+                ins("sub rsp, 32");              // shadow space(Win64 必需;SysV 对齐)
                 eval(c.args[0].get());
 #ifdef CPP2_NATIVE_HOST_OK
                 ins("mov rsi, rax");
@@ -1729,6 +1962,7 @@ private:
 #endif
                 ins("xor eax, eax");
                 ins("call printf");
+                ins("add rsp, 32");
                 return;
             }
         }
@@ -1876,15 +2110,28 @@ private:
                 if (b.op == "==") j = "je";  else if (b.op == "!=") j = "jne";
                 else if (b.op == "<") j = "jl"; else if (b.op == ">") j = "jg";
                 else if (b.op == "<=") j = "jle"; else j = "jge";
-                ins(j + " " + t_true);
-                ins("jmp " + t_false);
+                static std::unordered_map<std::string,std::string> const inv{
+                    {"je","jne"},{"jne","je"},{"jl","jge"},{"jg","jle"},
+                    {"jle","jl"},{"jge","jl"}};
+                auto ji = inv.find(j);
+                std::string jinv = (ji != inv.end()) ? ji->second : ("n" + j);
+                if (!t_true.empty()) {
+                    ins(j + " " + t_true);
+                    if (!t_false.empty()) ins("jmp " + t_false);
+                } else if (!t_false.empty()) {
+                    ins(jinv + " " + t_false);
+                }
                 return;
             }
         }
         eval(e);
         ins("cmp rax, 0");
-        ins("jne " + t_true);
-        ins("jmp " + t_false);
+        if (!t_true.empty()) {
+            ins("jne " + t_true);
+            if (!t_false.empty()) ins("jmp " + t_false);
+        } else if (!t_false.empty()) {
+            ins("je " + t_false);
+        }
     }
 };
 
@@ -1896,39 +2143,105 @@ std::string emit_asm(ast::Module& m, sema::Result const& r)
 
 std::vector<uint8_t> emit_pe(ast::Module& m, sema::Result const& r)
 {
-    // Windows 直出 PE：仅 hello 单测（import std, main->{print "Hello, C++2!\n"}），其余回退 headers/emit_asm
+    // Windows 直出 PE:零 CRT(hello 单测)。print → cpp2_write thunk(kernel32
+    // GetStdHandle+WriteFile),ExitProcess 收尾;msvcrt 不再出现在 IAT。
     if (!m.structs.empty() || !m.enums.empty() || !m.variants.empty() || !m.concepts.empty()) throw Unsupported("emit_pe: hello has no types");
     if (m.funcs.size() != 1 || m.funcs[0].name != "main") throw Unsupported("emit_pe: only hello main");
     auto& main = m.funcs[0];
     if (!main.has_block_body || !main.block_body) throw Unsupported("emit_pe: main needs block");
-    // 简化：直接用 x64::Emitter 手编 hello 的机器码
+
+    std::string hello = "Hello, C++2!\n";
+    int hello_len = (int)hello.size();          // 不含 NUL
+
+    // ── main ──
     x64::Emitter e;
-    // prologue
     e.push_rbp();
     e.mov_rbp_rsp();
-    e.sub_rsp_imm8(32);
-    // lea rcx, .LS0[rip]  (rodata hello string)
-    e.lea_rcx_rip(".LS0");
-    e.xor_eax_eax();
-    e.call_indirect_rip("printf");
+    e.sub_rsp_imm8(32);                          // shadow space
+    e.lea_rcx_rip(".LS0");                       // arg1 = buf
+    e.mov_edx_imm32(hello_len);                  // arg2 = len
+    e.call_rel("cpp2_write");                    // 内部 thunk(text_labels)
     e.add_rsp_imm8(32);
     e.xor_ecx_ecx();
-    e.call_indirect_rip("ExitProcess");
+    e.call_indirect_rip("ExitProcess");          // kernel32!ExitProcess(0)
+
+    // ── cpp2_write thunk(手编 Win64;跨平台注:ELF 路径在 elf.cpp 用 syscall 对等实现)──
+    // cpp2_write(rcx=buf, edx=len):
+    //   push rbx; sub rsp,0x40                 ; 保持 16 对齐
+    //   mov ebx, edx                           ; len 暂存(callee-saved)
+    //   mov r14d? — 不用 volatile 存 buf:
+    //   实际序列:
+    //     mov rsi, rcx                         ; buf(rsi 非参数寄存器,安全)
+    //     mov ecx, -11                         ; STD_OUTPUT_HANDLE
+    //     call qword [rip+IAT.GetStdHandle]    ; rax = handle
+    //     mov rcx, rax                         ; WriteFile(handle,
+    //     mov rdx, rsi                         ;            buf,
+    //     mov r8d, ebx                         ;            len,
+    //     lea r9, [rsp+0x28]                   ;            &written,
+    //     mov qword [rsp+0x20], 0              ;            NULL)   ; 第5参走栈
+    //     call qword [rip+IAT.WriteFile]
+    //     add rsp,0x40; pop rbx; ret
+    x64::Emitter t;
+    size_t thunk_off = 0;                        // 相对 .text 起点(main 之后)
+    {
+        // 先量 main 长度:thunk_off = e.code.size()(对齐 16 便于阅读)
+        thunk_off = (e.code.size() + 15) & ~size_t(15);
+        while (e.code.size() < thunk_off) e.code.push_back(0xCC); // int3 填充
+
+        auto t8 = [&](uint8_t b){ e.code.push_back(b); };
+        auto t32 = [&](int32_t v){ for(int i=0;i<4;++i) e.code.push_back(uint8_t((v>>(i*8))&0xff)); };
+        auto rel32_to = [&](const char* sym){
+            t8(0xFF); t8(0x15);                  // call qword ptr [rip+disp32]
+            e.relocs.push_back({e.code.size(), sym, true});
+            t32(0);
+        };
+        // push rbx                      53
+        t8(0x53);
+        // sub rsp, 0x40                 48 83 EC 40
+        t8(0x48); t8(0x83); t8(0xEC); t8(0x40);
+        // mov [rsp+0x38], rcx           48 89 4C 24 38   ; buf 存栈(volatile 寄存器跨调用不保)
+        t8(0x48); t8(0x89); t8(0x4C); t8(0x24); t8(0x38);
+        // mov ebx, edx                  89 D3            ; len(callee-saved)
+        t8(0x89); t8(0xD3);
+        // mov ecx, -11                  B9 F7 FF FF FF   ; STD_OUTPUT_HANDLE
+        t8(0xB9); t32(-11);
+        rel32_to("GetStdHandle");            // rax = handle
+        // mov rcx, rax                  48 89 C1
+        t8(0x48); t8(0x89); t8(0xC1);
+        // mov rdx, [rsp+0x38]           48 8B 54 24 38   ; buf
+        t8(0x48); t8(0x8B); t8(0x54); t8(0x24); t8(0x38);
+        // mov r8d, ebx                  41 89 D8         ; len
+        t8(0x41); t8(0x89); t8(0xD8);
+        // lea r9, [rsp+0x28]            4C 8D 4C 24 28   ; &written
+        t8(0x4C); t8(0x8D); t8(0x4C); t8(0x24); t8(0x28);
+        // mov qword [rsp+0x20], 0       48 C7 44 24 20 … ; 第5参 NULL
+        t8(0x48); t8(0xC7); t8(0x44); t8(0x24); t8(0x20);
+        for(int i=0;i<4;++i) t8(0);
+        rel32_to("WriteFile");
+        // add rsp, 0x40                 48 83 C4 40
+        t8(0x48); t8(0x83); t8(0xC4); t8(0x40);
+        // pop rbx                       5B
+        t8(0x5B);
+        // ret                           C3
+        t8(0xC3);
+    }
+
     std::vector<uint8_t> text = e.code;
     std::vector<uint8_t> rodata;
-    std::string hello = "Hello, C++2!\n";
     hello.push_back('\0');
     for(char c: hello) rodata.push_back((uint8_t)c);
+
     std::vector<pe::Reloc> relocs;
     for(auto &r: e.relocs){
         pe::Reloc pr;
-        pr.offset = r.pos - 0; // x64::Reloc pos is disp offset
+        pr.offset = r.pos;
         pr.target = r.target;
         pr.is_call = r.is_call;
         relocs.push_back(pr);
     }
     std::vector<std::pair<std::string,std::string>> labels = { {".LS0","0"} };
-    return pe::build_exe(text, rodata, relocs, labels);
+    std::vector<std::pair<std::string,size_t>> text_labels = { {"cpp2_write", thunk_off} };
+    return pe::build_exe(text, rodata, relocs, labels, text_labels);
 }
 
 #endif

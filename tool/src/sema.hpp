@@ -55,6 +55,8 @@ struct Type {
     bool is_arith()  const { return is_int() || kind == Float || kind == Double; }
     bool is_floaty() const { return kind == Float || kind == Double; }
     bool is_indexable() const {
+        // Pointer 不在此列:指针下标无长度概念,越界检查不适用
+        // (sema.cpp Infer 已放行 p[i] = *(p+i);emit 走裸下标)
         return kind == Container || kind == String || kind == StringView;
     }
     bool is_smart() const {

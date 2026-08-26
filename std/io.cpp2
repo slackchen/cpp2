@@ -1,39 +1,65 @@
-// std/io.cpp2 — cpp2 标准库 io（print/println），native/headers 共用
+// std/io.cpp2 — cpp2 标准库 io(print/println/print_int)
+// 纯 cpp2:零 cxx_legacy、零 extern "C"、零 CRT 符号。
+// 分层:L2 内建原语(write_stdout/write_char/sys_exit)由编译器直接实现
+//   —— headers 后端降到 rt/cpp2/support.hpp 的 cpp2_* 内联函数,
+//      native 后端降为机器码(PE kernel32 thunk / ELF syscall 规划)。
+// 本文件(L3)只做纯算法叠加(strlen、十进制格式化),平台中立。
 module io;
 
-cxx_legacy {
-    #include <cstdio>
-    namespace cpp2mod::io {
-        int printf_wrapper(const char* s) { return ::printf("%s", s); }
-        int printf_nl_wrapper(const char* s) { return ::printf("%s\n", s); }
-        int printf_int_wrapper(const char* fmt, int a0) { return ::printf(fmt, a0); }
-    }
-}
-export printf_wrapper: (s: const char*) -> int;
-export printf_nl_wrapper: (s: const char*) -> int;
-export printf_int_wrapper: (fmt: const char*, a0: int) -> int;
+builtin write_stdout: (s: const char*, n: int) -> void;
+builtin write_char:   (c: char) -> void;
 
 export print: (s: const char*) -> void = {
-    printf_wrapper(s);
+    // strlen 内联(指针下标;NUL 约定与 C 互操作一致)
+    n: int = 0;
+    while s[n] != '\0' {
+        n += 1;
+    }
+    write_stdout(s, n);
 }
 
 export println: (s: const char*) -> void = {
-    printf_nl_wrapper(s);
+    print(s);
+    write_char('\n');
 }
 
-export print_int: (fmt: std::string, a0: int) -> void = {
-    // fmt 中 {0} -> %d
-    cfmt: std::string = "";
-    i: int = 0;
-    n: int = fmt.size() as int;
-    while i < n {
-        if i + 2 < n && fmt[i] == '{' && fmt[i+1] == '0' && fmt[i+2] == '}' {
-            cfmt += "%d";
-            i += 3;
-        } else {
-            cfmt += fmt[i];
-            i += 1;
-        }
+export print_int: (v: int) -> void = {
+    if v < 0 {
+        write_char('-');
+        print_int_abs(v * -1);
+        return;
     }
-    printf_int_wrapper(cfmt.c_str(), a0);
+    print_int_abs(v);
+}
+
+print_int_abs: (v: int) -> void = {
+    n: int = v;
+    // 十进制位缓冲(int ≤10 位),显式零初始化
+    d0: int = 0; d1: int = 0; d2: int = 0; d3: int = 0; d4: int = 0;
+    d5: int = 0; d6: int = 0; d7: int = 0; d8: int = 0; d9: int = 0;
+    i: int = 0;
+    if n == 0 {
+        write_char('0');
+        return;
+    }
+    while n > 0 {
+        if i == 0 { d0 = n % 10; } else if i == 1 { d1 = n % 10; }
+        else if i == 2 { d2 = n % 10; } else if i == 3 { d3 = n % 10; }
+        else if i == 4 { d4 = n % 10; } else if i == 5 { d5 = n % 10; }
+        else if i == 6 { d6 = n % 10; } else if i == 7 { d7 = n % 10; }
+        else if i == 8 { d8 = n % 10; } else { d9 = n % 10; }
+        i += 1;
+        n /= 10;
+    }
+    j: int = i - 1;
+    while j >= 0 {
+        dv: int = 0;
+        if j == 0 { dv = d0; } else if j == 1 { dv = d1; }
+        else if j == 2 { dv = d2; } else if j == 3 { dv = d3; }
+        else if j == 4 { dv = d4; } else if j == 5 { dv = d5; }
+        else if j == 6 { dv = d6; } else if j == 7 { dv = d7; }
+        else if j == 8 { dv = d8; } else { dv = d9; }
+        write_char(('0' as int + dv) as char);
+        j -= 1;
+    }
 }

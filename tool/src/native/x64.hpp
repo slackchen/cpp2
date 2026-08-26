@@ -31,6 +31,7 @@ struct Emitter {
     void xor_ecx_ecx() { put8(0x31); put8(0xC9); }
     void mov_rax_imm32(int32_t v) { put8(0x48); put8(0xC7); put8(0xC0); put32(v); }
     void mov_rcx_imm32(int32_t v) { put8(0xB9); put32(v); }
+    void mov_edx_imm32(int32_t v) { put8(0xBA); put32(v); }   // edx = imm32(Win64 第2参)
     // lea rcx, [rip+disp32]  -> 48 8D 0D disp32
     void lea_rcx_rip(const std::string& target) {
         put8(0x48); put8(0x8D); put8(0x0D);

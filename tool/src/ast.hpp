@@ -257,6 +257,11 @@ struct FuncDecl {
     std::vector<TypeParam> type_params;      // <T: Concept>(M2d)
     std::vector<RequiresItem> requires_list; // requires A<T> && B<T>(M2d)
     bool is_extern = false;                  // 无体声明:name: (...)->ret;(M6 互操作)
+    bool c_linkage = false;                  // extern "C" 前缀:C 链接(std 直连 CRT/OS);
+                                             // 非 c_linkage 的无体声明按 C++ 链接(cxx_legacy 配对)
+    bool builtin = false;                    // builtin 前缀:编译器内建原语(无体,不发原型)。
+                                             // 平台差异由各后端直接实现(headers=rt cpp2;
+                                             // native=机器码/syscall)。std 专用,用户库不可注册。
     std::vector<std::string> error_categories; // throws E1, E2(M6 收口:存档+audit)
     std::vector<Param> params;
     std::optional<TypeUse> ret;

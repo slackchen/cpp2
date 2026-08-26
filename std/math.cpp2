@@ -1,0 +1,65 @@
+// std/math.cpp2 — 整数数学(纯算法,L3;零依赖)
+module math;
+
+export abs: (v: int) -> int = {
+    if v < 0 { return -v; }
+    return v;
+}
+
+export min: (a: int, b: int) -> int = {
+    if a < b { return a; }
+    return b;
+}
+
+export max: (a: int, b: int) -> int = {
+    if a > b { return a; }
+    return b;
+}
+
+export clamp: (v: int, lo: int, hi: int) -> int = {
+    if v < lo { return lo; }
+    if v > hi { return hi; }
+    return v;
+}
+
+export powi: (base: int, exp: int) -> int = {
+    // 快速幂;0^0=1 约定
+    r: int = 1;
+    b: int = base;
+    e: int = exp;
+    while e > 0 {
+        if e % 2 == 1 { r *= b; }
+        b *= b;
+        e /= 2;
+    }
+    return r;
+}
+
+export isqrt: (v: int) -> int = {
+    // 牛顿法整数平方根;负数返回 -1(错误值约定)
+    if v < 0 { return -1; }
+    if v < 2 { return v; }
+    x: int = v;
+    y: int = (x + 1) / 2;
+    while y < x {
+        x = y;
+        y = (x + v / x) / 2;
+    }
+    return x;
+}
+
+export gcd: (a: int, b: int) -> int = {
+    x: int = abs(a);
+    y: int = abs(b);
+    while y != 0 {
+        t: int = y;
+        y = x % y;
+        x = t;
+    }
+    return x;
+}
+
+export lcm: (a: int, b: int) -> int = {
+    if a == 0 || b == 0 { return 0; }
+    return abs(a * b) / gcd(a, b);
+}
