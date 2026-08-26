@@ -469,6 +469,31 @@ private:
         }
         case ast::Stmt::If: {
             auto& i = static_cast<ast::IfStmt&>(*s);
+            // if-let:if v := f() { } else e := it { }(v0 哨兵:非0=成功)
+            if (i.is_let()) {
+                int tmp_off = slot_or_new("$iflet_" + std::to_string(label_++));
+                eval(i.let_init.get());
+                ins("mov QWORD PTR [rbp" + std::to_string(tmp_off) + "], rax");
+                std::string els = lbl("iflet_else"), end = lbl("iflet_end");
+                ins("test rax, rax");
+                ins("je " + els);
+                if (i.let_name != "_" && !i.let_name.empty()) {
+                    int boff = slot_or_new(i.let_name);
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(tmp_off) + "]");
+                    ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
+                }
+                emit_stmt(i.then_block.get());
+                ins("jmp " + end);
+                label(els);
+                if (!i.else_binding.empty()) {
+                    int boff = slot_or_new(i.else_binding);
+                    ins("xor eax, eax");
+                    ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
+                }
+                if (i.else_block) emit_stmt(i.else_block.get());
+                label(end);
+                break;
+            }
             std::string els = lbl("else");
             branch_bool(i.cond.get(), "", els);
             emit_stmt(i.then_block.get());
@@ -660,6 +685,26 @@ private:
                             ins("mov rax, QWORD PTR [rbp" + std::to_string(data_off + fi*8) + "]");
                             ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
                         }
+                    }
+                } else if (arm.pat == ast::MatchArm::Pat::Ok || arm.pat == ast::MatchArm::Pat::Some) {
+                    // ok n => :值非 0;绑定 n = scrutinee
+                    ins("mov rax, QWORD PTR [rsp]");
+                    ins("test rax, rax");
+                    ins("je " + next);
+                    if (!arm.binding.empty() && arm.binding != "_") {
+                        int boff = slot_or_new(arm.binding);
+                        ins("mov rax, QWORD PTR [rsp]");
+                        ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
+                    }
+                } else if (arm.pat == ast::MatchArm::Pat::Err || arm.pat == ast::MatchArm::Pat::None) {
+                    // err e => :值为 0;v0 错误消息不可用,e 绑定为 0
+                    ins("mov rax, QWORD PTR [rsp]");
+                    ins("test rax, rax");
+                    ins("jne " + next);
+                    if (!arm.binding.empty() && arm.binding != "_") {
+                        int boff = slot_or_new(arm.binding);
+                        ins("xor eax, eax");
+                        ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
                     }
                 } else {
                     unsup("unsupported match pattern");
@@ -1011,6 +1056,11 @@ private:
                     label(se);
                     return;
                 }
+                if (mem.name == "message") {
+                    eval(mem.base.get());
+                    ins("xor eax, eax");          // v0:错误串不可用,返回空
+                    return;
+                }
                 if (mem.name == "has_value") {
                     eval(mem.base.get());
                     ins("test rax, rax");
@@ -1064,6 +1114,7 @@ private:
         // 单字符池、sys_exit=kernel32 IAT。ELF 规划: syscall 序列。
         if (!nm.qualified()) {
             std::string const& bn = nm.parts[0];
+            if (bn == "err") { ins("xor eax, eax"); return; }  // 语言级哨兵
             bool declared_builtin = false;
             for (auto& f : m_->funcs)
                 if (f.name == bn && f.builtin) { declared_builtin = true; break; }
@@ -1111,6 +1162,26 @@ private:
                     ins("mov ecx, eax");
 #endif
                     ins("call sys_exit");
+                    return;
+                }
+                if (bn == "mem_alloc") {
+                    eval(c.args[0].get());
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("mov edi, eax");
+#else
+                    ins("mov ecx, eax");
+#endif
+                    ins("call cpp2_alloc");
+                    return;
+                }
+                if (bn == "mem_free") {
+                    eval(c.args[0].get());
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("mov rdi, rax");
+#else
+                    ins("mov rcx, rax");
+#endif
+                    ins("call cpp2_free");
                     return;
                 }
             }
@@ -1706,6 +1777,31 @@ private:
         }
         case ast::Stmt::If: {
             auto& i = static_cast<ast::IfStmt&>(*s);
+            // if-let:if v := f() { } else e := it { }(v0 哨兵:非0=成功)
+            if (i.is_let()) {
+                int tmp_off = slot_or_new("$iflet_" + std::to_string(label_++));
+                eval(i.let_init.get());
+                ins("mov QWORD PTR [rbp" + std::to_string(tmp_off) + "], rax");
+                std::string els = lbl("iflet_else"), end = lbl("iflet_end");
+                ins("test rax, rax");
+                ins("je " + els);
+                if (i.let_name != "_" && !i.let_name.empty()) {
+                    int boff = slot_or_new(i.let_name);
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(tmp_off) + "]");
+                    ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
+                }
+                emit_stmt(i.then_block.get());
+                ins("jmp " + end);
+                label(els);
+                if (!i.else_binding.empty()) {
+                    int boff = slot_or_new(i.else_binding);
+                    ins("xor eax, eax");
+                    ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
+                }
+                if (i.else_block) emit_stmt(i.else_block.get());
+                label(end);
+                break;
+            }
             std::string els = lbl("else");
             branch_bool(i.cond.get(), "", els);
             emit_stmt(i.then_block.get());
@@ -1897,6 +1993,26 @@ private:
                             ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
                         }
                     }
+                } else if (arm.pat == ast::MatchArm::Pat::Ok || arm.pat == ast::MatchArm::Pat::Some) {
+                    // ok n => :值非 0;绑定 n = scrutinee
+                    ins("mov rax, QWORD PTR [rsp]");
+                    ins("test rax, rax");
+                    ins("je " + next);
+                    if (!arm.binding.empty() && arm.binding != "_") {
+                        int boff = slot_or_new(arm.binding);
+                        ins("mov rax, QWORD PTR [rsp]");
+                        ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
+                    }
+                } else if (arm.pat == ast::MatchArm::Pat::Err || arm.pat == ast::MatchArm::Pat::None) {
+                    // err e => :值为 0;v0 错误消息不可用,e 绑定为 0
+                    ins("mov rax, QWORD PTR [rsp]");
+                    ins("test rax, rax");
+                    ins("jne " + next);
+                    if (!arm.binding.empty() && arm.binding != "_") {
+                        int boff = slot_or_new(arm.binding);
+                        ins("xor eax, eax");
+                        ins("mov QWORD PTR [rbp" + std::to_string(boff) + "], rax");
+                    }
                 } else {
                     unsup("unsupported match pattern");
                 }
@@ -1988,6 +2104,50 @@ private:
         case ast::Expr::Paren:
             eval(static_cast<ast::ParenExpr&>(*e).inner.get());
             break;
+        case ast::Expr::Try: {
+            // f()?:v0 哨兵语义 —— lhs==0 → 跳到函数出口返回 0
+            auto& ty = static_cast<ast::TryExpr&>(*e);
+            eval(ty.operand.get());
+            std::string ok = lbl("tryok");
+            ins("test rax, rax");
+            ins("jne " + ok);
+            ins("xor eax, eax");
+            ins("jmp .Lret_" + (cur_fn_ ? cur_fn_->name : cur_sym_name_));
+            label(ok);
+            break;
+        }
+        case ast::Expr::OrDefault: {
+            // f() or d:v0 哨兵语义 —— lhs==0 视为失败,取 rhs
+            auto& od = static_cast<ast::OrDefaultExpr&>(*e);
+            int tmp_off = slot_or_new("$or_" + std::to_string(label_++));
+            eval(od.lhs.get());
+            ins("mov QWORD PTR [rbp" + std::to_string(tmp_off) + "], rax");
+            std::string has = lbl("orhas"), done = lbl("ordone");
+            ins("test rax, rax");
+            ins("jne " + has);
+            eval(od.rhs.get());
+            ins("jmp " + done);
+            label(has);
+            ins("mov rax, QWORD PTR [rbp" + std::to_string(tmp_off) + "]");
+            label(done);
+            break;
+        }
+        case ast::Expr::Must: {
+            // f()!:v0 哨兵语义 —— 0 即 trap
+            auto& mu = static_cast<ast::MustExpr&>(*e);
+            eval(mu.operand.get());
+            std::string ok = lbl("mustok");
+            ins("test rax, rax");
+            ins("jne " + ok);
+#ifdef CPP2_NATIVE_HOST_OK
+            ins("xor edi, edi");
+#else
+            ins("xor ecx, ecx");
+#endif
+            ins("call sys_exit");
+            label(ok);
+            break;
+        }
         case ast::Expr::AsCast: {
             auto& ac = static_cast<ast::AsCastExpr&>(*e);
             eval(ac.operand.get());
@@ -2308,6 +2468,11 @@ private:
                     label(se);
                     return;
                 }
+                if (mem.name == "message") {
+                    eval(mem.base.get());
+                    ins("xor eax, eax");          // v0:错误串不可用,返回空
+                    return;
+                }
                 if (mem.name == "has_value") {
                     eval(mem.base.get());
                     ins("test rax, rax");
@@ -2344,6 +2509,7 @@ private:
         auto& nm = static_cast<ast::NameExpr&>(*c.callee);
         if (!nm.qualified()) {
             std::string const& bn = nm.parts[0];
+            if (bn == "err") { ins("xor eax, eax"); return; }  // 语言级哨兵
             bool declared_builtin = false;
             for (auto& f : m_->funcs)
                 if (f.name == bn && f.builtin) { declared_builtin = true; break; }
@@ -2390,6 +2556,26 @@ private:
                     ins("mov ecx, eax");
 #endif
                     ins("call sys_exit");
+                    return;
+                }
+                if (bn == "mem_alloc") {
+                    eval(c.args[0].get());
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("mov edi, eax");
+#else
+                    ins("mov ecx, eax");
+#endif
+                    ins("call cpp2_alloc");
+                    return;
+                }
+                if (bn == "mem_free") {
+                    eval(c.args[0].get());
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("mov rdi, rax");
+#else
+                    ins("mov rcx, rax");
+#endif
+                    ins("call cpp2_free");
                     return;
                 }
             }
