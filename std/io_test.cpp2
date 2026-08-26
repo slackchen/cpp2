@@ -4,5 +4,6 @@ import io;
 main: () -> int = {
     print("Hello from std.io!\n");
     println("Hello via println");
+    print_int("value={0}\n", 42);
     return 0;
 }
