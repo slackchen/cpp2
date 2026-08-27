@@ -7,8 +7,9 @@
 
 namespace cpp2::native::pe {
 
-// RIP 相对重定位:target ∈ rodata 标签 | text 标签(thunk) | kernel32 导入符号
-struct Reloc { size_t offset; std::string target; bool is_call; };
+// RIP 相对重定位:target ∈ rodata 标签 | text 标签(thunk) | 导入符号(IAT)
+// offset = disp32 位置; ref = 指令尾(用于计算 RIP 相对位移的基准)
+struct Reloc { size_t offset; std::string target; size_t ref; bool is_call; };
 
 // 生成最小 PE64 可执行（入口 main，零 CRT）
 // text:   .text 内容（已含入口 + 可选 cpp2_write thunk，RIP 重定位待填）

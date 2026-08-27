@@ -10,7 +10,7 @@
 
 namespace cpp2::native::asm64 {
 
-struct Reloc { size_t offset; std::string target; bool is_call; };
+struct Reloc { size_t offset; std::string target; size_t ref; bool is_call; };
 
 struct Result {
     std::vector<uint8_t> text;

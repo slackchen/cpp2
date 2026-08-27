@@ -2,12 +2,13 @@
 // Contract: when native.cpp adds a new instruction pattern, extend here too.
 #include "asm64.hpp"
 #include <cstring>
+#include <set>
 #include <sstream>
 #include <unordered_map>
 
 namespace cpp2::native::asm64 {
 
-using u8 = uint8_t; using u32 = uint32_t; using u64 = uint64_t; using i32 = int32_t;
+using u8 = uint8_t; using u16 = uint16_t; using u32 = uint32_t; using u64 = uint64_t; using i32 = int32_t; using i64 = int64_t;
 
 static int reg64(const std::string& r) {
     static const std::unordered_map<std::string,int> m{
@@ -28,7 +29,40 @@ static u8 rex(int reg, int rm) {
 
 Result assemble(const std::string& source) {
     Result res;
-    std::vector<std::pair<size_t, std::string>> fixes;
+    std::vector<Reloc> fixes;
+    std::set<std::string> rodata_labels_set;
+    bool in_text = true;
+    std::set<std::string> defined_labels;   // 预扫描:所有 label 定义(含 .L/rodata)
+    {
+        std::istringstream pre(source);
+        std::string pl;
+        while (std::getline(pre, pl)) {
+            size_t pa = pl.find_first_not_of(" \t\r");
+            if (pa == std::string::npos) continue;
+            pl = pl.substr(pa);
+            if (pl == ".text" || pl == ".intel_syntax noprefix") continue;
+            if (pl.rfind(".section",0)==0 || pl.rfind(".globl",0)==0 ||
+                pl.rfind(".data",0)==0 || pl.rfind(".quad",0)==0) continue;
+            if (pl.find(".string") != std::string::npos) continue;
+            if (pl.back() == ':' && pl.find(' ') == std::string::npos) {
+                defined_labels.insert(pl.substr(0, pl.size()-1));
+                continue;
+            }
+            size_t pcolon = pl.find(':');
+            if (pcolon != std::string::npos && pcolon > 1) {
+                std::string ml = pl.substr(0, pcolon);
+                size_t mla = ml.find_first_not_of(" \t");
+                if (mla != std::string::npos) {
+                    ml = ml.substr(mla);
+                    if (ml.find(' ')==std::string::npos && ml.find('(')==std::string::npos && ml[0]!='#') {
+                        std::string rest = pl.substr(pcolon+1);
+                        if (rest.find_first_not_of(" \t") == std::string::npos)
+                            defined_labels.insert(ml);
+                    }
+                }
+            }
+        }
+    }
     std::istringstream in(source);
     std::string line;
     size_t pc = 0;
@@ -43,15 +77,19 @@ Result assemble(const std::string& source) {
         line = line.substr(a, b-a+1);
         if (line.empty()) continue;
 
-        // Skip directives
-        if (line == ".text" || line == ".intel_syntax noprefix") continue;
+        // Skip directives / track section
+        if (line == ".text") { in_text = true; continue; }
+        if (line == ".intel_syntax noprefix") continue;
+        if (line == ".section .rodata") { in_text = false; continue; }
         if (line.rfind(".section",0)==0 || line.rfind(".globl",0)==0 ||
             line.rfind(".data",0)==0 || line.rfind(".quad",0)==0) continue;
         if (line.find(".string") != std::string::npos) continue;
 
         // Label definition "xxx:" alone on line
         if (line.back() == ':' && line.find(' ') == std::string::npos) {
-            res.symbols[line.substr(0, line.size()-1)] = pc;
+            std::string lbl = line.substr(0, line.size()-1);
+            if (in_text) res.symbols[lbl] = pc;
+            else rodata_labels_set.insert(lbl);
             continue;
         }
 
@@ -73,11 +111,13 @@ Result assemble(const std::string& source) {
                     size_t ra = rest.find_first_not_of(" \t");
                     if (ra == std::string::npos) {
                         // Pure label
-                        res.symbols[maybe_lbl] = pc;
+                        if (in_text) res.symbols[maybe_lbl] = pc;
+                        else rodata_labels_set.insert(maybe_lbl);
                         continue;
                     }
                     // Label + instruction
-                    res.symbols[maybe_lbl] = pc;
+                    if (in_text) res.symbols[maybe_lbl] = pc;
+                    else rodata_labels_set.insert(maybe_lbl);
                     line = rest.substr(ra);
                     had_label = true;
                 }
@@ -131,8 +171,8 @@ Result assemble(const std::string& source) {
                 continue;
             }
 
-            // mov rax/rdi/rsi..., imm32 (B8+r for short forms)
-            if (dd>=0 && dd<=7 && src[0]>='0' && src[0]<='9') {
+            // mov rax/rdi/rsi..., imm32 (B8+r for short forms; also negative)
+            if (dd>=0 && dd<=7 && (src[0]=='-' || (src[0]>='0' && src[0]<='9'))) {
                 i32 imm = (i32)std::stoll(src);
                 if (dd==0) emit8(0xB8);
                 else if (dd==1) emit8(0xB9);
@@ -144,16 +184,24 @@ Result assemble(const std::string& source) {
                 continue;
             }
 
-            // mov QWORD PTR [rbp-N], reg
-            if (dst.rfind("QWORD")==0 && src.length()>0 && reg64(src)>=0) {
-                // Find [rbp-N] in dst
+            // mov QWORD PTR [rbp-N], reg|imm
+            if (dst.rfind("QWORD")==0) {
                 auto pos = dst.find("[rbp-");
                 if (pos != std::string::npos) {
                     int disp = -std::stoi(dst.substr(pos+5));
                     int rr = reg64(src);
-                    emit8(rex(rr,5)); emit8(0x89);
-                    emit8(0x40|((rr&7)<<3)|0x05);
-                    emit8((uint8_t)disp);
+                    if (rr >= 0) {
+                        emit8(rex(rr,5)); emit8(0x89);
+                        emit8(0x40|((rr&7)<<3)|0x05);
+                        emit8((uint8_t)disp);
+                    } else {
+                        // imm32: 48 C7 45 disp imm32
+                        i32 imm = (i32)std::stoll(src);
+                        emit8(0x48); emit8(0xC7);
+                        emit8(0x45);
+                        emit8((uint8_t)disp);
+                        for(int i=0;i<4;++i) emit8(uint8_t(((u32)imm>>(i*8))&0xff));
+                    }
                     continue;
                 }
             }
@@ -179,7 +227,7 @@ Result assemble(const std::string& source) {
             if (dd==6 && ss2==0) { emit8(0x89); emit8(0xC0|(0<<3)|6); continue; }
 
             // mov esi/ecx/edx, imm
-            if ((dd==6||dd==2) && src[0]>='0' && src[0]<='9') {
+            if ((dd==6||dd==2) && (src[0]=='-' || (src[0]>='0' && src[0]<='9'))) {
                 i32 imm = (i32)std::stoi(src);
                 if (dd==6) emit8(0xBE);
                 else if (dd==2) emit8(0xBA);
@@ -199,8 +247,41 @@ Result assemble(const std::string& source) {
                 std::string tgt = src.substr(0, src.find("[rip]"));
                 emit8(rex(dd,0)); emit8(0x8D);
                 emit8(0x05|((dd&7)<<3));
-                fixes.push_back({pc, tgt});
+                fixes.push_back({pc, tgt, pc+4, false});
                 emit32(0);
+                continue;
+            }
+            // lea reg, [rbp-N]
+            if (dd>=0) {
+                auto pos = src.find("[rbp-");
+                if (pos != std::string::npos) {
+                    int disp = -std::stoi(src.substr(pos+5));
+                    emit8(rex(dd,5)); emit8(0x8D);
+                    emit8(0x45|((dd&7)<<3));
+                    emit8((uint8_t)disp);
+                    continue;
+                }
+            }
+        }
+
+        // add/sub/and/or/xor/cmp reg, imm8|imm32
+        if ((op=="add"||op=="sub"||op=="and"||op=="or"||op=="xor"||op=="cmp") && tok.size()>=3) {
+            std::string dst = strip_comma(tok[1]);
+            std::string src = tok[2];
+            int dd = reg64(dst);
+            if (dd>=0 && (src[0]=='-' || (src[0]>='0' && src[0]<='9'))) {
+                i64 v = std::stoll(src);
+                u8 ext = (op=="add")?0:(op=="or")?1:(op=="and")?4:(op=="sub")?5:
+                          (op=="xor")?6:(op=="cmp")?7:0;
+                if (v >= -128 && v <= 127) {
+                    emit8(rex(dd,0)); emit8(0x83);
+                    emit8(0xC0|((ext&7)<<3)|(dd&7));
+                    emit8((uint8_t)(i32)v);
+                } else {
+                    emit8(rex(dd,0)); emit8(0x81);
+                    emit8(0xC0|((ext&7)<<3)|(dd&7));
+                    i32 imm=(i32)v; for(int i=0;i<4;++i) emit8(uint8_t(((u32)imm>>(i*8))&0xff));
+                }
                 continue;
             }
         }
@@ -212,24 +293,35 @@ Result assemble(const std::string& source) {
                 emit8(0xFF); emit8(0xD0|(reg64(tgt)&7));
                 continue;
             }
-            emit8(0xE8);
-            fixes.push_back({pc, tgt});
-            emit32(0);
-            bool known=false;
-            for(auto&p:res.symbols) if(p.first==tgt){known=true;break;}
-            if(!known){
-                bool ext=false;
-                for(auto&e2:res.externs) if(e2==tgt){ext=true;break;}
-                if(!ext) res.externs.push_back(tgt);
+            if (defined_labels.count(tgt)) {
+                // 内部调用:直接 E8 rel32
+                emit8(0xE8);
+                fixes.push_back({pc, tgt, pc+4, true});
+                emit32(0);
+            } else {
+                // 外部符号:FF 15 disp32 (间接调用,经 IAT)
+                emit8(0xFF); emit8(0x15);
+                fixes.push_back({pc, tgt, pc+4, true});
+                emit32(0);
             }
             continue;
         }
 
         // jmp label
         if (op=="jmp" && tok.size()>=2) {
-            emit8(0xE9);
-            fixes.push_back({pc, tok[1]});
-            emit32(0);
+            if (is_r64(tok[1])) {
+                emit8(0xFF); emit8(0xE0|(reg64(tok[1])&7));
+                continue;
+            }
+            if (defined_labels.count(tok[1])) {
+                emit8(0xE9);
+                fixes.push_back({pc, tok[1], pc+4, false});
+                emit32(0);
+            } else {
+                emit8(0xFF); emit8(0x25);
+                fixes.push_back({pc, tok[1], pc+4, false});
+                emit32(0);
+            }
             continue;
         }
 
@@ -240,7 +332,7 @@ Result assemble(const std::string& source) {
             auto it2 = cc.find(op);
             if (it2 != cc.end()) {
                 emit8(0x0F); emit8(it2->second);
-                fixes.push_back({pc, tok[1]});
+                fixes.push_back({pc, tok[1], pc+4, false});
                 emit32(0);
                 continue;
             }
@@ -336,11 +428,24 @@ Result assemble(const std::string& source) {
 
     // Resolve label references
     for (auto& f : fixes) {
-        auto it = res.symbols.find(f.second);
-        if (it == res.symbols.end()) continue;
-        i32 rel = (i32)(it->second - (f.first + 4));
-        for(int i=0;i<4;++i)
-            res.text[f.first+i] = uint8_t(((u32)rel>>(i*8))&0xff);
+        auto it = res.symbols.find(f.target);
+        if (it != res.symbols.end()) {
+            // 内部标签:直接回填 disp32
+            i32 rel = (i32)((i64)it->second - (i64)f.ref);
+            for(int i=0;i<4;++i)
+                res.text[f.offset+i] = uint8_t(((u32)rel>>(i*8))&0xff);
+            continue;
+        }
+        if (rodata_labels_set.count(f.target)) {
+            // rodata 标签:发 RIP 相对重定位,交给 PE 层填 rodata RVA
+            res.relocs.push_back({f.offset, f.target, f.ref, false});
+            continue;
+        }
+        // 外部符号(printf/sys_exit/...):发重定位,目标 = 导入表 IAT
+        bool have = false;
+        for (auto& e : res.externs) if (e == f.target) { have = true; break; }
+        if (!have) res.externs.push_back(f.target);
+        res.relocs.push_back({f.offset, f.target, f.ref, f.is_call});
     }
 
     // Extract rodata strings (second pass over source)

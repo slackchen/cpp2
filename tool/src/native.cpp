@@ -297,9 +297,18 @@ private:
             ins("jmp " + ret);
         }
         label(ret);
-        ins("mov rsp, rbp");
-        ins("pop rbp");
-        ins("ret");
+        if (f.name == "main") {
+            if (f.ret && !f.ret->empty())
+                ins("mov rcx, rax");
+            else
+                ins("xor rcx, rcx");
+            ins("call ExitProcess");
+            ins("ret");
+        } else {
+            ins("mov rsp, rbp");
+            ins("pop rbp");
+            ins("ret");
+        }
         put("");
         cur_fn_ = nullptr;
     }
@@ -1156,7 +1165,7 @@ private:
 #ifdef CPP2_NATIVE_HOST_OK
                     ins("mov edi, eax");
 #else
-                    ins("mov ecx, eax");
+                    ins("mov rcx, rax");
 #endif
                     ins("call sys_exit");
                     return;
@@ -1166,7 +1175,7 @@ private:
 #ifdef CPP2_NATIVE_HOST_OK
                     ins("mov edi, eax");
 #else
-                    ins("mov ecx, eax");
+                    ins("mov rcx, rax");
 #endif
                     ins("call cpp2_alloc");
                     return;
@@ -1358,7 +1367,7 @@ private:
                 else if (b.op == "<=") j = "jle"; else j = "jge";
                 static std::unordered_map<std::string,std::string> const inv{
                     {"je","jne"},{"jne","je"},{"jl","jge"},{"jg","jle"},
-                    {"jle","jl"},{"jge","jl"}};
+                    {"jle","jg"},{"jge","jl"}};
                 auto ji = inv.find(j);
                 std::string jinv = (ji != inv.end()) ? ji->second : ("n" + j);
                 if (!t_true.empty()) {
@@ -1609,9 +1618,18 @@ private:
             ins("jmp " + ret);
         }
         label(ret);
-        ins("mov rsp, rbp");
-        ins("pop rbp");
-        ins("ret");
+        if (f.name == "main") {
+            if (f.ret && !f.ret->empty())
+                ins("mov rcx, rax");
+            else
+                ins("xor rcx, rcx");
+            ins("call ExitProcess");
+            ins("ret");
+        } else {
+            ins("mov rsp, rbp");
+            ins("pop rbp");
+            ins("ret");
+        }
         put("");
         cur_fn_ = nullptr;
     }
@@ -2137,7 +2155,7 @@ private:
 #ifdef CPP2_NATIVE_HOST_OK
             ins("xor edi, edi");
 #else
-            ins("xor ecx, ecx");
+            ins("xor rcx, rcx");
 #endif
             ins("call sys_exit");
             label(ok);
@@ -2236,9 +2254,13 @@ private:
                     std::string ok = lbl("divok");
                     ins("jnz " + ok);
                     ins("lea rcx, .Lfmt_div0[rip]");
+                    ins("sub rsp, 32");
                     ins("call printf");
-                    ins("mov ecx, 101");
+                    ins("add rsp, 32");
+                    ins("mov rcx, 101");
+                    ins("sub rsp, 32");
                     ins("call exit");
+                    ins("add rsp, 32");
                     label(ok);
                     ins("cqo");
                     ins("idiv rcx");
@@ -2248,9 +2270,13 @@ private:
                     std::string ok = lbl("divok");
                     ins("jnz " + ok);
                     ins("lea rcx, .Lfmt_div0[rip]");
+                    ins("sub rsp, 32");
                     ins("call printf");
-                    ins("mov ecx, 101");
+                    ins("add rsp, 32");
+                    ins("mov rcx, 101");
+                    ins("sub rsp, 32");
                     ins("call exit");
+                    ins("add rsp, 32");
                     label(ok);
                     ins("cqo");
                     ins("idiv rcx");
@@ -2546,7 +2572,7 @@ private:
 #ifdef CPP2_NATIVE_HOST_OK
                     ins("mov edi, eax");
 #else
-                    ins("mov ecx, eax");
+                    ins("mov rcx, rax");
 #endif
                     ins("call sys_exit");
                     return;
@@ -2556,7 +2582,7 @@ private:
 #ifdef CPP2_NATIVE_HOST_OK
                     ins("mov edi, eax");
 #else
-                    ins("mov ecx, eax");
+                    ins("mov rcx, rax");
 #endif
                     ins("call cpp2_alloc");
                     return;
@@ -2615,7 +2641,9 @@ private:
                 ins("lea rcx, " + fmt_lbl + "[rip]");
 #endif
                 ins("xor eax, eax");
+                ins("sub rsp, 32");
                 ins("call printf");
+                ins("add rsp, 32");
                 return;
             }
         }
@@ -2765,7 +2793,7 @@ private:
                 else if (b.op == "<=") j = "jle"; else j = "jge";
                 static std::unordered_map<std::string,std::string> const inv{
                     {"je","jne"},{"jne","je"},{"jl","jge"},{"jg","jle"},
-                    {"jle","jl"},{"jge","jl"}};
+                    {"jle","jg"},{"jge","jl"}};
                 auto ji = inv.find(j);
                 std::string jinv = (ji != inv.end()) ? ji->second : ("n" + j);
                 if (!t_true.empty()) {
@@ -2900,12 +2928,74 @@ std::vector<uint8_t> emit_pe(ast::Module& m, sema::Result const& r)
 // ── 通用 native: .s 文本 → asm64 汇编 → PE 字节(零外部工具)────────
 std::vector<uint8_t> emit_native(const std::string& asm_text)
 {
-    auto res = asm64::assemble(asm_text);
+    // 追加最小运行时(零 CRT):cpp2_write/sys_exit/... 直接走 kernel32 系统调用
+    static char const* runtime_s = R"(
+.section .text
+.globl cpp2_write
+cpp2_write:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 0x30
+    mov QWORD PTR [rbp-0x18], rcx
+    mov QWORD PTR [rbp-0x20], rdx
+    mov ecx, -11
+    call GetStdHandle
+    mov rcx, rax
+    mov rdx, [rbp-0x18]
+    mov r8, [rbp-0x20]
+    lea r9, [rbp-0x08]
+    mov QWORD PTR [rbp-0x10], 0
+    call WriteFile
+    add rsp, 0x30
+    pop rbp
+    ret
+.globl cpp2_exit
+cpp2_exit:
+    call ExitProcess
+    ret
+.globl sys_exit
+sys_exit:
+    call ExitProcess
+    ret
+.globl cpp2_alloc
+cpp2_alloc:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 0x20
+    mov QWORD PTR [rbp-0x10], rcx
+    call GetProcessHeap
+    mov rcx, rax
+    mov rdx, 0
+    mov r8, [rbp-0x10]
+    call HeapAlloc
+    add rsp, 0x20
+    pop rbp
+    ret
+.globl cpp2_free
+cpp2_free:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 0x20
+    mov QWORD PTR [rbp-0x10], rcx
+    call GetProcessHeap
+    mov rcx, rax
+    mov rdx, 0
+    mov r8, [rbp-0x10]
+    call HeapFree
+    add rsp, 0x20
+    pop rbp
+    ret
+)";
+    std::string full = asm_text + "\n" + runtime_s;
+
+    auto res = asm64::assemble(full);
     if (res.text.empty()) throw Unsupported("asm64 produced no code");
 
-    // asm64 已内联回填内部 label 引用;外部符号(printf 等)需要 PE 导入表重定位。
-    // v0:外部符号引用暂不处理(需扩展 asm64 输出未解析 fixups)
-    std::vector<pe::Reloc> prelocs;
+    // 重定位:asm64 已把内部标签回填,其余(rodata + 外部导入)以 RIP 相对重定位给出
+    std::vector<pe::Reloc> relocs;
+    for (auto& r : res.relocs)
+        relocs.push_back({r.offset, r.target, r.ref, r.is_call});
+
     // 构建 rodata 标签表(label→offset in rodata blob)
     std::vector<uint8_t> rodata_blob;
     std::vector<std::pair<std::string,std::string>> ro_labels;
@@ -2914,22 +3004,33 @@ std::vector<uint8_t> emit_native(const std::string& asm_text)
         rodata_blob.insert(rodata_blob.end(), bytes.begin(), bytes.end());
     }
 
-    // 构建 text 内标签表(函数入口等)
+    // 构建 text 内标签表(函数入口等,跳过 .L 局部)
     std::vector<std::pair<std::string,size_t>> text_labels;
     for (auto& [name, off] : res.symbols) {
-        if (name[0] != '.')  // 只导出函数名,跳过 .L 局部标签
+        if (!name.empty() && name[0] != '.')
             text_labels.push_back({name, off});
     }
 
-    // 额外导入: printf → msvcrt.dll;其余 externs 也尝试映射到 msvcrt
-    std::vector<std::pair<std::string,std::string>> extra_imports;
+    // 动态导入表:把外部符号按 DLL 归类
+    std::map<std::string, std::vector<std::string>> imports_map;
+    auto dll_for = [](std::string const& s) -> std::string {
+        if (s == "printf" || s == "scanf" || s == "strlen" || s == "memcpy" ||
+            s == "sprintf" || s == "strcmp" || s == "strcpy" || s == "puts" ||
+            s == "malloc" || s == "free" || s == "exit" || s == "abort")
+            return "msvcrt.dll";
+        return "kernel32.dll";
+    };
     for (auto& e : res.externs) {
-        if (e == "ExitProcess" || e == "GetStdHandle" || e == "WriteFile") continue;
-        extra_imports.push_back({e, "msvcrt.dll"});
+        if (e == "cpp2_write" || e == "cpp2_exit" || e == "sys_exit" ||
+            e == "cpp2_alloc" || e == "cpp2_free")
+            continue;  // 由内联运行时提供
+        imports_map[dll_for(e)].push_back(e);
     }
+    std::vector<std::pair<std::string, std::vector<std::string>>> imports(
+        imports_map.begin(), imports_map.end());
 
-    return pe::build_exe(res.text, rodata_blob, prelocs,
-                         ro_labels, text_labels);
+    return pe::build_exe(res.text, rodata_blob, relocs,
+                         ro_labels, text_labels, imports);
 }
 
 #endif

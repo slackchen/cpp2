@@ -34,12 +34,15 @@ std::vector<u8> build_exe(
     u32 text_raw = hdr_size;
     u32 text_sz = (u32)text.size();
     u32 text_raw_sz = align(text_sz, file_align);
-    u32 rodata_rva = align(text_rva + text_sz, sect_align);
-    u32 rodata_raw = align(text_raw + text_raw_sz, file_align);
     u32 rodata_sz = (u32)rodata.size();
-    u32 rodata_raw_sz = align(rodata_sz, file_align);
-    u32 idata_rva = align(rodata_rva + rodata_sz, sect_align);
-    u32 idata_raw = align(rodata_raw + rodata_raw_sz, file_align);
+    bool has_rodata = rodata_sz > 0;
+    u32 rodata_rva = has_rodata ? align(text_rva + text_sz, sect_align) : 0;
+    u32 rodata_raw = has_rodata ? align(text_raw + text_raw_sz, file_align) : 0;
+    u32 rodata_raw_sz = has_rodata ? align(rodata_sz, file_align) : 0;
+    u32 idata_rva = has_rodata ? align(rodata_rva + rodata_sz, sect_align)
+                               : align(text_rva + text_sz, sect_align);
+    u32 idata_raw = has_rodata ? align(rodata_raw + rodata_raw_sz, file_align)
+                               : align(text_raw + text_raw_sz, file_align);
 
     // ── 标签映射 ──
     std::map<std::string, u32> ro_label_rva;
@@ -48,6 +51,9 @@ std::vector<u8> build_exe(
     std::map<std::string, u32> tx_label_rva;
     for (auto& p : text_labels)
         tx_label_rva[p.first] = text_rva + (u32)p.second;
+    u32 entry_rva = text_rva;
+    if (tx_label_rva.count("main")) entry_rva = tx_label_rva["main"];
+    else if (tx_label_rva.count("_main")) entry_rva = tx_label_rva["_main"];
 
     // ── 导入表布局(多 DLL 动态)──
     int ndll = (int)imports.size();
@@ -80,35 +86,43 @@ std::vector<u8> build_exe(
             ++gi;
         }
     }
+    u32 sym_slots = 0;
+    for (int d = 0; d < ndll; ++d)
+        sym_slots += (u32)(imports[d].second.size() + 1);  // 每 DLL +1 空项
     u32 off_iat = (cur + 15) & ~15u;
-    u32 off_thunk = off_iat + (u32)(total_syms * 8);
-    u32 idata_sz_calc = off_thunk + (u32)((total_syms + 1) * 8);
+    u32 off_thunk = off_iat + sym_slots * 8;
+    u32 idata_sz_calc = off_thunk + sym_slots * 8;
+
+    // 每 DLL 独立 IAT/INT 段偏移(段间留空项)
+    std::vector<u32> dll_iat_off(ndll), dll_thunk_off(ndll);
+    {
+        u32 acc = 0;
+        for (int d = 0; d < ndll; ++d) {
+            dll_iat_off[d] = off_iat + acc;
+            dll_thunk_off[d] = off_thunk + acc;
+            acc += (u32)(imports[d].second.size() + 1) * 8;
+        }
+    }
 
     // symbol name → IAT RVA
     std::unordered_map<std::string, u32> sym_to_iat;
     {
-        u32 idx = 0;
         for (int d = 0; d < ndll; ++d)
-            for (size_t k = 0; k < imports[d].second.size(); ++k) {
-                sym_to_iat[imports[d].second[k]] = idata_rva + off_iat + idx * 8;
-                ++idx;
-            }
+            for (size_t k = 0; k < imports[d].second.size(); ++k)
+                sym_to_iat[imports[d].second[k]] = idata_rva + dll_iat_off[d] + (u32)(k * 8);
     }
-    u32 iat_size = (u32)((total_syms + 1) * 8);
 
     // ── 组装 .idata ──
     std::vector<u8> idata((size_t)idata_sz_calc, 0);
     // descriptors
     {
-        u32 idx = 0;
         for (int d = 0; d < ndll; ++d) {
             u32 base = (u32)(d * 20);
-            u32 thunk_rva = idata_rva + off_thunk + (u32)(sym_gidx[d] * 8);
-            u32 ft_rva = idata_rva + off_iat + (u32)(sym_gidx[d] * 8);
+            u32 thunk_rva = idata_rva + dll_thunk_off[d];
+            u32 ft_rva = idata_rva + dll_iat_off[d];
             patch_u32(idata, base+0, thunk_rva);
             patch_u32(idata, base+12, idata_rva + dll_name_off[d]);
             patch_u32(idata, base+16, ft_rva);
-            (void)idx;
         }
         // null descriptor at base = ndll*20 (already zeroed)
     }
@@ -117,15 +131,13 @@ std::vector<u8> build_exe(
         memcpy(idata.data()+dll_name_off[d], imports[d].first.c_str(), imports[d].first.size()+1);
     // Hint/Name + IAT + Thunk
     {
-        u32 idx = 0;
         for (int d = 0; d < ndll; ++d) {
             for (size_t k = 0; k < imports[d].second.size(); ++k) {
                 u32 hn_rva = idata_rva + sym_hint_off[d][k];
                 patch_u16(idata, sym_hint_off[d][k], 0);
                 memcpy(idata.data()+sym_hint_off[d][k]+2, imports[d].second[k].c_str(), imports[d].second[k].size()+1);
-                put_u64_at(idata, off_iat   + (size_t)idx*8, hn_rva);
-                put_u64_at(idata, off_thunk + (size_t)idx*8, hn_rva);
-                ++idx;
+                put_u64_at(idata, dll_iat_off[d]   + (size_t)k*8, hn_rva);
+                put_u64_at(idata, dll_thunk_off[d] + (size_t)k*8, hn_rva);
             }
         }
     }
@@ -151,7 +163,7 @@ std::vector<u8> build_exe(
     out.push_back(0x0E); out.push_back(0x1E);
     put_u32(out, text_raw_sz + rodata_raw_sz + idata_raw_sz);
     put_u32(out, 0); put_u32(out, 0);
-    put_u32(out, text_rva);        // entry point
+    put_u32(out, entry_rva);       // entry point
     put_u32(out, text_rva);
     put_u64(out, image_base);
     put_u32(out, sect_align); put_u32(out, file_align);
@@ -163,11 +175,11 @@ std::vector<u8> build_exe(
     put_u32(out,0);put_u32(out,0);
     put_u32(out,idata_rva);put_u32(out,idata_sz);
     for(int i=2;i<12;++i){put_u32(out,0);put_u32(out,0);}
-    put_u32(out,idata_rva+off_iat);put_u32(out,iat_size);
+    put_u32(out,idata_rva+off_iat);put_u32(out,sym_slots*8);
     for(int i=13;i<16;++i){put_u32(out,0);put_u32(out,0);}
 
-    // Fix section count (3 sections: .text/.rdata/.idata)
-    patch_u16(out, 0x80+6, 3);
+    // Fix section count
+    patch_u16(out, 0x80+6, has_rodata ? 3 : 2);
 
     auto put_sect = [&](const char* name, u32 vsz, u32 va, u32 rawsz, u32 rawptr, u32 chars){
         char n[8]={0}; strncpy(n,name,8);
@@ -176,7 +188,8 @@ std::vector<u8> build_exe(
         put_u32(out,0);put_u32(out,0);put_u16(out,0);put_u16(out,0);put_u32(out,chars);
     };
     put_sect(".text",  text_sz,  text_rva,  text_raw_sz,  text_raw,  0x60000020);
-    put_sect(".rdata", rodata_sz,rodata_rva,rodata_raw_sz,rodata_raw,0x40000040);
+    if (has_rodata)
+        put_sect(".rdata", rodata_sz,rodata_rva,rodata_raw_sz,rodata_raw,0x40000040);
     put_sect(".idata", idata_sz, idata_rva, idata_raw_sz, idata_raw, 0xC0000040);
 
     while (out.size() < hdr_size) out.push_back(0);
@@ -193,13 +206,15 @@ std::vector<u8> build_exe(
         else if (ro_label_rva.count(r.target)) { target_rva = ro_label_rva[r.target]; resolved=true; }
         else if (sym_to_iat.count(r.target)) { target_rva = sym_to_iat[r.target]; resolved=true; }
         if (!resolved) target_rva = rodata_rva;
-        u32 rel_pos = text_rva + (u32)r.offset + 4;
+        u32 rel_pos = text_rva + (u32)r.ref;
         int32_t disp = (int32_t)(target_rva - rel_pos);
         patch_u32(out, text_off + r.offset, (u32)disp);
     }
 
-    out.insert(out.end(), rodata.begin(), rodata.end());
-    while (out.size() < rodata_raw + rodata_raw_sz) out.push_back(0);
+    if (has_rodata) {
+        out.insert(out.end(), rodata.begin(), rodata.end());
+        while (out.size() < rodata_raw + rodata_raw_sz) out.push_back(0);
+    }
     out.insert(out.end(), idata.begin(), idata.end());
     while (out.size() < idata_raw + idata_raw_sz) out.push_back(0);
     return out;

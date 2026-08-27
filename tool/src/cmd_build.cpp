@@ -120,7 +120,7 @@ int cmd_build(std::vector<std::string> const& args)
         } else {
             try {
 #ifdef _WIN32
-                // Windows: direct PE without g++ (B) for hello, else try asm+struct
+                // Windows: emit_pe(hello 专用) 优先;其余走 asm64 + direct PE(零 g++)
                 try {
                     auto pe_bytes = cpp2::native::emit_pe(g.units.at(g.root_name).ast,
                                                           p->sema.at(g.root_name));
@@ -132,30 +132,18 @@ int cmd_build(std::vector<std::string> const& args)
                     std::cerr << "[cpp2] native backend: emitting x86-64 Win64 (direct PE, no g++)\n";
                     std::cout << exe.string() << "\n";
                     return 0;
-                } catch (std::exception const& pe_e) {
-                    // hello 以外走 asm+struct 路径（仍经 g++ -c，但已支持 struct）
+                } catch (std::exception const&) {
                     std::string asm_text = cpp2::native::emit_asm(g.units.at(g.root_name).ast,
                                                                   p->sema.at(g.root_name));
-                    fs::create_directories(build_dir);
-                    fs::path s_file = build_dir / (in.stem().string() + ".s");
-                    fs::path prog_o = build_dir / "prog.o";
-                    fs::path rt_o   = build_dir / "native_rt.o";
-                    fs::path rt_src = fs::path("tools") / "native_rt.c";
-                    if (!fs::exists(rt_src)) rt_src = fs::path("..") / "tools" / "native_rt.c";
-                    fs::path exe = in.parent_path() / ".cpp2build" / (in.stem().string() + ".exe");
-                    tc::Family fam0 = tc::detect(cxx);
-                    std::string shim = cxx + " -x c -c " + quote(native(rt_src)) + " -o " + quote(native(rt_o));
-                    std::string asmc = cxx + " -c " + quote(native(s_file)) + " -o " + quote(native(prog_o));
-                    write_file(s_file, asm_text);
-                    std::cerr << "[cpp2] native backend: emitting x86-64 Win64 (asm+struct, via g++)\n";
-                    std::cerr << "[cpp2] " << shim << "\n";
-                    if (!run_capture(shim).ok) throw std::runtime_error(std::string("runtime shim build failed: ") + pe_e.what());
-                    std::cerr << "[cpp2] " << asmc << "\n";
-                    if (!run_capture(asmc).ok) throw std::runtime_error("assemble failed");
-                    std::string link = tc::link_command(cxx, fam0, {native(prog_o), native(rt_o)}, native(exe)) + ldflags_env();
-                    link += " -mconsole";
-                    std::cerr << "[cpp2] " << link << "\n";
-                    if (!run_capture(link).ok) throw std::runtime_error("link failed");
+                    fs::path native_dir = build_dir / "native";
+                    fs::create_directories(native_dir);
+                    fs::path exe = native_dir / (in.stem().string() + ".exe");
+                    write_file(native_dir / (in.stem().string() + ".s"), asm_text);
+                    auto pe_bytes = cpp2::native::emit_native(asm_text);
+                    std::ofstream out(native(exe), std::ios::binary);
+                    out.write(reinterpret_cast<char const*>(pe_bytes.data()), pe_bytes.size());
+                    out.close();
+                    std::cerr << "[cpp2] native backend: emitting x86-64 Win64 (asm64 + direct PE, no g++)\n";
                     std::cout << exe.string() << "\n";
                     return 0;
                 }
