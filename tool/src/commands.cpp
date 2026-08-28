@@ -115,14 +115,16 @@ int cmd_run(std::vector<std::string> const& args)
     if (want_native && !in.parent_path().empty()) {
         try {
             auto& g0 = p->graph;
+            std::string src_norm0 = in.string();
+            for (auto& ch : src_norm0) if (ch == '\\') ch = '/';   // 位置后缀与转译模式同格式
             auto asm_text = cpp2::native::emit_asm(
-                g0.units.at(g0.root_name).ast, p->sema.at(g0.root_name));
+                g0.units.at(g0.root_name).ast, p->sema.at(g0.root_name), src_norm0);
             fs::path build_dir0 = in.parent_path() / ".cpp2build" / "native";
             fs::create_directories(build_dir0);
 #ifdef _WIN32
+            write_file(build_dir0 / (in.stem().string() + ".asm"), asm_text);   // 失败也可查
             auto pe_bytes = cpp2::native::emit_native(asm_text);
             fs::path exe = build_dir0 / (in.stem().string() + ".exe");
-            write_file(build_dir0 / (in.stem().string() + ".asm"), asm_text);
             std::ofstream out(native(exe), std::ios::binary);
             out.write(reinterpret_cast<char const*>(pe_bytes.data()), pe_bytes.size());
             out.close();

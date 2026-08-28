@@ -184,7 +184,7 @@ std::vector<u8> build_exe(
     put_u32(out, sect_align); put_u32(out, file_align);
     put_u16(out,6);put_u16(out,0); put_u16(out,0);put_u16(out,0); put_u16(out,6);put_u16(out,0);
     put_u32(out,0); put_u32(out,image_sz); put_u32(out,hdr_size); put_u32(out,0);
-    put_u16(out,3); put_u16(out,0x8160);
+    put_u16(out,3); put_u16(out,0x0100);   // NX_COMPAT;无 .reloc,必须关 DYNAMIC_BASE/HIGH_ENTROPY_VA(ASLR 下加载器重定位会崩)
     put_u64(out,0x100000);put_u64(out,0x1000);put_u64(out,0x100000);put_u64(out,0x1000);
     put_u32(out,0); put_u32(out,16);
     put_u32(out,0);put_u32(out,0);

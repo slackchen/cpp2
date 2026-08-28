@@ -451,8 +451,6 @@ M1–M6 至此全部完成。剩余为 M7+(自举实验、原生后端评估,研
 
 回归 **105 用例全绿**,悬垂捕获率 14/14。
 
-回归 **105 用例全绿**,悬垂捕获率 14/14。
-
 **M7 自举第二批 + 原生后端 P0 完成记录(2026-08-24)**:
 - **ABI 冻结文档 v1(P0 交付)**:`docs/abi-freeze.md` 七节——数据表示、参数传递约定、错误通道布局(index+error 三字段)、命名与链接(cpp2mod 方案/无体声明)、运行时入口清单(trap/checked_*/gc/arena…)、版本化(CPP2_ABI_VERSION=1 混入缓存键)、明确不冻结清单。原生后端 P1(直译原型)的前置条件就此就位。
 - **错误链(库级)**:error 增 `cause`(shared_ptr 链)与 `chain()` 全链消息;`cpp2::err_caused(cause, msg)` 包装;示例 errchain(caused by 层级输出)。语言语法零改动,纯 rt 能力。
@@ -460,6 +458,15 @@ M1–M6 至此全部完成。剩余为 M7+(自举实验、原生后端评估,研
 - **自举暴露并修复的语言工效缝隙**(偏差表同步):string 字面量推断为 char*(需显式 `: string`)、`_` 不可作循环变量名、括号内 if 表达式不支持(改语句形态)、`in` 为关键字不可作变量名。
 - **CI**:千单元产物执行异常持续降级诊断(continue-on-error);grep 管道补 `2>&1`(build ok 走 stderr 的根因);gcc/clang 双矩阵全绿含 zlib 实测。**vendored zlib**(`third_party/zlib-1.3.1`,白名单入库)使本地可复现 zlib_demo。
 
+**原生后端 P1 完成记录(2026-08-26 → 08-28)**:ABI 冻结(P0)后实现启动,路线比 eval 文档的 P1 定义("仍链接 libstdc++")更激进——直接选路线三"手写 x64 直译":自写汇编器 + 直接生成 Windows PE,**零 g++、零 CRT**。
+- **asm64**(`tool/src/native/asm64.cpp`,v2):模式匹配式 x86-64 汇编器,两遍(先收集标号、后解析 fixup);覆盖 mov/push/pop/call/jmp/jcc(含 jz/jnz 别名)/setCC/movzx/movsx/lea rip-relative/imul/idiv+cqo/neg 等;v2 重写为规范操作数词法化(`QWORD PTR [rbp-N]`、通用 ModRM/SIB/disp、十六进制 base0、32 位寄存器),未知指令严格 throw;外部符号 fixup 导出供 PE 接 IAT。
+- **pe**(`tool/src/native/pe.cpp`):直接 PE 生成——任意 DLL+符号的动态导入表(每 DLL 独立 IAT/INT、空项分隔)、.data 段 blob、rodata 布局、入口 ExitProcess。运行时形态:零 CRT——print 走 cpp2_write thunk(kernel32 GetStdHandle+WriteFile),printf 族按需引 msvcrt.dll。
+- **管线接线**:`run`/`build --backend=native`(Windows)改走 emit_native,替换 g++ 汇编/链接回退;build.sh 收编 native/*.cpp。
+- **语言覆盖对齐转译语义**:循环(字面量与非字面量界)、函数调用、inout 参数(形参记录 + 调用点传址,含 Out)、沿基类链的字段偏移与方法查找、字符串拼接(cpp2_strcat + .data)、printf 格式化按类型分发、err() 携带源位置(.Lerrmsg)、析构器 return 跳过、div0 trap(.Lfmt_div0 rodata)。
+- 验证:循环累加(test_sum:`1..=100` 非字面量界 = 5050)、printf 多参、循环内 print 等 native 直出全部正确。
+
 ## 10. v0.x 明确不做
 
-原生后端、完整 borrow checker、反射、async/并发模型、跨编译器 BMI 共享、调试器专有扩展(DWARF/PDB 经 `#line` 已基本可用)。
+完整 borrow checker、反射、async/并发模型、跨编译器 BMI 共享、调试器专有扩展(DWARF/PDB 经 `#line` 已基本可用)。
+
+~~原生后端~~ **已移出本节**(2026-08-26 起):经 [native-backend-eval.md](docs/native-backend-eval.md) 评估后,P0(ABI 冻结)与 P1(直译原型)已交付,见上方 2026-08-24 / 08-28 完成记录;P2(LLVM-C 引入决策)、P3(自有优化器)仍维持评估态、按需启动。

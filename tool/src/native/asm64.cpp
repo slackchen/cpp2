@@ -17,7 +17,7 @@ using i8 = int8_t; using i32 = int32_t; using i64 = int64_t;
 
 namespace {
 
-enum class RegSize { R8, R32, R64 };
+enum class RegSize { R8, R32, R64, XMM };
 struct Reg { RegSize size; int id; };   // id = x86 register number (0=rax ... 15=r15)
 
 const std::unordered_map<std::string, Reg>& reg_table() {
@@ -39,6 +39,10 @@ const std::unordered_map<std::string, Reg>& reg_table() {
         // 8
         {"al",{RegSize::R8,0}},{"cl",{RegSize::R8,1}},{"dl",{RegSize::R8,2}},
         {"bl",{RegSize::R8,3}},
+        // SSE(xmm 仅作独立操作数,不进内存寻址)
+        {"xmm0",{RegSize::XMM,0}},{"xmm1",{RegSize::XMM,1}},{"xmm2",{RegSize::XMM,2}},
+        {"xmm3",{RegSize::XMM,3}},{"xmm4",{RegSize::XMM,4}},{"xmm5",{RegSize::XMM,5}},
+        {"xmm6",{RegSize::XMM,6}},{"xmm7",{RegSize::XMM,7}},
     };
     return m;
 }
@@ -549,6 +553,87 @@ struct Asm {
             return;
         }
 
+        // ── SSE2 double 子集(native.cpp 的 double 路径专用)──────────
+        // movq GPR↔XMM(双向:第 1/2 操作数任一为 XMM)
+        if (op == "movq" && ops.size() == 2 && ops[0].kind == Op::REG &&
+            ops[1].kind == Op::REG &&
+            ((ops[0].reg.size == RegSize::XMM) != (ops[1].reg.size == RegSize::XMM))) {
+            bool to_xmm = ops[0].reg.size == RegSize::XMM;
+            emit8(0x66);
+            emit8(rex(true, ops[0].reg.id, -1, ops[1].reg.id));
+            emit8(0x0F); emit8(to_xmm ? 0x6E : 0x7E);
+            emit8(modrm(3, ops[0].reg.id, ops[1].reg.id));
+            return;
+        }
+        if (ops.size() == 2 && ops[0].kind == Op::REG && ops[0].reg.size == RegSize::XMM) {
+            // 单目 xmm 源:movsd/cvtsi2sd/sqrtsd/comisd/ucomisd/addsd/subsd/mulsd/divsd
+            static const std::unordered_map<std::string, std::tuple<u8, u8, u8>> sse2{
+                // 前缀, OPCODE, 允许 mem 源
+                {"movsd",   {0xF2, 0x10, 1}},
+                {"addsd",   {0xF2, 0x58, 1}},
+                {"subsd",   {0xF2, 0x5C, 1}},
+                {"mulsd",   {0xF2, 0x59, 1}},
+                {"divsd",   {0xF2, 0x5E, 1}},
+                {"sqrtsd",  {0xF2, 0x51, 1}},
+                {"comisd",  {0x66, 0x2F, 1}},
+                {"ucomisd", {0x66, 0x2E, 1}},
+            };
+            if (op == "cvtsi2sd") {
+                if (ops[1].kind == Op::REG && ops[1].reg.size == RegSize::R64) {
+                    emit8(0xF2);
+                    emit8(rex(true, ops[0].reg.id, -1, ops[1].reg.id));
+                    emit8(0x0F); emit8(0x2A);
+                    emit8(modrm(3, ops[0].reg.id, ops[1].reg.id));
+                    return;
+                }
+                if (ops[1].kind == Op::MEM && ops[1].size == 8) {
+                    emit8(0xF2);
+                    emit8(rex(true, ops[0].reg.id, ops[1].index, ops[1].base));
+                    emit8(0x0F); emit8(0x2A);
+                    emit_mem_rm(ops[1], ops[0].reg.id);
+                    return;
+                }
+                fail("unsupported cvtsi2sd", line);
+            }
+            if (op == "cvtsd2si") {
+                if (ops[1].kind == Op::REG && ops[1].reg.size == RegSize::XMM && ops[0].reg.size == RegSize::R64) {
+                    emit8(0xF2);
+                    emit8(rex(true, ops[0].reg.id, -1, ops[1].reg.id));
+                    emit8(0x0F); emit8(0x2C);
+                    emit8(modrm(3, ops[0].reg.id, ops[1].reg.id));
+                    return;
+                }
+                fail("unsupported cvtsd2si", line);
+            }
+            auto sit = sse2.find(op);
+            if (sit != sse2.end()) {
+                auto const& [pfx, opc, allow_mem] = sit->second;
+                auto& src2 = ops[1];
+                if (src2.kind == Op::REG && src2.reg.size == RegSize::XMM) {
+                    emit8(pfx);
+                    emit8(rex(false, ops[0].reg.id, -1, src2.reg.id));
+                    emit8(0x0F); emit8(opc);
+                    emit8(modrm(3, ops[0].reg.id, src2.reg.id));
+                    return;
+                }
+                if (allow_mem && src2.kind == Op::MEM && src2.size == 8) {
+                    emit8(pfx);
+                    emit8(rex(false, ops[0].reg.id, src2.index, src2.base));
+                    emit8(0x0F); emit8(opc);
+                    emit_mem_rm(src2, ops[0].reg.id);
+                    return;
+                }
+                fail("unsupported " + op + " source", line);
+            }
+        }
+        if (op == "movsd" && ops.size() == 2 && ops[0].kind == Op::MEM && ops[0].size == 8 &&
+            ops[1].kind == Op::REG && ops[1].reg.size == RegSize::XMM) {
+            emit8(0xF2);
+            emit8(rex(false, ops[1].reg.id, ops[0].index, ops[0].base));
+            emit8(0x0F); emit8(0x11);
+            emit_mem_rm(ops[0], ops[1].reg.id);
+            return;
+        }
         fail("unknown instruction", line);
     }
 };
