@@ -136,14 +136,14 @@ private:
         return t.kind == K::String || t.kind == K::StringView;
     }
 
-    // inout 参数集合(当前函数):这些名字的槽存实参地址,读写须间接
+    // inout/out 参数集合(当前函数):这些名字的槽存实参地址,读写须间接
     std::set<std::string> inout_params_;
     bool is_inout_param(std::string const& n) const { return inout_params_.count(n) != 0; }
     void record_inout_params(std::vector<ast::Param>& params)
     {
         inout_params_.clear();
         for (auto& p : params)
-            if (p.mode == ast::ParamMode::Inout) inout_params_.insert(p.name);
+            if (p.mode == ast::ParamMode::Inout || p.mode == ast::ParamMode::Out) inout_params_.insert(p.name);
     }
 
     ast::StructDecl* cur_struct_ = nullptr;   // 方法发射时的所属类型(经 this 字段访问)
@@ -225,6 +225,11 @@ private:
             }
             out_ << ".text\n";
         }
+        // div0 trap 消息(供 checked div 使用)
+        out_ << ".section .rodata\n";
+        out_ << ".Lfmt_div0:\n";
+        out_ << "    .string \"division by zero\\n\"\n";
+        out_ << ".text\n";
         // 全局错误串槽(err() 写 / e.message() 读),始终存在
         out_ << ".data\n";
         out_ << ".Lerrmsg:\n";
@@ -1445,7 +1450,7 @@ private:
             if (f.name == nm.parts[0] && f.params.size() == c.args.size()) { c2_callee = &f; break; }
         for (size_t i = 0; i < c.args.size(); ++i) {
             auto& a = c.args[i];
-            bool pass_addr = c2_callee && c2_callee->params[i].mode == ast::ParamMode::Inout
+            bool pass_addr = c2_callee && (c2_callee->params[i].mode == ast::ParamMode::Inout || c2_callee->params[i].mode == ast::ParamMode::Out)
                           && a->kind() == ast::Expr::Name;
             if (pass_addr) {
                 auto& an = static_cast<ast::NameExpr&>(*a);
@@ -1740,14 +1745,14 @@ private:
         return t.kind == K::String || t.kind == K::StringView;
     }
 
-    // inout 参数集合(当前函数):这些名字的槽存实参地址,读写须间接
+    // inout/out 参数集合(当前函数):这些名字的槽存实参地址,读写须间接
     std::set<std::string> inout_params_;
     bool is_inout_param(std::string const& n) const { return inout_params_.count(n) != 0; }
     void record_inout_params(std::vector<ast::Param>& params)
     {
         inout_params_.clear();
         for (auto& p : params)
-            if (p.mode == ast::ParamMode::Inout) inout_params_.insert(p.name);
+            if (p.mode == ast::ParamMode::Inout || p.mode == ast::ParamMode::Out) inout_params_.insert(p.name);
     }
 
     ast::StructDecl* cur_struct_ = nullptr;   // 方法发射时的所属类型(经 this 字段访问)
@@ -1829,6 +1834,11 @@ private:
             }
             out_ << ".text\n";
         }
+        // div0 trap 消息(供 checked div 使用)
+        out_ << ".section .rodata\n";
+        out_ << ".Lfmt_div0:\n";
+        out_ << "    .string \"division by zero\\n\"\n";
+        out_ << ".text\n";
         // 全局错误串槽(err() 写 / e.message() 读),始终存在
         out_ << ".data\n";
         out_ << ".Lerrmsg:\n";
@@ -3122,13 +3132,13 @@ private:
         }
         if (nm.qualified()) unsup("qualified calls (std bridge)");
         if (c.args.size() > 4) unsup("more than 4 call arguments on Windows native");
-        // inout 实参传地址(裸名字且槽存在);其余传值
+        // inout/out 实参传地址(裸名字且槽存在);其余传值
         ast::FuncDecl* c2_callee = nullptr;
         for (auto& f : m_->funcs)
             if (f.name == nm.parts[0] && f.params.size() == c.args.size()) { c2_callee = &f; break; }
         for (size_t i = 0; i < c.args.size(); ++i) {
             auto& a = c.args[i];
-            bool pass_addr = c2_callee && c2_callee->params[i].mode == ast::ParamMode::Inout
+            bool pass_addr = c2_callee && (c2_callee->params[i].mode == ast::ParamMode::Inout || c2_callee->params[i].mode == ast::ParamMode::Out)
                           && a->kind() == ast::Expr::Name;
             if (pass_addr) {
                 auto& an = static_cast<ast::NameExpr&>(*a);

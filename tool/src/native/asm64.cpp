@@ -542,7 +542,7 @@ struct Asm {
             fail("unsupported jmp", line);
         }
         static const std::unordered_map<std::string, u8> jcc{
-            {"je",0x84},{"jne",0x85},{"jl",0x8C},{"jg",0x8F},{"jle",0x8E},{"jge",0x8D},
+            {"je",0x84},{"jne",0x85},{"jz",0x84},{"jnz",0x85},{"jl",0x8C},{"jg",0x8F},{"jle",0x8E},{"jge",0x8D},
             {"ja",0x87},{"jae",0x83},{"jb",0x82},{"jbe",0x86},{"js",0x88},{"jns",0x89}};
         if (jcc.count(op) && ops.size() == 1 && ops[0].kind == Op::SYM) {
             branch(ops[0].sym, /*is_call=*/false, jcc.at(op), /*two_byte=*/true);
