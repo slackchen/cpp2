@@ -11,5 +11,5 @@ esac
 
 mkdir -p .cpp2build
 # shellcheck disable=SC2086
-"$CXX" -std=c++23 -O1 -Wall -Wextra tool/src/*.cpp -o "$EXE"
+"$CXX" -std=c++23 -O1 -Wall -Wextra tool/src/*.cpp tool/src/native/*.cpp -o "$EXE"
 echo "built $EXE"

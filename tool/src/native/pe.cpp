@@ -22,7 +22,10 @@ std::vector<u8> build_exe(
     const std::vector<std::pair<std::string,size_t>>& text_labels,
     // 动态导入表:DLL名 → 符号列表。至少含 kernel32 三件套;
     // 额外 DLL(如 msvcrt.dll:printf)按需追加。
-    const std::vector<std::pair<std::string, std::vector<std::string>>>& imports)
+    const std::vector<std::pair<std::string, std::vector<std::string>>>& imports,
+    // 可写 .data 段(全局槽,如错误消息指针);data_labels = name → offset in data
+    const std::vector<u8>& data,
+    const std::vector<std::pair<std::string,std::string>>& data_labels)
 {
     const u64 image_base = 0x140000000ULL;
     const u32 sect_align = 0x1000;
@@ -39,15 +42,27 @@ std::vector<u8> build_exe(
     u32 rodata_rva = has_rodata ? align(text_rva + text_sz, sect_align) : 0;
     u32 rodata_raw = has_rodata ? align(text_raw + text_raw_sz, file_align) : 0;
     u32 rodata_raw_sz = has_rodata ? align(rodata_sz, file_align) : 0;
-    u32 idata_rva = has_rodata ? align(rodata_rva + rodata_sz, sect_align)
+    u32 data_sz = (u32)data.size();
+    bool has_data = data_sz > 0;
+    u32 data_rva = has_rodata ? align(rodata_rva + rodata_sz, sect_align)
+                              : align(text_rva + text_sz, sect_align);
+    u32 data_raw = has_rodata ? align(rodata_raw + rodata_raw_sz, file_align)
+                              : align(text_raw + text_raw_sz, file_align);
+    u32 data_raw_sz = has_data ? align(data_sz, file_align) : 0;
+    u32 idata_rva = has_data ? align(data_rva + data_sz, sect_align)
+                             : has_rodata ? align(rodata_rva + rodata_sz, sect_align)
                                : align(text_rva + text_sz, sect_align);
-    u32 idata_raw = has_rodata ? align(rodata_raw + rodata_raw_sz, file_align)
+    u32 idata_raw = has_data ? align(data_raw + data_raw_sz, file_align)
+                             : has_rodata ? align(rodata_raw + rodata_raw_sz, file_align)
                                : align(text_raw + text_raw_sz, file_align);
 
     // ── 标签映射 ──
     std::map<std::string, u32> ro_label_rva;
     for (auto& p : rodata_labels)
         ro_label_rva[p.first] = rodata_rva + (u32)std::stoul(p.second);
+    std::map<std::string, u32> da_label_rva;
+    for (auto& p : data_labels)
+        da_label_rva[p.first] = data_rva + (u32)std::stoul(p.second);
     std::map<std::string, u32> tx_label_rva;
     for (auto& p : text_labels)
         tx_label_rva[p.first] = text_rva + (u32)p.second;
@@ -161,7 +176,7 @@ std::vector<u8> build_exe(
     size_t opt_start = out.size();
     put_u16(out, 0x020B);
     out.push_back(0x0E); out.push_back(0x1E);
-    put_u32(out, text_raw_sz + rodata_raw_sz + idata_raw_sz);
+    put_u32(out, text_raw_sz + rodata_raw_sz + data_raw_sz + idata_raw_sz);
     put_u32(out, 0); put_u32(out, 0);
     put_u32(out, entry_rva);       // entry point
     put_u32(out, text_rva);
@@ -179,7 +194,7 @@ std::vector<u8> build_exe(
     for(int i=13;i<16;++i){put_u32(out,0);put_u32(out,0);}
 
     // Fix section count
-    patch_u16(out, 0x80+6, has_rodata ? 3 : 2);
+    patch_u16(out, 0x80+6, (has_rodata ? 1 : 0) + (has_data ? 1 : 0) + 2);
 
     auto put_sect = [&](const char* name, u32 vsz, u32 va, u32 rawsz, u32 rawptr, u32 chars){
         char n[8]={0}; strncpy(n,name,8);
@@ -190,6 +205,8 @@ std::vector<u8> build_exe(
     put_sect(".text",  text_sz,  text_rva,  text_raw_sz,  text_raw,  0x60000020);
     if (has_rodata)
         put_sect(".rdata", rodata_sz,rodata_rva,rodata_raw_sz,rodata_raw,0x40000040);
+    if (has_data)
+        put_sect(".data",  data_sz,  data_rva,  data_raw_sz,  data_raw,  0xC0000040);
     put_sect(".idata", idata_sz, idata_rva, idata_raw_sz, idata_raw, 0xC0000040);
 
     while (out.size() < hdr_size) out.push_back(0);
@@ -204,6 +221,7 @@ std::vector<u8> build_exe(
         bool resolved = false;
         if (tx_label_rva.count(r.target)) { target_rva = tx_label_rva[r.target]; resolved=true; }
         else if (ro_label_rva.count(r.target)) { target_rva = ro_label_rva[r.target]; resolved=true; }
+        else if (da_label_rva.count(r.target)) { target_rva = da_label_rva[r.target]; resolved=true; }
         else if (sym_to_iat.count(r.target)) { target_rva = sym_to_iat[r.target]; resolved=true; }
         if (!resolved) target_rva = rodata_rva;
         u32 rel_pos = text_rva + (u32)r.ref;
@@ -214,6 +232,10 @@ std::vector<u8> build_exe(
     if (has_rodata) {
         out.insert(out.end(), rodata.begin(), rodata.end());
         while (out.size() < rodata_raw + rodata_raw_sz) out.push_back(0);
+    }
+    if (has_data) {
+        out.insert(out.end(), data.begin(), data.end());
+        while (out.size() < data_raw + data_raw_sz) out.push_back(0);
     }
     out.insert(out.end(), idata.begin(), idata.end());
     while (out.size() < idata_raw + idata_raw_sz) out.push_back(0);

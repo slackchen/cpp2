@@ -9,6 +9,7 @@
 
 #include <algorithm>
 #include <iostream>
+#include <set>
 #include <sstream>
 
 #ifndef _WIN32
@@ -58,10 +59,12 @@ bool is_int_kind(sema::Type::Kind k)
 
 class NativeEmitter {
 public:
-    std::string emit(ast::Module& m, sema::Result const&)
+    std::string emit(ast::Module& m, sema::Result const& r, std::string const& src_path = {})
     {
         std::cerr << "[native] emit for module " << m.name << " funcs " << m.funcs.size() << " structs " << m.structs.size() << std::endl;
         m_ = &m;
+        R_ = &r;
+        src_path_ = src_path;
         precheck();
         out_ << ".intel_syntax noprefix\n";
         emit_globals();
@@ -74,7 +77,6 @@ public:
         }
         for (auto& s : m_->structs) {
             for (auto& md : s.methods) {
-                if (md.name == "destructor") continue;
                 emit_method(s, md);
             }
         }
@@ -84,6 +86,8 @@ public:
 
 private:
     ast::Module* m_ = nullptr;
+    sema::Result const* R_ = nullptr;
+    std::string src_path_;   // 源文件路径(err() 位置后缀用)
     std::ostringstream out_;
     int label_ = 0;
     int push_depth_ = 0;
@@ -95,6 +99,98 @@ private:
     std::unordered_map<std::string, std::string> str_pool_;
 
     [[noreturn]] void unsup(std::string const& msg) { throw Unsupported(msg); }
+
+    sema::Type type_of(ast::Expr* e) const { return R_ ? R_->type_of(*e) : sema::Type{}; }
+
+    // printf 格式符按静态类型选择(string 在 native v0 = NUL 结尾 char 指针)
+    char const* fmt_for(ast::Expr* e)
+    {
+        if (!R_ || !e) return "%lld";
+        // std 桥:e.message() 返回错误 C 串 → %s
+        if (e->kind() == ast::Expr::Call) {
+            auto& c = static_cast<ast::CallExpr&>(*e);
+            if (c.callee->kind() == ast::Expr::Member &&
+                static_cast<ast::MemberExpr&>(*c.callee).name == "message")
+                return "%s";
+        }
+        auto t = R_->type_of(*e);
+        using K = sema::Type::Kind;
+        switch (t.kind) {
+        case K::String: case K::StringView: return "%s";
+        case K::Char:   return "%c";
+        case K::Double: case K::Float: return "%f";
+        case K::Bool:   return "%d";
+        default:        return "%lld";
+        }
+    }
+
+    // 静态类型是否 string(字面量直接判定;其余查 sema)—— 用于 + 拼接判定
+    bool is_string_expr(ast::Expr* e)
+    {
+        if (!e) return false;
+        if (auto* lit = dynamic_cast<ast::LiteralExpr*>(e))
+            if (lit->lit == ast::LitKind::String) return true;
+        if (!R_) return false;
+        auto t = R_->type_of(*e);
+        using K = sema::Type::Kind;
+        return t.kind == K::String || t.kind == K::StringView;
+    }
+
+    // inout 参数集合(当前函数):这些名字的槽存实参地址,读写须间接
+    std::set<std::string> inout_params_;
+    bool is_inout_param(std::string const& n) const { return inout_params_.count(n) != 0; }
+    void record_inout_params(std::vector<ast::Param>& params)
+    {
+        inout_params_.clear();
+        for (auto& p : params)
+            if (p.mode == ast::ParamMode::Inout) inout_params_.insert(p.name);
+    }
+
+    ast::StructDecl* cur_struct_ = nullptr;   // 方法发射时的所属类型(经 this 字段访问)
+
+    ast::StructDecl* find_sd(std::string const& n)
+    {
+        for (auto& s : m_->structs) if (s.name == n) return &s;
+        return nullptr;
+    }
+
+    // 字段偏移沿基类链累计(基类字段居低地址,与 C++ 布局同构);未找到返回 -1
+    int field_offset_in(ast::StructDecl* sd, std::string const& fname)
+    {
+        int off = 0;
+        std::string bn = (sd->base && !sd->base->parts.empty()) ? sd->base->parts[0] : "";
+        while (!bn.empty()) {
+            ast::StructDecl* bs = find_sd(bn);
+            if (!bs) break;
+            for (size_t i = 0; i < bs->fields.size(); ++i)
+                if (bs->fields[i].name == fname) return off + (int)i * 8;
+            off += (int)bs->fields.size() * 8;
+            bn = (bs->base && !bs->base->parts.empty()) ? bs->base->parts[0] : "";
+        }
+        for (size_t i = 0; i < sd->fields.size(); ++i)
+            if (sd->fields[i].name == fname) return off + (int)i * 8;
+        return -1;
+    }
+
+    // 全字段视图(基类在前),StructLit 初始化用;second = 字节偏移
+    std::vector<std::pair<ast::FieldDecl*, int>> fields_deep(ast::StructDecl* sd)
+    {
+        std::vector<std::pair<ast::FieldDecl*, int>> out;
+        std::vector<ast::StructDecl*> chain;
+        for (std::string bn = (sd->base && !sd->base->parts.empty()) ? sd->base->parts[0] : "";
+             !bn.empty();) {
+            ast::StructDecl* bs = find_sd(bn);
+            if (!bs) break;
+            chain.push_back(bs);
+            bn = (bs->base && !bs->base->parts.empty()) ? bs->base->parts[0] : "";
+        }
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+            for (auto& f : (*it)->fields)
+                out.push_back({&f, (int)out.size() * 8});
+        for (auto& f : sd->fields)
+            out.push_back({&f, (int)out.size() * 8});
+        return out;
+    }
 
     void put(std::string const& s) { out_ << s << "\n"; }
     void ins(std::string const& s) { out_ << "    " << s << "\n"; }
@@ -112,21 +208,27 @@ private:
 
     void emit_rodata_strs()
     {
-        if (str_pool_.empty()) return;
-        out_ << ".section .rodata\n";
-        for (auto const& [text, lblname] : str_pool_) {
-            out_ << lblname << ":\n";
-            out_ << "    .string \"";
-            for (char c : text) {
-                if (c == '\\') out_ << "\\\\";
-                else if (c == '"') out_ << "\\\"";
-                else if (c == '\n') out_ << "\\n";
-                else if (c == '\t') out_ << "\\t";
-                else if (c == '\0') break;
-                else out_ << c;
+        if (!str_pool_.empty()) {
+            out_ << ".section .rodata\n";
+            for (auto const& [text, lblname] : str_pool_) {
+                out_ << lblname << ":\n";
+                out_ << "    .string \"";
+                for (char c : text) {
+                    if (c == '\\') out_ << "\\\\";
+                    else if (c == '"') out_ << "\\\"";
+                    else if (c == '\n') out_ << "\\n";
+                    else if (c == '\t') out_ << "\\t";
+                    else if (c == '\0') break;
+                    else out_ << c;
+                }
+                out_ << "\"\n";
             }
-            out_ << "\"\n";
+            out_ << ".text\n";
         }
+        // 全局错误串槽(err() 写 / e.message() 读),始终存在
+        out_ << ".data\n";
+        out_ << ".Lerrmsg:\n";
+        out_ << "    .quad 0\n";
         out_ << ".text\n";
     }
 
@@ -266,8 +368,11 @@ private:
     {
         cur_fn_ = &f;
         cur_sym_name_ = f.name;
+        cur_struct_ = nullptr;
+        scope_stack_.clear();
         slots_.clear();
         push_depth_ = 0;
+        record_inout_params(f.params);
 
         for (size_t i = 0; i < f.params.size(); ++i)
             slots_[f.params[i].name] = -(8 * (int)(i + 1));
@@ -319,8 +424,11 @@ private:
         std::string mname = s.name + "_" + m.name;
         cur_fn_ = nullptr;
         cur_sym_name_ = mname;
+        cur_struct_ = &s;
+        scope_stack_.clear();
         slots_.clear();
         push_depth_ = 0;
+        record_inout_params(m.params);
         slots_["this"] = -(8 * 1);
         for (size_t i = 0; i < m.params.size(); ++i)
             slots_[m.params[i].name] = -(8 * (int)(i + 2));
@@ -358,11 +466,66 @@ private:
     }
 
     // ── 语句 ────────────────────────────────────────────────────
+    // 作用域析构栈:每层 block 一个帧,记录 (变量名, 声明析构器的 struct)
+    using DtorEntry = std::pair<std::string, ast::StructDecl*>;
+    std::vector<std::vector<DtorEntry>> scope_stack_;
+
+    void emit_dtor_call(DtorEntry const& vd)
+    {
+        int off = slot_of(vd.first);
+        ins("lea rax, QWORD PTR [rbp" + std::to_string(off) + "]");
+        ins("push rax");
+        ++push_depth_;
+        ins("pop rdi");
+        --push_depth_;
+        if (push_depth_ % 2 == 1) ins("sub rsp, 8");
+        ins("call " + vd.second->name + "_destructor");
+        if (push_depth_ % 2 == 1) ins("add rsp, 8");
+    }
+
+    // return 离开全部作用域:自内向外调用所有未析构的 struct 局部
+    // skip:被返回的局部(所有权移交给调用方),不在此处析构
+    void emit_all_dtors_for_return(std::string const& skip = {})
+    {
+        for (auto it = scope_stack_.rbegin(); it != scope_stack_.rend(); ++it)
+            for (auto jt = it->rbegin(); jt != it->rend(); ++jt)
+                if (skip.empty() || jt->first != skip) emit_dtor_call(*jt);
+        for (auto& f : scope_stack_) f.clear();
+    }
+
     void emit_stmt(ast::Stmt* s)
     {
         switch (s->kind()) {
         case ast::Stmt::Block: {
-            for (auto& st : static_cast<ast::BlockStmt*>(s)->stmts) emit_stmt(st.get());
+            auto& blk = *static_cast<ast::BlockStmt*>(s);
+            // 预扫描本块直接声明的、带析构器的 struct 局部变量(DESIGN §5.3)
+            scope_stack_.emplace_back();
+            for (auto& st : blk.stmts) {
+                if (st->kind() != ast::Stmt::Var) continue;
+                auto& v = *static_cast<ast::VarStmt*>(st.get());
+                std::string tn;
+                if (v.has_type && !v.type.parts.empty()) tn = v.type.parts[0];
+                else if (R_ && v.init) {
+                    auto vt = R_->type_of(*v.init);
+                    if (vt.kind == sema::Type::Kind::NamedStruct) tn = vt.name;
+                }
+                if (tn.empty()) continue;
+                ast::StructDecl* tsd = find_sd(tn);
+                if (!tsd) continue;
+                ast::StructDecl* dsd = nullptr;
+                for (ast::StructDecl* s2 = tsd; s2 && !dsd;) {
+                    for (auto& m2 : s2->methods) if (m2.name == "destructor") { dsd = s2; break; }
+                    if (!dsd)
+                        s2 = (s2->base && !s2->base->parts.empty()) ? find_sd(s2->base->parts[0]) : nullptr;
+                }
+                if (dsd) scope_stack_.back().push_back({v.name, dsd});
+            }
+            for (auto& st : blk.stmts) emit_stmt(st.get());
+            {
+                auto& fr = scope_stack_.back();
+                for (auto it = fr.rbegin(); it != fr.rend(); ++it) emit_dtor_call(*it);
+            }
+            scope_stack_.pop_back();
             break;
         }
         case ast::Stmt::ExprStmt:
@@ -403,16 +566,19 @@ private:
                         base_off = lo;
                         second_off = hi;
                     }
-                    for (size_t i=0;i<sd->fields.size();++i) {
-                        bool found = false;
-                        for (auto& pr : sl.fields) if (pr.first == sd->fields[i].name) {
-                            eval(pr.second.get());
-                            found = true;
-                            break;
+                    {
+                        auto fds = fields_deep(sd);
+                        for (size_t i=0;i<fds.size();++i) {
+                            bool found = false;
+                            for (auto& pr : sl.fields) if (pr.first == fds[i].first->name) {
+                                eval(pr.second.get());
+                                found = true;
+                                break;
+                            }
+                            if (!found) eval(fds[i].first->init.get());
+                            int off2 = (i==0) ? lo : hi;
+                            ins("mov QWORD PTR [rbp" + std::to_string(off2) + "], rax");
                         }
-                        if (!found) eval(sd->fields[i].init.get());
-                        int off2 = (i==0) ? lo : hi;
-                        ins("mov QWORD PTR [rbp" + std::to_string(off2) + "], rax");
                     }
                     break;
                 }
@@ -450,16 +616,19 @@ private:
                     for (auto& s2 : m_->structs) if (s2.name == tn) { sd = &s2; break; }
                 }
                 if (sd) {
-                    for (size_t i=0;i<sd->fields.size();++i) {
-                        bool found = false;
-                        for (auto& pr : ((ast::StructLitExpr&)*v.init).fields)
-                            if (pr.first == sd->fields[i].name) {
-                                eval(pr.second.get());
-                                found = true;
-                                break;
-                            }
-                        if (!found) eval(sd->fields[i].init.get());
-                        ins("mov QWORD PTR [rbp" + std::to_string(data_off + (int)i*8) + "], rax");
+                    {
+                        auto fds = fields_deep(sd);
+                        for (size_t i=0;i<fds.size();++i) {
+                            bool found = false;
+                            for (auto& pr : ((ast::StructLitExpr&)*v.init).fields)
+                                if (pr.first == fds[i].first->name) {
+                                    eval(pr.second.get());
+                                    found = true;
+                                    break;
+                                }
+                            if (!found) eval(fds[i].first->init.get());
+                            ins("mov QWORD PTR [rbp" + std::to_string(data_off + (int)i*8) + "], rax");
+                        }
                     }
                 }
                 break;
@@ -474,6 +643,16 @@ private:
             auto& r = static_cast<ast::ReturnStmt&>(*s);
             if (r.value) eval(r.value.get());
             else ins("xor eax, eax");
+            // 被返回的具名局部移交给调用方,返回路径跳过其析构
+            std::string skip;
+            if (r.value && r.value->kind() == ast::Expr::Name)
+                skip = static_cast<ast::NameExpr&>(*r.value).parts[0];
+            // 析构调用会破坏 rax(caller-saved),返回值先压栈
+            bool has_dtors = false;
+            for (auto& f : scope_stack_) if (!f.empty()) { has_dtors = true; break; }
+            if (has_dtors) { ins("push rax"); ++push_depth_; }
+            emit_all_dtors_for_return(skip);
+            if (has_dtors) { ins("pop rax"); --push_depth_; }
             ins("jmp .Lret_" + (cur_fn_ ? cur_fn_->name : cur_sym_name_));
             break;
         }
@@ -774,19 +953,17 @@ private:
             {
                 bool is_field = false;
                 int field_off = -1;
-                for (auto& s : m_->structs) {
-                    for (size_t i=0;i<s.fields.size();++i) if (s.fields[i].name == n.parts[0]) {
-                        field_off = (int)i * 8;
-                        is_field = true;
-                        break;
-                    }
-                    if (is_field) break;
+                if (cur_struct_) {
+                    field_off = field_offset_in(cur_struct_, n.parts[0]);
+                    is_field = field_off != -1;
                 }
                 if (is_field && cur_fn_ == nullptr) {
                     ins("mov rax, QWORD PTR [rbp-8]");
                     ins("mov rax, QWORD PTR [rax+" + std::to_string(field_off) + "]");
                 } else {
-                    ins("mov rax, QWORD PTR [rbp" + std::to_string(slot_or_new(n.parts[0])) + "]");
+                    int voff = slot_or_new(n.parts[0]);
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(voff) + "]");
+                    if (is_inout_param(n.parts[0])) ins("mov rax, QWORD PTR [rax]");
                 }
             }
             name_done:
@@ -816,6 +993,7 @@ private:
                 std::string lop = a.op.substr(0, a.op.size() - 1); // "+=" -> "+"
                 // lhs -> rcx, rhs -> rax, then compute
                 ins("mov rax, QWORD PTR [rbp" + std::to_string(off) + "]");
+                if (is_inout_param(n.parts[0])) ins("mov rax, QWORD PTR [rax]");
                 ins("push rax");
                 ++push_depth_;
                 eval(a.value.get());
@@ -862,6 +1040,9 @@ private:
                 ins("pop rcx");
                 --push_depth_;
                 ins("mov QWORD PTR [rcx], rax");
+            } else if (is_inout_param(n.parts[0])) {
+                ins("mov rcx, QWORD PTR [rbp" + std::to_string(off) + "]");   // 实参地址
+                ins("mov QWORD PTR [rcx], rax");
             } else {
                 ins("mov QWORD PTR [rbp" + std::to_string(off) + "], rax");
             }
@@ -872,16 +1053,27 @@ private:
             if (m.base->kind() != ast::Expr::Name) unsup("member base must be name");
             auto& base = static_cast<ast::NameExpr&>(*m.base);
             int field_off = -1;
-            for (auto& s : m_->structs) {
-                for (size_t i=0;i<s.fields.size();++i) if (s.fields[i].name == m.name) {
-                    field_off = (int)i * 8;
-                    break;
+            if (R_) {
+                auto bt = R_->type_of(*m.base);
+                if (bt.kind == sema::Type::Kind::NamedStruct) {
+                    if (ast::StructDecl* rsd = find_sd(bt.name))
+                        field_off = field_offset_in(rsd, m.name);
                 }
-                if (field_off != -1) break;
+            }
+            if (field_off == -1) {
+                for (auto& s : m_->structs) {
+                    field_off = field_offset_in(&s, m.name);
+                    if (field_off != -1) break;
+                }
             }
             if (field_off == -1) unsup("unknown field '" + m.name + "'");
             int base_off = slot_of(base.parts[0]);
-            ins("mov rax, QWORD PTR [rbp" + std::to_string(base_off + field_off) + "]");
+            if (is_inout_param(base.parts[0])) {
+                ins("mov rax, QWORD PTR [rbp" + std::to_string(base_off) + "]");   // 实参地址
+                ins("mov rax, QWORD PTR [rax+" + std::to_string(field_off) + "]");
+            } else {
+                ins("mov rax, QWORD PTR [rbp" + std::to_string(base_off + field_off) + "]");
+            }
             break;
         }
         case ast::Expr::StructLit: {
@@ -894,15 +1086,18 @@ private:
             int tmp_off = slot_or_new(tmp);
             std::string tmp2 = tmp + "_2";
             slot_or_new(tmp2);
-            for (size_t i=0;i<sd->fields.size();++i) {
-                bool found = false;
-                for (auto& pr : sl.fields) if (pr.first == sd->fields[i].name) {
-                    eval(pr.second.get());
-                    found = true;
-                    break;
+            {
+                auto fds = fields_deep(sd);
+                for (size_t i=0;i<fds.size();++i) {
+                    bool found = false;
+                    for (auto& pr : sl.fields) if (pr.first == fds[i].first->name) {
+                        eval(pr.second.get());
+                        found = true;
+                        break;
+                    }
+                    if (!found) eval(fds[i].first->init.get());
+                    ins("mov QWORD PTR [rbp" + std::to_string(tmp_off + (int)fds[i].second) + "], rax");
                 }
-                if (!found) eval(sd->fields[i].init.get());
-                ins("mov QWORD PTR [rbp" + std::to_string(tmp_off + (int)i*8) + "], rax");
             }
             ins("mov rax, " + std::to_string(tmp_off));
             break;
@@ -1009,9 +1204,24 @@ private:
             auto& base = static_cast<ast::NameExpr&>(*mem.base);
             ast::StructDecl* sd = nullptr;
             ast::MethodDecl* md = nullptr;
-            for (auto& s : m_->structs) {
-                for (auto& m : s.methods) if (m.name == mem.name) { sd = &s; md = &m; break; }
-                if (sd) break;
+            // 接收者静态类型优先沿继承链解析(派生方法隐藏基类同名)
+            if (R_) {
+                auto bt = R_->type_of(*mem.base);
+                if (bt.kind == sema::Type::Kind::NamedStruct) {
+                    ast::StructDecl* s = find_sd(bt.name);
+                    while (s && !md) {
+                        for (auto& m : s->methods)
+                            if (m.name == mem.name) { sd = s; md = &m; break; }
+                        if (!md)
+                            s = (s->base && !s->base->parts.empty()) ? find_sd(s->base->parts[0]) : nullptr;
+                    }
+                }
+            }
+            if (!sd || !md) {
+                for (auto& s : m_->structs) {
+                    for (auto& m : s.methods) if (m.name == mem.name) { sd = &s; md = &m; break; }
+                    if (sd) break;
+                }
             }
             if (!sd || !md) {
                 // std 方法桥(v0 语义化降级):
@@ -1065,8 +1275,9 @@ private:
                     return;
                 }
                 if (mem.name == "message") {
-                    eval(mem.base.get());
-                    ins("xor eax, eax");          // v0:错误串不可用,返回空
+                    // v1:错误串由 err() 写入全局槽,e.message() 读出
+                    ins("lea rax, .Lerrmsg[rip]");
+                    ins("mov rax, QWORD PTR [rax]");
                     return;
                 }
                 if (mem.name == "has_value") {
@@ -1120,7 +1331,35 @@ private:
         // 单字符池、sys_exit=kernel32 IAT。ELF 规划: syscall 序列。
         if (!nm.qualified()) {
             std::string const& bn = nm.parts[0];
-            if (bn == "err") { ins("xor eax, eax"); return; }  // 语言级哨兵
+            if (bn == "err") {
+                // v1:错误串存入全局槽 .Lerrmsg;返回 0 哨兵。
+                // 与参考实现一致,编译期拼接来源位置后缀" (路径:行号)"
+                if (!c.args.empty()) {
+                    eval(c.args[0].get());
+                    if (!src_path_.empty()) {
+                        std::string suffix = " (" + src_path_ + ":" + std::to_string(c.line) + ")";
+                        std::string slbl = intern_string(suffix);
+#ifdef CPP2_NATIVE_HOST_OK
+                        ins("mov rdi, rax");
+                        ins("lea rsi, " + slbl + "[rip]");
+                        ins("call cpp2_strcat");
+#else
+                        ins("mov rcx, rax");
+                        ins("lea rdx, " + slbl + "[rip]");
+                        ins("call cpp2_strcat");
+#endif
+                    }
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("lea rdi, .Lerrmsg[rip]");
+                    ins("mov QWORD PTR [rdi], rax");
+#else
+                    ins("lea rcx, .Lerrmsg[rip]");
+                    ins("mov QWORD PTR [rcx], rax");
+#endif
+                }
+                ins("xor eax, eax");  // 语言级哨兵
+                return;
+            }
             bool declared_builtin = false;
             for (auto& f : m_->funcs)
                 if (f.name == bn && f.builtin) { declared_builtin = true; break; }
@@ -1200,8 +1439,21 @@ private:
         if (nm.qualified()) unsup("qualified calls (std bridge)");
         if (c.args.size() > 6) unsup("more than 6 call arguments");
 
-        for (auto& a : c.args) {
-            eval(a.get());
+        // inout 实参传地址(裸名字且槽存在);其余传值
+        ast::FuncDecl* c2_callee = nullptr;
+        for (auto& f : m_->funcs)
+            if (f.name == nm.parts[0] && f.params.size() == c.args.size()) { c2_callee = &f; break; }
+        for (size_t i = 0; i < c.args.size(); ++i) {
+            auto& a = c.args[i];
+            bool pass_addr = c2_callee && c2_callee->params[i].mode == ast::ParamMode::Inout
+                          && a->kind() == ast::Expr::Name;
+            if (pass_addr) {
+                auto& an = static_cast<ast::NameExpr&>(*a);
+                int aoff = slot_of(an.parts[0]);
+                ins("lea rax, QWORD PTR [rbp" + std::to_string(aoff) + "]");
+            } else {
+                eval(a.get());
+            }
             ins("push rax");
             ++push_depth_;
         }
@@ -1233,7 +1485,10 @@ private:
             if (text[pos] == '{' && pos + 2 < text.size()
                 && text[pos + 1] >= '0' && text[pos + 1] <= '9'
                 && text[pos + 2] == '}') {
-                cfmt += "%lld";
+                int idx = text[pos + 1] - '0';
+                if (idx + 1 >= (int)c.args.size())
+                    unsup("println placeholder {" + std::string(1, text[pos + 1]) + "} out of range");
+                cfmt += fmt_for(c.args[idx + 1].get());
                 pos += 2;
             } else if (text[pos] == '\\' && pos + 1 < text.size()) {
                 char nxt = text[pos + 1];
@@ -1297,7 +1552,15 @@ private:
         ins("pop rcx");                          // rcx = lhs,rax = rhs
         --push_depth_;
 
-        if (b.op == "+") { ins("add rax, rcx"); return; }
+        if (b.op == "+") {
+            if (is_string_expr(b.lhs.get())) {
+                ins("mov rdi, rcx");
+                ins("mov rsi, rax");
+                ins("call cpp2_strcat");
+                return;
+            }
+            ins("add rax, rcx"); return;
+        }
         if (b.op == "&")  { ins("and rax, rcx"); return; }
         if (b.op == "|")  { ins("or rax, rcx"); return; }
         if (b.op == "-") { ins("xchg rax, rcx"); ins("sub rax, rcx"); return; }
@@ -1390,20 +1653,22 @@ private:
     }
 };
 
-std::string emit_asm(ast::Module& m, sema::Result const& r)
+std::string emit_asm(ast::Module& m, sema::Result const& r, std::string const& src_path)
 {
     NativeEmitter em;
-    return em.emit(m, r);
+    return em.emit(m, r, src_path);
 }
 
 #else // Windows x64 ABI
 
 class NativeEmitter {
 public:
-    std::string emit(ast::Module& m, sema::Result const&)
+    std::string emit(ast::Module& m, sema::Result const& r, std::string const& src_path = {})
     {
         std::cerr << "[native] emit for module " << m.name << " funcs " << m.funcs.size() << " structs " << m.structs.size() << std::endl;
         m_ = &m;
+        R_ = &r;
+        src_path_ = src_path;
         precheck();
         out_ << ".intel_syntax noprefix\n";
         emit_globals();
@@ -1416,7 +1681,6 @@ public:
         }
         for (auto& s : m_->structs) {
             for (auto& md : s.methods) {
-                if (md.name == "destructor") continue;
                 emit_method(s, md);
             }
         }
@@ -1426,6 +1690,8 @@ public:
 
 private:
     ast::Module* m_ = nullptr;
+    sema::Result const* R_ = nullptr;
+    std::string src_path_;   // 源文件路径(err() 位置后缀用)
     std::ostringstream out_;
     int label_ = 0;
     int push_depth_ = 0;
@@ -1437,6 +1703,98 @@ private:
     std::unordered_map<std::string, std::string> str_pool_;
 
     [[noreturn]] void unsup(std::string const& msg) { throw Unsupported(msg); }
+
+    sema::Type type_of(ast::Expr* e) const { return R_ ? R_->type_of(*e) : sema::Type{}; }
+
+    // printf 格式符按静态类型选择(string 在 native v0 = NUL 结尾 char 指针)
+    char const* fmt_for(ast::Expr* e)
+    {
+        if (!R_ || !e) return "%lld";
+        // std 桥:e.message() 返回错误 C 串 → %s
+        if (e->kind() == ast::Expr::Call) {
+            auto& c = static_cast<ast::CallExpr&>(*e);
+            if (c.callee->kind() == ast::Expr::Member &&
+                static_cast<ast::MemberExpr&>(*c.callee).name == "message")
+                return "%s";
+        }
+        auto t = R_->type_of(*e);
+        using K = sema::Type::Kind;
+        switch (t.kind) {
+        case K::String: case K::StringView: return "%s";
+        case K::Char:   return "%c";
+        case K::Double: case K::Float: return "%f";
+        case K::Bool:   return "%d";
+        default:        return "%lld";
+        }
+    }
+
+    // 静态类型是否 string(字面量直接判定;其余查 sema)—— 用于 + 拼接判定
+    bool is_string_expr(ast::Expr* e)
+    {
+        if (!e) return false;
+        if (auto* lit = dynamic_cast<ast::LiteralExpr*>(e))
+            if (lit->lit == ast::LitKind::String) return true;
+        if (!R_) return false;
+        auto t = R_->type_of(*e);
+        using K = sema::Type::Kind;
+        return t.kind == K::String || t.kind == K::StringView;
+    }
+
+    // inout 参数集合(当前函数):这些名字的槽存实参地址,读写须间接
+    std::set<std::string> inout_params_;
+    bool is_inout_param(std::string const& n) const { return inout_params_.count(n) != 0; }
+    void record_inout_params(std::vector<ast::Param>& params)
+    {
+        inout_params_.clear();
+        for (auto& p : params)
+            if (p.mode == ast::ParamMode::Inout) inout_params_.insert(p.name);
+    }
+
+    ast::StructDecl* cur_struct_ = nullptr;   // 方法发射时的所属类型(经 this 字段访问)
+
+    ast::StructDecl* find_sd(std::string const& n)
+    {
+        for (auto& s : m_->structs) if (s.name == n) return &s;
+        return nullptr;
+    }
+
+    // 字段偏移沿基类链累计(基类字段居低地址,与 C++ 布局同构);未找到返回 -1
+    int field_offset_in(ast::StructDecl* sd, std::string const& fname)
+    {
+        int off = 0;
+        std::string bn = (sd->base && !sd->base->parts.empty()) ? sd->base->parts[0] : "";
+        while (!bn.empty()) {
+            ast::StructDecl* bs = find_sd(bn);
+            if (!bs) break;
+            for (size_t i = 0; i < bs->fields.size(); ++i)
+                if (bs->fields[i].name == fname) return off + (int)i * 8;
+            off += (int)bs->fields.size() * 8;
+            bn = (bs->base && !bs->base->parts.empty()) ? bs->base->parts[0] : "";
+        }
+        for (size_t i = 0; i < sd->fields.size(); ++i)
+            if (sd->fields[i].name == fname) return off + (int)i * 8;
+        return -1;
+    }
+
+    // 全字段视图(基类在前),StructLit 初始化用;second = 字节偏移
+    std::vector<std::pair<ast::FieldDecl*, int>> fields_deep(ast::StructDecl* sd)
+    {
+        std::vector<std::pair<ast::FieldDecl*, int>> out;
+        std::vector<ast::StructDecl*> chain;
+        for (std::string bn = (sd->base && !sd->base->parts.empty()) ? sd->base->parts[0] : "";
+             !bn.empty();) {
+            ast::StructDecl* bs = find_sd(bn);
+            if (!bs) break;
+            chain.push_back(bs);
+            bn = (bs->base && !bs->base->parts.empty()) ? bs->base->parts[0] : "";
+        }
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+            for (auto& f : (*it)->fields)
+                out.push_back({&f, (int)out.size() * 8});
+        for (auto& f : sd->fields)
+            out.push_back({&f, (int)out.size() * 8});
+        return out;
+    }
 
     void put(std::string const& s) { out_ << s << "\n"; }
     void ins(std::string const& s) { out_ << "    " << s << "\n"; }
@@ -1454,21 +1812,27 @@ private:
 
     void emit_rodata_strs()
     {
-        if (str_pool_.empty()) return;
-        out_ << ".section .rodata\n";
-        for (auto const& [text, lblname] : str_pool_) {
-            out_ << lblname << ":\n";
-            out_ << "    .string \"";
-            for (char c : text) {
-                if (c == '\\') out_ << "\\\\";
-                else if (c == '"') out_ << "\\\"";
-                else if (c == '\n') out_ << "\\n";
-                else if (c == '\t') out_ << "\\t";
-                else if (c == '\0') break;
-                else out_ << c;
+        if (!str_pool_.empty()) {
+            out_ << ".section .rodata\n";
+            for (auto const& [text, lblname] : str_pool_) {
+                out_ << lblname << ":\n";
+                out_ << "    .string \"";
+                for (char c : text) {
+                    if (c == '\\') out_ << "\\\\";
+                    else if (c == '"') out_ << "\\\"";
+                    else if (c == '\n') out_ << "\\n";
+                    else if (c == '\t') out_ << "\\t";
+                    else if (c == '\0') break;
+                    else out_ << c;
+                }
+                out_ << "\"\n";
             }
-            out_ << "\"\n";
+            out_ << ".text\n";
         }
+        // 全局错误串槽(err() 写 / e.message() 读),始终存在
+        out_ << ".data\n";
+        out_ << ".Lerrmsg:\n";
+        out_ << "    .quad 0\n";
         out_ << ".text\n";
     }
 
@@ -1593,8 +1957,11 @@ private:
     {
         cur_fn_ = &f;
         cur_sym_name_ = f.name;
+        cur_struct_ = nullptr;
+        scope_stack_.clear();
         slots_.clear();
         push_depth_ = 0;
+        record_inout_params(f.params);
         for (size_t i = 0; i < f.params.size(); ++i)
             slots_[f.params[i].name] = -(8 * (int)(i + 1));
         scan_slots(f.has_block_body ? f.block_body.get() : nullptr);
@@ -1640,8 +2007,11 @@ private:
         std::string mname = s.name + "_" + m.name;
         cur_fn_ = nullptr;
         cur_sym_name_ = mname;
+        cur_struct_ = &s;
+        scope_stack_.clear();
         slots_.clear();
         push_depth_ = 0;
+        record_inout_params(m.params);
         slots_["this"] = -(8 * 1);
         for (size_t i = 0; i < m.params.size(); ++i)
             slots_[m.params[i].name] = -(8 * (int)(i + 2));
@@ -1671,11 +2041,69 @@ private:
         put("");
     }
 
+    // 作用域析构栈:每层 block 一个帧,记录 (变量名, 声明析构器的 struct)
+    using DtorEntry = std::pair<std::string, ast::StructDecl*>;
+    std::vector<std::vector<DtorEntry>> scope_stack_;
+
+    void emit_dtor_call(DtorEntry const& vd)
+    {
+        int off = slot_of(vd.first);
+        ins("lea rax, QWORD PTR [rbp" + std::to_string(off) + "]");
+        ins("push rax");
+        ++push_depth_;
+        ins("pop rcx");
+        --push_depth_;
+        bool odd = (push_depth_ % 2 == 1);
+        if (odd) ins("sub rsp, 8");
+        ins("sub rsp, 32");
+        ins("call " + vd.second->name + "_destructor");
+        ins("add rsp, 32");
+        if (odd) ins("add rsp, 8");
+    }
+
+    // return 离开全部作用域:自内向外调用所有未析构的 struct 局部
+    // skip:被返回的局部(所有权移交给调用方),不在此处析构
+    void emit_all_dtors_for_return(std::string const& skip = {})
+    {
+        for (auto it = scope_stack_.rbegin(); it != scope_stack_.rend(); ++it)
+            for (auto jt = it->rbegin(); jt != it->rend(); ++jt)
+                if (skip.empty() || jt->first != skip) emit_dtor_call(*jt);
+        for (auto& f : scope_stack_) f.clear();
+    }
+
     void emit_stmt(ast::Stmt* s)
     {
         switch (s->kind()) {
         case ast::Stmt::Block: {
-            for (auto& st : static_cast<ast::BlockStmt*>(s)->stmts) emit_stmt(st.get());
+            auto& blk = *static_cast<ast::BlockStmt*>(s);
+            // 预扫描本块直接声明的、带析构器的 struct 局部变量(DESIGN §5.3)
+            scope_stack_.emplace_back();
+            for (auto& st : blk.stmts) {
+                if (st->kind() != ast::Stmt::Var) continue;
+                auto& v = *static_cast<ast::VarStmt*>(st.get());
+                std::string tn;
+                if (v.has_type && !v.type.parts.empty()) tn = v.type.parts[0];
+                else if (R_ && v.init) {
+                    auto vt = R_->type_of(*v.init);
+                    if (vt.kind == sema::Type::Kind::NamedStruct) tn = vt.name;
+                }
+                if (tn.empty()) continue;
+                ast::StructDecl* tsd = find_sd(tn);
+                if (!tsd) continue;
+                ast::StructDecl* dsd = nullptr;
+                for (ast::StructDecl* s2 = tsd; s2 && !dsd;) {
+                    for (auto& m2 : s2->methods) if (m2.name == "destructor") { dsd = s2; break; }
+                    if (!dsd)
+                        s2 = (s2->base && !s2->base->parts.empty()) ? find_sd(s2->base->parts[0]) : nullptr;
+                }
+                if (dsd) scope_stack_.back().push_back({v.name, dsd});
+            }
+            for (auto& st : blk.stmts) emit_stmt(st.get());
+            {
+                auto& fr = scope_stack_.back();
+                for (auto it = fr.rbegin(); it != fr.rend(); ++it) emit_dtor_call(*it);
+            }
+            scope_stack_.pop_back();
             break;
         }
         case ast::Stmt::ExprStmt:
@@ -1716,16 +2144,19 @@ private:
                         base_off = lo;
                         second_off = hi;
                     }
-                    for (size_t i=0;i<sd->fields.size();++i) {
-                        bool found = false;
-                        for (auto& pr : sl.fields) if (pr.first == sd->fields[i].name) {
-                            eval(pr.second.get());
-                            found = true;
-                            break;
+                    {
+                        auto fds = fields_deep(sd);
+                        for (size_t i=0;i<fds.size();++i) {
+                            bool found = false;
+                            for (auto& pr : sl.fields) if (pr.first == fds[i].first->name) {
+                                eval(pr.second.get());
+                                found = true;
+                                break;
+                            }
+                            if (!found) eval(fds[i].first->init.get());
+                            int off2 = (i==0) ? lo : hi;
+                            ins("mov QWORD PTR [rbp" + std::to_string(off2) + "], rax");
                         }
-                        if (!found) eval(sd->fields[i].init.get());
-                        int off2 = (i==0) ? lo : hi;
-                        ins("mov QWORD PTR [rbp" + std::to_string(off2) + "], rax");
                     }
                     break;
                 }
@@ -1763,16 +2194,19 @@ private:
                     for (auto& s2 : m_->structs) if (s2.name == tn) { sd = &s2; break; }
                 }
                 if (sd) {
-                    for (size_t i=0;i<sd->fields.size();++i) {
-                        bool found = false;
-                        for (auto& pr : ((ast::StructLitExpr&)*v.init).fields)
-                            if (pr.first == sd->fields[i].name) {
-                                eval(pr.second.get());
-                                found = true;
-                                break;
-                            }
-                        if (!found) eval(sd->fields[i].init.get());
-                        ins("mov QWORD PTR [rbp" + std::to_string(data_off + (int)i*8) + "], rax");
+                    {
+                        auto fds = fields_deep(sd);
+                        for (size_t i=0;i<fds.size();++i) {
+                            bool found = false;
+                            for (auto& pr : ((ast::StructLitExpr&)*v.init).fields)
+                                if (pr.first == fds[i].first->name) {
+                                    eval(pr.second.get());
+                                    found = true;
+                                    break;
+                                }
+                            if (!found) eval(fds[i].first->init.get());
+                            ins("mov QWORD PTR [rbp" + std::to_string(data_off + (int)i*8) + "], rax");
+                        }
                     }
                 }
                 break;
@@ -1787,6 +2221,16 @@ private:
             auto& r = static_cast<ast::ReturnStmt&>(*s);
             if (r.value) eval(r.value.get());
             else ins("xor eax, eax");
+            // 被返回的具名局部移交给调用方,返回路径跳过其析构
+            std::string skip;
+            if (r.value && r.value->kind() == ast::Expr::Name)
+                skip = static_cast<ast::NameExpr&>(*r.value).parts[0];
+            // 析构调用会破坏 rax(caller-saved),返回值先压栈
+            bool has_dtors = false;
+            for (auto& f : scope_stack_) if (!f.empty()) { has_dtors = true; break; }
+            if (has_dtors) { ins("push rax"); ++push_depth_; }
+            emit_all_dtors_for_return(skip);
+            if (has_dtors) { ins("pop rax"); --push_depth_; }
             ins("jmp .Lret_" + (cur_fn_ ? cur_fn_->name : cur_sym_name_));
             break;
         }
@@ -2085,19 +2529,17 @@ private:
             {
                 bool is_field = false;
                 int field_off = -1;
-                for (auto& s : m_->structs) {
-                    for (size_t i=0;i<s.fields.size();++i) if (s.fields[i].name == n.parts[0]) {
-                        field_off = (int)i * 8;
-                        is_field = true;
-                        break;
-                    }
-                    if (is_field) break;
+                if (cur_struct_) {
+                    field_off = field_offset_in(cur_struct_, n.parts[0]);
+                    is_field = field_off != -1;
                 }
                 if (is_field && cur_fn_ == nullptr) {
                     ins("mov rax, QWORD PTR [rbp-8]");
                     ins("mov rax, QWORD PTR [rax+" + std::to_string(field_off) + "]");
                 } else {
-                    ins("mov rax, QWORD PTR [rbp" + std::to_string(slot_or_new(n.parts[0])) + "]");
+                    int voff = slot_or_new(n.parts[0]);
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(voff) + "]");
+                    if (is_inout_param(n.parts[0])) ins("mov rax, QWORD PTR [rax]");
                 }
             }
             name_done:
@@ -2174,21 +2616,33 @@ private:
                 if (m.base->kind() != ast::Expr::Name) unsup("assign base must be name");
                 auto& base = static_cast<ast::NameExpr&>(*m.base);
                 int field_off = -1;
-                for (auto& s : m_->structs) {
-                    for (size_t i=0;i<s.fields.size();++i) if (s.fields[i].name == m.name) {
-                        field_off = (int)i * 8;
-                        break;
+                if (R_) {
+                    auto bt = R_->type_of(*m.base);
+                    if (bt.kind == sema::Type::Kind::NamedStruct) {
+                        if (ast::StructDecl* rsd = find_sd(bt.name))
+                            field_off = field_offset_in(rsd, m.name);
                     }
-                    if (field_off != -1) break;
+                }
+                if (field_off == -1) {
+                    for (auto& s : m_->structs) {
+                        field_off = field_offset_in(&s, m.name);
+                        if (field_off != -1) break;
+                    }
                 }
                 if (field_off == -1) unsup("unknown field '" + m.name + "'");
                 int base_off = slot_of(base.parts[0]);
+                bool via_inout = is_inout_param(base.parts[0]);
                 int tgt_off = base_off + field_off;
                 if (a.op == "=") {
                     eval(a.value.get());
                 } else {
                     std::string lop = a.op.substr(0, a.op.size() - 1);
-                    ins("mov rax, QWORD PTR [rbp" + std::to_string(tgt_off) + "]");
+                    if (via_inout) {
+                        ins("mov rax, QWORD PTR [rbp" + std::to_string(base_off) + "]");   // 实参地址
+                        ins("mov rax, QWORD PTR [rax+" + std::to_string(field_off) + "]");
+                    } else {
+                        ins("mov rax, QWORD PTR [rbp" + std::to_string(tgt_off) + "]");
+                    }
                     ins("push rax");
                     ++push_depth_;
                     eval(a.value.get());
@@ -2199,7 +2653,12 @@ private:
                     else if (lop == "*") { ins("imul rax, rcx"); }
                     else unsup("compound assign to field '" + a.op + "'");
                 }
-                ins("mov QWORD PTR [rbp" + std::to_string(tgt_off) + "], rax");
+                if (via_inout) {
+                    ins("mov rcx, QWORD PTR [rbp" + std::to_string(base_off) + "]");
+                    ins("mov QWORD PTR [rcx+" + std::to_string(field_off) + "], rax");
+                } else {
+                    ins("mov QWORD PTR [rbp" + std::to_string(tgt_off) + "], rax");
+                }
                 break;
             }
             if (a.target->kind() != ast::Expr::Name) unsup("assignment form");
@@ -2207,13 +2666,9 @@ private:
             // 方法上下文(cur_fn_==nullptr)且名字是字段 → 经 this 指针读写
             bool fld = false;
             int fld_off = -1;
-            for (auto& s2 : m_->structs) {
-                for (size_t i=0;i<s2.fields.size();++i) if (s2.fields[i].name == n.parts[0]) {
-                    fld_off = (int)i * 8;
-                    fld = true;
-                    break;
-                }
-                if (fld) break;
+            if (cur_struct_) {
+                fld_off = field_offset_in(cur_struct_, n.parts[0]);
+                fld = fld_off != -1;
             }
             int off;
             std::string tgt_addr;
@@ -2239,6 +2694,7 @@ private:
                     ins("mov rax, QWORD PTR [rcx]");   // lhs = *addr
                 } else {
                     ins("mov rax, QWORD PTR [rbp" + std::to_string(off) + "]");
+                    if (is_inout_param(n.parts[0])) ins("mov rax, QWORD PTR [rax]");
                 }
                 ins("push rax");
                 ++push_depth_;
@@ -2292,6 +2748,9 @@ private:
                 ins("pop rcx");
                 --push_depth_;
                 ins("mov QWORD PTR [rcx], rax");
+            } else if (is_inout_param(n.parts[0])) {
+                ins("mov rcx, QWORD PTR [rbp" + std::to_string(off) + "]");   // 实参地址
+                ins("mov QWORD PTR [rcx], rax");
             } else {
                 ins("mov QWORD PTR [rbp" + std::to_string(off) + "], rax");
             }
@@ -2302,16 +2761,27 @@ private:
             if (m.base->kind() != ast::Expr::Name) unsup("member base must be name");
             auto& base = static_cast<ast::NameExpr&>(*m.base);
             int field_off = -1;
-            for (auto& s : m_->structs) {
-                for (size_t i=0;i<s.fields.size();++i) if (s.fields[i].name == m.name) {
-                    field_off = (int)i * 8;
-                    break;
+            if (R_) {
+                auto bt = R_->type_of(*m.base);
+                if (bt.kind == sema::Type::Kind::NamedStruct) {
+                    if (ast::StructDecl* rsd = find_sd(bt.name))
+                        field_off = field_offset_in(rsd, m.name);
                 }
-                if (field_off != -1) break;
+            }
+            if (field_off == -1) {
+                for (auto& s : m_->structs) {
+                    field_off = field_offset_in(&s, m.name);
+                    if (field_off != -1) break;
+                }
             }
             if (field_off == -1) unsup("unknown field '" + m.name + "'");
             int base_off = slot_of(base.parts[0]);
-            ins("mov rax, QWORD PTR [rbp" + std::to_string(base_off + field_off) + "]");
+            if (is_inout_param(base.parts[0])) {
+                ins("mov rax, QWORD PTR [rbp" + std::to_string(base_off) + "]");   // 实参地址
+                ins("mov rax, QWORD PTR [rax+" + std::to_string(field_off) + "]");
+            } else {
+                ins("mov rax, QWORD PTR [rbp" + std::to_string(base_off + field_off) + "]");
+            }
             break;
         }
         case ast::Expr::StructLit: {
@@ -2324,15 +2794,18 @@ private:
             int tmp_off = slot_or_new(tmp);
             std::string tmp2 = tmp + "_2";
             slot_or_new(tmp2);
-            for (size_t i=0;i<sd->fields.size();++i) {
-                bool found = false;
-                for (auto& pr : sl.fields) if (pr.first == sd->fields[i].name) {
-                    eval(pr.second.get());
-                    found = true;
-                    break;
+            {
+                auto fds = fields_deep(sd);
+                for (size_t i=0;i<fds.size();++i) {
+                    bool found = false;
+                    for (auto& pr : sl.fields) if (pr.first == fds[i].first->name) {
+                        eval(pr.second.get());
+                        found = true;
+                        break;
+                    }
+                    if (!found) eval(fds[i].first->init.get());
+                    ins("mov QWORD PTR [rbp" + std::to_string(tmp_off + (int)fds[i].second) + "], rax");
                 }
-                if (!found) eval(sd->fields[i].init.get());
-                ins("mov QWORD PTR [rbp" + std::to_string(tmp_off + (int)i*8) + "], rax");
             }
             ins("mov rax, " + std::to_string(tmp_off));
             break;
@@ -2434,9 +2907,24 @@ private:
             auto& base = static_cast<ast::NameExpr&>(*mem.base);
             ast::StructDecl* sd = nullptr;
             ast::MethodDecl* md = nullptr;
-            for (auto& s : m_->structs) {
-                for (auto& m : s.methods) if (m.name == mem.name) { sd = &s; md = &m; break; }
-                if (sd) break;
+            // 接收者静态类型优先沿继承链解析(派生方法隐藏基类同名)
+            if (R_) {
+                auto bt = R_->type_of(*mem.base);
+                if (bt.kind == sema::Type::Kind::NamedStruct) {
+                    ast::StructDecl* s = find_sd(bt.name);
+                    while (s && !md) {
+                        for (auto& m : s->methods)
+                            if (m.name == mem.name) { sd = s; md = &m; break; }
+                        if (!md)
+                            s = (s->base && !s->base->parts.empty()) ? find_sd(s->base->parts[0]) : nullptr;
+                    }
+                }
+            }
+            if (!sd || !md) {
+                for (auto& s : m_->structs) {
+                    for (auto& m : s.methods) if (m.name == mem.name) { sd = &s; md = &m; break; }
+                    if (sd) break;
+                }
             }
             if (!sd || !md) {
                 // std 方法桥(v0 语义化降级):
@@ -2490,8 +2978,9 @@ private:
                     return;
                 }
                 if (mem.name == "message") {
-                    eval(mem.base.get());
-                    ins("xor eax, eax");          // v0:错误串不可用,返回空
+                    // v1:错误串由 err() 写入全局槽,e.message() 读出
+                    ins("lea rax, .Lerrmsg[rip]");
+                    ins("mov rax, QWORD PTR [rax]");
                     return;
                 }
                 if (mem.name == "has_value") {
@@ -2528,7 +3017,35 @@ private:
         auto& nm = static_cast<ast::NameExpr&>(*c.callee);
         if (!nm.qualified()) {
             std::string const& bn = nm.parts[0];
-            if (bn == "err") { ins("xor eax, eax"); return; }  // 语言级哨兵
+            if (bn == "err") {
+                // v1:错误串存入全局槽 .Lerrmsg;返回 0 哨兵。
+                // 与参考实现一致,编译期拼接来源位置后缀" (路径:行号)"
+                if (!c.args.empty()) {
+                    eval(c.args[0].get());
+                    if (!src_path_.empty()) {
+                        std::string suffix = " (" + src_path_ + ":" + std::to_string(c.line) + ")";
+                        std::string slbl = intern_string(suffix);
+#ifdef CPP2_NATIVE_HOST_OK
+                        ins("mov rdi, rax");
+                        ins("lea rsi, " + slbl + "[rip]");
+                        ins("call cpp2_strcat");
+#else
+                        ins("mov rcx, rax");
+                        ins("lea rdx, " + slbl + "[rip]");
+                        ins("call cpp2_strcat");
+#endif
+                    }
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("lea rdi, .Lerrmsg[rip]");
+                    ins("mov QWORD PTR [rdi], rax");
+#else
+                    ins("lea rcx, .Lerrmsg[rip]");
+                    ins("mov QWORD PTR [rcx], rax");
+#endif
+                }
+                ins("xor eax, eax");  // 语言级哨兵
+                return;
+            }
             bool declared_builtin = false;
             for (auto& f : m_->funcs)
                 if (f.name == bn && f.builtin) { declared_builtin = true; break; }
@@ -2605,8 +3122,21 @@ private:
         }
         if (nm.qualified()) unsup("qualified calls (std bridge)");
         if (c.args.size() > 4) unsup("more than 4 call arguments on Windows native");
-        for (auto& a : c.args) {
-            eval(a.get());
+        // inout 实参传地址(裸名字且槽存在);其余传值
+        ast::FuncDecl* c2_callee = nullptr;
+        for (auto& f : m_->funcs)
+            if (f.name == nm.parts[0] && f.params.size() == c.args.size()) { c2_callee = &f; break; }
+        for (size_t i = 0; i < c.args.size(); ++i) {
+            auto& a = c.args[i];
+            bool pass_addr = c2_callee && c2_callee->params[i].mode == ast::ParamMode::Inout
+                          && a->kind() == ast::Expr::Name;
+            if (pass_addr) {
+                auto& an = static_cast<ast::NameExpr&>(*a);
+                int aoff = slot_of(an.parts[0]);
+                ins("lea rax, QWORD PTR [rbp" + std::to_string(aoff) + "]");
+            } else {
+                eval(a.get());
+            }
             ins("push rax");
             ++push_depth_;
         }
@@ -2615,9 +3145,16 @@ private:
             ins("pop " + std::string(regs[i]));
             --push_depth_;
         }
-        ins("sub rsp, 32");
-        ins("call " + nm.parts[0]);
-        ins("add rsp, 32");
+        if (push_depth_ % 2 == 1) {              // call 前 rsp 16 对齐(奇数次 8B push)
+            ins("sub rsp, 8");
+            ins("sub rsp, 32");
+            ins("call " + nm.parts[0]);
+            ins("add rsp, 40");
+        } else {
+            ins("sub rsp, 32");
+            ins("call " + nm.parts[0]);
+            ins("add rsp, 32");
+        }
     }
 
     void emit_printf(ast::CallExpr& c, bool newline)
@@ -2628,11 +3165,11 @@ private:
             if (lit0 && lit0->lit == ast::LitKind::String) {
                 // 单参字符串：走下方 cfmt 流程
             } else {
-                // 单参非字符串（如 c as int）：直接 %d
-                std::string cfmt = "%d";
+                // 单参非字符串:按静态类型选格式(int %lld / string %s / double %f / char %c)
+                std::string cfmt = fmt_for(c.args[0].get());
                 if (newline) cfmt += "\n";
                 std::string fmt_lbl = intern_string(cfmt);
-                                eval(c.args[0].get());
+                eval(c.args[0].get());
 #ifdef CPP2_NATIVE_HOST_OK
                 ins("mov rsi, rax");
                 ins("lea rdi, " + fmt_lbl + "[rip]");
@@ -2662,7 +3199,10 @@ private:
         std::string cfmt;
         for (size_t pos = 0; pos < text.size(); ++pos) {
             if (text[pos] == '{' && pos + 2 < text.size() && text[pos + 1] >= '0' && text[pos + 1] <= '9' && text[pos + 2] == '}') {
-                cfmt += "%lld";
+                int idx = text[pos + 1] - '0';
+                if (idx + 1 >= (int)c.args.size())
+                    unsup("println placeholder {" + std::string(1, text[pos + 1]) + "} out of range");
+                cfmt += fmt_for(c.args[idx + 1].get());
                 pos += 2;
             } else if (text[pos] == '\\' && pos + 1 < text.size()) {
                 char nxt = text[pos + 1];
@@ -2726,7 +3266,14 @@ private:
         eval(b.rhs.get());
         ins("pop rcx");
         --push_depth_;
-        if (b.op == "+") { ins("add rax, rcx"); return; }
+        if (b.op == "+") {
+            if (is_string_expr(b.lhs.get())) {
+                ins("mov rdx, rax");
+                ins("call cpp2_strcat");
+                return;
+            }
+            ins("add rax, rcx"); return;
+        }
         if (b.op == "&")  { ins("and rax, rcx"); return; }
         if (b.op == "|")  { ins("or rax, rcx"); return; }
         if (b.op == "-") { ins("xchg rax, rcx"); ins("sub rax, rcx"); return; }
@@ -2816,10 +3363,10 @@ private:
     }
 };
 
-std::string emit_asm(ast::Module& m, sema::Result const& r)
+std::string emit_asm(ast::Module& m, sema::Result const& r, std::string const& src_path)
 {
     NativeEmitter em;
-    return em.emit(m, r);
+    return em.emit(m, r, src_path);
 }
 
 std::vector<uint8_t> emit_pe(ast::Module& m, sema::Result const& r)
@@ -2935,18 +3482,18 @@ std::vector<uint8_t> emit_native(const std::string& asm_text)
 cpp2_write:
     push rbp
     mov rbp, rsp
-    sub rsp, 0x30
-    mov QWORD PTR [rbp-0x18], rcx
-    mov QWORD PTR [rbp-0x20], rdx
+    sub rsp, 0x40
+    mov QWORD PTR [rbp-0x08], rcx
+    mov QWORD PTR [rbp-0x10], rdx
     mov ecx, -11
     call GetStdHandle
     mov rcx, rax
-    mov rdx, [rbp-0x18]
-    mov r8, [rbp-0x20]
-    lea r9, [rbp-0x08]
-    mov QWORD PTR [rbp-0x10], 0
+    mov rdx, [rbp-0x08]
+    mov r8, [rbp-0x10]
+    lea r9, [rbp-0x18]
+    mov QWORD PTR [rbp-0x18], 0
     call WriteFile
-    add rsp, 0x30
+    add rsp, 0x40
     pop rbp
     ret
 .globl cpp2_exit
@@ -2961,28 +3508,88 @@ sys_exit:
 cpp2_alloc:
     push rbp
     mov rbp, rsp
-    sub rsp, 0x20
-    mov QWORD PTR [rbp-0x10], rcx
+    sub rsp, 0x30
+    mov QWORD PTR [rbp-0x08], rcx
     call GetProcessHeap
     mov rcx, rax
     mov rdx, 0
-    mov r8, [rbp-0x10]
+    mov r8, [rbp-0x08]
     call HeapAlloc
-    add rsp, 0x20
+    add rsp, 0x30
     pop rbp
     ret
 .globl cpp2_free
 cpp2_free:
     push rbp
     mov rbp, rsp
-    sub rsp, 0x20
-    mov QWORD PTR [rbp-0x10], rcx
+    sub rsp, 0x30
+    mov QWORD PTR [rbp-0x08], rcx
     call GetProcessHeap
     mov rcx, rax
     mov rdx, 0
-    mov r8, [rbp-0x10]
+    mov r8, [rbp-0x08]
     call HeapFree
-    add rsp, 0x20
+    add rsp, 0x30
+    pop rbp
+    ret
+.globl cpp2_strcat
+cpp2_strcat:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 0x40
+    mov QWORD PTR [rbp-0x08], rcx
+    mov QWORD PTR [rbp-0x10], rdx
+    mov rax, [rbp-0x08]
+    xor r9, r9
+.cpp2_strcat_la:
+    cmp byte PTR [rax+r9], 0
+    je .cpp2_strcat_lb
+    inc r9
+    jmp .cpp2_strcat_la
+.cpp2_strcat_lb:
+    mov QWORD PTR [rbp-0x20], r9
+    mov rax, [rbp-0x10]
+    xor r10, r10
+.cpp2_strcat_lb2:
+    cmp byte PTR [rax+r10], 0
+    je .cpp2_strcat_alloc
+    inc r10
+    jmp .cpp2_strcat_lb2
+.cpp2_strcat_alloc:
+    mov rcx, r9
+    add rcx, r10
+    inc rcx
+    call cpp2_alloc
+    mov r9, QWORD PTR [rbp-0x20]
+    mov QWORD PTR [rbp-0x18], rax
+    mov rcx, [rbp-0x08]
+    mov rdx, [rbp-0x18]
+    xor r8, r8
+.cpp2_strcat_cp1:
+    cmp r8, r9
+    jge .cpp2_strcat_cp2
+    movzx r10, byte PTR [rcx+r8]
+    mov ebx, r10d
+    mov byte PTR [rdx+r8], bl
+    inc r8
+    jmp .cpp2_strcat_cp1
+.cpp2_strcat_cp2:
+    mov rcx, [rbp-0x10]
+    mov rdx, [rbp-0x18]
+    xor r8, r8
+.cpp2_strcat_cp3:
+    cmp byte PTR [rcx+r8], 0
+    je .cpp2_strcat_done
+    movzx r10, byte PTR [rcx+r8]
+    mov ebx, r10d
+    mov byte PTR [rdx+r9], bl
+    inc r9
+    inc r8
+    jmp .cpp2_strcat_cp3
+.cpp2_strcat_done:
+    mov rax, [rbp-0x18]
+    mov byte PTR [rax+r9], 0
+    add rsp, 0x40
     pop rbp
     ret
 )";
@@ -3004,6 +3611,14 @@ cpp2_free:
         rodata_blob.insert(rodata_blob.end(), bytes.begin(), bytes.end());
     }
 
+    // .data 全局槽(如 .Lerrmsg 错误消息指针)
+    std::vector<uint8_t> data_blob;
+    std::vector<std::pair<std::string,std::string>> da_labels;
+    for (auto& [name, qv] : res.data) {
+        da_labels.push_back({name, std::to_string(data_blob.size())});
+        for (int i = 0; i < 8; ++i) data_blob.push_back((uint8_t)((qv >> (i*8)) & 0xff));
+    }
+
     // 构建 text 内标签表(函数入口等,跳过 .L 局部)
     std::vector<std::pair<std::string,size_t>> text_labels;
     for (auto& [name, off] : res.symbols) {
@@ -3022,7 +3637,7 @@ cpp2_free:
     };
     for (auto& e : res.externs) {
         if (e == "cpp2_write" || e == "cpp2_exit" || e == "sys_exit" ||
-            e == "cpp2_alloc" || e == "cpp2_free")
+            e == "cpp2_alloc" || e == "cpp2_free" || e == "cpp2_strcat")
             continue;  // 由内联运行时提供
         imports_map[dll_for(e)].push_back(e);
     }
@@ -3030,7 +3645,7 @@ cpp2_free:
         imports_map.begin(), imports_map.end());
 
     return pe::build_exe(res.text, rodata_blob, relocs,
-                         ro_labels, text_labels, imports);
+                         ro_labels, text_labels, imports, data_blob, da_labels);
 }
 
 #endif

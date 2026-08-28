@@ -122,6 +122,7 @@ int cmd_run(std::vector<std::string> const& args)
 #ifdef _WIN32
             auto pe_bytes = cpp2::native::emit_native(asm_text);
             fs::path exe = build_dir0 / (in.stem().string() + ".exe");
+            write_file(build_dir0 / (in.stem().string() + ".asm"), asm_text);
             std::ofstream out(native(exe), std::ios::binary);
             out.write(reinterpret_cast<char const*>(pe_bytes.data()), pe_bytes.size());
             out.close();

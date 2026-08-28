@@ -28,7 +28,10 @@ std::vector<uint8_t> build_exe(
     // 动态导入表: {DLL名, 符号列表}
     const std::vector<std::pair<std::string, std::vector<std::string>>>& imports = {
         {"kernel32.dll", {"GetStdHandle", "WriteFile", "ExitProcess"}}
-    }
+    },
+    // 可写 .data 段(全局槽)+ name → offset in data
+    const std::vector<uint8_t>& data = {},
+    const std::vector<std::pair<std::string,std::string>>& data_labels = {}
 );
 
 } // namespace cpp2::native::pe
