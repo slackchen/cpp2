@@ -14,7 +14,11 @@
 #include <set>
 #include <sstream>
 
-#ifndef _WIN32
+// 目标平台 = 宿主平台。__CYGWIN__ 宿主也走 Win64 直出 PE:PE 是纯目标产物,
+// 生成与执行不依赖工具自身 ABI;而 cygwin/mingw 程序运行时本就是 Win64 ABI,SysV asm 无法工作。
+#if defined(_WIN32) || defined(__CYGWIN__)
+#define CPP2_NATIVE_WIN 1
+#else
 #define CPP2_NATIVE_HOST_OK 1
 #endif
 
@@ -108,12 +112,13 @@ private:
     char const* fmt_for(ast::Expr* e)
     {
         if (!R_ || !e) return "%lld";
-        // std 桥:e.message() 返回错误 C 串 → %s
+        // std 桥:e.message()/e.chain() 返回错误 C 串 → %s
         if (e->kind() == ast::Expr::Call) {
             auto& c = static_cast<ast::CallExpr&>(*e);
-            if (c.callee->kind() == ast::Expr::Member &&
-                static_cast<ast::MemberExpr&>(*c.callee).name == "message")
-                return "%s";
+            if (c.callee->kind() == ast::Expr::Member) {
+                auto const& mn = static_cast<ast::MemberExpr&>(*c.callee).name;
+                if (mn == "message" || mn == "chain") return "%s";
+            }
         }
         auto t = R_->type_of(*e);
         using K = sema::Type::Kind;
@@ -236,6 +241,11 @@ private:
         out_ << ".data\n";
         out_ << ".Lerrmsg:\n";
         out_ << "    .quad 0\n";
+        // 错误类别/因果链槽(M7):err(msg, cat) 写 .Lerrcat;err_caused 写 .Lerrcause
+        out_ << ".Lerrcat:\n";
+        out_ << "    .quad 0\n";
+        out_ << ".Lerrcause:\n";
+        out_ << "    .quad 0\n";
         out_ << ".text\n";
     }
 
@@ -351,6 +361,22 @@ private:
         }
         case ast::Stmt::Var: {
             auto& v = static_cast<ast::VarStmt&>(*s);
+            // struct 变量:预留连续字段块(字段 i 位于 base + i*8,base = 块内最低槽)
+            {
+                std::string tn;
+                if (v.has_type && v.type.parts.size() == 1) tn = v.type.parts[0];
+                else if (v.init && v.init->kind() == ast::Expr::StructLit &&
+                         !static_cast<ast::StructLitExpr&>(*v.init).type_parts.empty())
+                    tn = static_cast<ast::StructLitExpr&>(*v.init).type_parts[0];
+                ast::StructDecl* sd = tn.empty() ? nullptr : find_sd(tn);
+                if (sd) {
+                    int n = (int)fields_deep(sd).size();
+                    for (int i = 1; i < n; ++i)
+                        slot_or_new(v.name + "#f" + std::to_string(i));
+                    slot_or_new(v.name);
+                    break;
+                }
+            }
             slot_or_new(v.name);
             break;
         }
@@ -409,18 +435,12 @@ private:
             ins("jmp " + ret);
         }
         label(ret);
-        if (f.name == "main") {
-            if (f.ret && !f.ret->empty())
-                ins("mov rcx, rax");
-            else
-                ins("xor rcx, rcx");
-            ins("call ExitProcess");
-            ins("ret");
-        } else {
-            ins("mov rsp, rbp");
-            ins("pop rbp");
-            ins("ret");
-        }
+        if (f.name == "main" && !(f.ret && !f.ret->empty()))
+            ins("xor eax, eax");   // 隐式 return 0
+        // SysV:正常 leave/ret,退出码经 rax 交还 CRT(含 stdio flush);ExitProcess 收尾是 Win64 直出 PE 专属
+        ins("mov rsp, rbp");
+        ins("pop rbp");
+        ins("ret");
         put("");
         cur_fn_ = nullptr;
     }
@@ -540,52 +560,25 @@ private:
             break;
         case ast::Stmt::Var: {
             auto& v = static_cast<ast::VarStmt&>(*s);
-            // 特殊处理 Point 等 struct 的 StructLit 初始化：直接按字段存入 p 的连续槽
+            // 特殊处理 Point 等 struct 的 StructLit 初始化:字段 i 存入 base + i*8
+            // (base 槽已由 scan_slots 预留为块内最低槽,与 field_offset_in 布局一致)
             if (v.init && v.init->kind() == ast::Expr::StructLit) {
                 auto& sl = static_cast<ast::StructLitExpr&>(*v.init);
                 std::string tname = sl.type_parts.empty() ? "" : sl.type_parts[0];
                 ast::StructDecl* sd = nullptr;
                 for (auto& s : m_->structs) if (s.name == tname) { sd = &s; break; }
                 if (sd) {
-                    std::string second = v.name + "#2";
-                    int base_off, second_off;
-                    // 确保 p 的基址为低地址（x 在 lo，y 在 hi）
-                    auto it = slots_.find(v.name);
-                    auto it2 = slots_.find(second);
-                    if (it == slots_.end() && it2 == slots_.end()) {
-                        // 首次分配：先为 y 分配高地址，再为 x 分配低地址，保证 x 在 lo
-                        second_off = slot_or_new(second); // -8
-                        base_off = slot_or_new(v.name);   // -16
-                    } else if (it != slots_.end()) {
-                        base_off = it->second;
-                        second_off = (it2 == slots_.end()) ? slot_or_new(second) : it2->second;
-                    } else {
-                        second_off = it2->second;
-                        base_off = slot_or_new(v.name);
-                    }
-                    int lo = std::min(base_off, second_off);
-                    int hi = std::max(base_off, second_off);
-                    // 矫正：确保 base_off 为 lo（x 的槽）
-                    if (base_off != lo) {
-                        // 交换 slots 中 p 与 p#2 的偏移，使 p 指向 lo
-                        slots_[v.name] = lo;
-                        slots_[second] = hi;
-                        base_off = lo;
-                        second_off = hi;
-                    }
-                    {
-                        auto fds = fields_deep(sd);
-                        for (size_t i=0;i<fds.size();++i) {
-                            bool found = false;
-                            for (auto& pr : sl.fields) if (pr.first == fds[i].first->name) {
-                                eval(pr.second.get());
-                                found = true;
-                                break;
-                            }
-                            if (!found) eval(fds[i].first->init.get());
-                            int off2 = (i==0) ? lo : hi;
-                            ins("mov QWORD PTR [rbp" + std::to_string(off2) + "], rax");
+                    int base_off = slot_or_new(v.name);
+                    auto fds = fields_deep(sd);
+                    for (size_t i=0;i<fds.size();++i) {
+                        bool found = false;
+                        for (auto& pr : sl.fields) if (pr.first == fds[i].first->name) {
+                            eval(pr.second.get());
+                            found = true;
+                            break;
                         }
+                        if (!found) eval(fds[i].first->init.get());
+                        ins("mov QWORD PTR [rbp" + std::to_string(base_off + fds[i].second) + "], rax");
                     }
                     break;
                 }
@@ -721,6 +714,48 @@ private:
         case ast::Stmt::For: {
             auto& fo = static_cast<ast::ForStmt&>(*s);
             if (!fo.is_range) {
+                // 整数字面量列表迭代:for id in {a, b, c} → 元素存入连续临时槽,按索引循环
+                if (fo.iterable && fo.iterable->kind() == ast::Expr::ListLit) {
+                    auto& ll = static_cast<ast::ListLitExpr&>(*fo.iterable);
+                    for (auto& el : ll.elements)
+                        if (el->kind() != ast::Expr::Literal)
+                            unsup("iterator for-loops: only literal int lists v0");
+                    int n = (int)ll.elements.size();
+                    std::string base_name = fo.var + "#lst";
+                    for (int k = 1; k < n; ++k)            // 占位:保证元素槽连续
+                        slot_or_new(base_name + std::to_string(k));
+                    int base_off = slot_or_new(base_name); // 元素 k 位于 base + k*8
+                    for (int k = 0; k < n; ++k) {
+                        eval(ll.elements[k].get());
+                        ins("mov QWORD PTR [rbp" + std::to_string(base_off + k * 8) + "], rax");
+                    }
+                    int ioff = slot_or_new(fo.var + "#i");
+                    int voff = slot_or_new(fo.var);
+                    ins("xor eax, eax");
+                    ins("mov QWORD PTR [rbp" + std::to_string(ioff) + "], rax");
+                    std::string top = lbl("fortop"), inc = lbl("forinc"), fend = lbl("fend");
+                    label(top);
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(ioff) + "]");
+                    ins("cmp rax, " + std::to_string(n));
+                    ins("jge " + fend);
+                    break_labels_.push_back(fend);
+                    continue_labels_.push_back(inc);
+                    // var = lst[i]
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(ioff) + "]");
+                    ins("shl rax, 3");
+                    ins("lea rcx, QWORD PTR [rbp" + std::to_string(base_off) + "]");
+                    ins("add rax, rcx");
+                    ins("mov rax, QWORD PTR [rax]");
+                    ins("mov QWORD PTR [rbp" + std::to_string(voff) + "], rax");
+                    emit_stmt(fo.body.get());
+                    label(inc);
+                    ins("inc QWORD PTR [rbp" + std::to_string(ioff) + "]");
+                    ins("jmp " + top);
+                    label(fend);
+                    break_labels_.pop_back();
+                    continue_labels_.pop_back();
+                    break;
+                }
                 // string 迭代降级:for c in s → i=0; while i<strlen(s) { c=s[i]; ... }
                 if (!fo.iterable || fo.iterable->kind() != ast::Expr::Name)
                     unsup("iterator for-loops (only 'for c in <string>' v0)");
@@ -979,6 +1014,7 @@ private:
             eval(u.operand.get());
             if (u.op == "-") ins("neg rax");
             else if (u.op == "!") { ins("cmp rax, 0"); ins("sete al"); ins("movzx rax, al"); }
+            else if (u.op == "move") { /* 所有权转移:值表示不变,恒等 */ }
             else unsup("unary operator '" + u.op + "'");
             break;
         }
@@ -990,15 +1026,40 @@ private:
             if (a.target->kind() != ast::Expr::Name)
                 unsup("assignment form");
             auto& n = static_cast<ast::NameExpr&>(*a.target);
-            int off = slot_or_new(n.parts[0]);
+            // 方法上下文(cur_fn_==nullptr)且名字是字段 → 经 this 指针读写
+            bool fld = false;
+            int fld_off = -1;
+            if (cur_struct_) {
+                fld_off = field_offset_in(cur_struct_, n.parts[0]);
+                fld = fld_off != -1;
+            }
+            int off;
+            bool via_this;
+            if (fld && cur_fn_ == nullptr) {
+                off = 0;                          // 占位:实际经 this
+                via_this = true;
+                ins("mov rax, QWORD PTR [rbp-8]");   // this
+                ins("add rax, " + std::to_string(fld_off));
+                ins("push rax");
+                ++push_depth_;                    // 栈顶 = 字段地址
+            } else {
+                off = slot_or_new(n.parts[0]);
+                via_this = false;
+            }
             if (a.op == "=") {
                 eval(a.value.get());
             } else {
                 // compound assignment: desugar lhs op rhs -> rax
                 std::string lop = a.op.substr(0, a.op.size() - 1); // "+=" -> "+"
                 // lhs -> rcx, rhs -> rax, then compute
-                ins("mov rax, QWORD PTR [rbp" + std::to_string(off) + "]");
-                if (is_inout_param(n.parts[0])) ins("mov rax, QWORD PTR [rax]");
+                if (via_this) {
+                    // 字段复合赋值:栈顶已存字段地址;复制一份供读取
+                    ins("mov rcx, QWORD PTR [rsp]");   // addr 副本(rcx 暂存)
+                    ins("mov rax, QWORD PTR [rcx]");   // lhs = *addr
+                } else {
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(off) + "]");
+                    if (is_inout_param(n.parts[0])) ins("mov rax, QWORD PTR [rax]");
+                }
                 ins("push rax");
                 ++push_depth_;
                 eval(a.value.get());
@@ -1070,6 +1131,12 @@ private:
                     field_off = field_offset_in(&s, m.name);
                     if (field_off != -1) break;
                 }
+            }
+            if (field_off == -1 && m.name == "category") {
+                // err 绑定(哨兵 0)的类别:M7,经全局槽读取
+                ins("lea rax, .Lerrcat[rip]");
+                ins("mov rax, QWORD PTR [rax]");
+                return;
             }
             if (field_off == -1) unsup("unknown field '" + m.name + "'");
             int base_off = slot_of(base.parts[0]);
@@ -1283,6 +1350,41 @@ private:
                     // v1:错误串由 err() 写入全局槽,e.message() 读出
                     ins("lea rax, .Lerrmsg[rip]");
                     ins("mov rax, QWORD PTR [rax]");
+                    return;
+                }
+                if (mem.name == "chain") {
+                    // v1 因果链:message + (cause 非空 ? "\n  caused by: " + cause : "")
+                    ins("lea rax, .Lerrcause[rip]");
+                    ins("mov rax, QWORD PTR [rax]");
+                    ins("cmp byte PTR [rax], 0");
+                    std::string nc = lbl("nochain"), ce = lbl("chainend");
+                    std::string midlbl = intern_string("\n  caused by: ");
+                    ins("je " + nc);
+                    ins("lea rax, .Lerrmsg[rip]");
+                    ins("mov rax, QWORD PTR [rax]");
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("mov rdi, rax");
+                    ins("lea rsi, " + midlbl + "[rip]");
+#else
+                    ins("mov rcx, rax");
+                    ins("lea rdx, " + midlbl + "[rip]");
+#endif
+                    ins("call cpp2_strcat");
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("mov rdi, rax");
+                    ins("lea rsi, .Lerrcause[rip]");
+                    ins("mov rsi, QWORD PTR [rsi]");
+#else
+                    ins("mov rcx, rax");
+                    ins("lea rdx, .Lerrcause[rip]");
+                    ins("mov rdx, QWORD PTR [rdx]");
+#endif
+                    ins("call cpp2_strcat");
+                    ins("jmp " + ce);
+                    label(nc);
+                    ins("lea rax, .Lerrmsg[rip]");
+                    ins("mov rax, QWORD PTR [rax]");
+                    label(ce);
                     return;
                 }
                 if (mem.name == "has_value") {
@@ -1689,6 +1791,11 @@ public:
                 emit_method(s, md);
             }
         }
+        while (!pending_lambdas_.empty()) {
+            auto pl = pending_lambdas_.front();
+            pending_lambdas_.erase(pending_lambdas_.begin());
+            emit_lambda(pl.first, pl.second);
+        }
         emit_rodata_strs();
         return out_.str();
     }
@@ -1706,6 +1813,14 @@ private:
     std::vector<std::string> break_labels_;
     std::vector<std::string> continue_labels_;
     std::unordered_map<std::string, std::string> str_pool_;
+    // 闭包(λ)v0 状态:显式按值捕获,env = [fn_ptr][cap0][cap1]...
+    struct LambdaInfo { std::string label; std::vector<std::string> caps; };
+    std::map<std::string, LambdaInfo> lambda_vars_;             // 变量名 → 闭包
+    std::vector<std::pair<std::string, ast::LambdaExpr*>> pending_lambdas_;
+    LambdaInfo last_lambda_;                                    // 最近一次 eval(Lambda)
+    bool in_lambda_ = false;                                    // 正在发射 lambda 体
+    int lambda_ctx_env_ = 0;                                    // 体内 env 所在槽
+    std::map<std::string, int> lambda_caps_;                    // 捕获名 → env 索引
 
     [[noreturn]] void unsup(std::string const& msg) { throw Unsupported(msg); }
 
@@ -1715,12 +1830,13 @@ private:
     char const* fmt_for(ast::Expr* e)
     {
         if (!R_ || !e) return "%lld";
-        // std 桥:e.message() 返回错误 C 串 → %s
+        // std 桥:e.message()/e.chain() 返回错误 C 串 → %s
         if (e->kind() == ast::Expr::Call) {
             auto& c = static_cast<ast::CallExpr&>(*e);
-            if (c.callee->kind() == ast::Expr::Member &&
-                static_cast<ast::MemberExpr&>(*c.callee).name == "message")
-                return "%s";
+            if (c.callee->kind() == ast::Expr::Member) {
+                auto const& mn = static_cast<ast::MemberExpr&>(*c.callee).name;
+                if (mn == "message" || mn == "chain") return "%s";
+            }
         }
         auto t = R_->type_of(*e);
         using K = sema::Type::Kind;
@@ -1843,6 +1959,11 @@ private:
         out_ << ".data\n";
         out_ << ".Lerrmsg:\n";
         out_ << "    .quad 0\n";
+        // 错误类别/因果链槽(M7):err(msg, cat) 写 .Lerrcat;err_caused 写 .Lerrcause
+        out_ << ".Lerrcat:\n";
+        out_ << "    .quad 0\n";
+        out_ << ".Lerrcause:\n";
+        out_ << "    .quad 0\n";
         // double 字面量常量槽(.quad 位模式,按名解析)
         for (auto& dc : dbl_consts_) {
             out_ << dc.first << ":\n";
@@ -1853,6 +1974,14 @@ private:
         out_ << "    .quad 0\n";
         for (int i = 0; i < 32; ++i) {
             std::string bnm = ".Ldblbuf_" + std::string(i < 10 ? "0" : "") + std::to_string(i);
+            out_ << bnm << ":\n";
+            out_ << "    .quad 0\n";
+        }
+        // cpp2_int_str 运行时数据:轮转计数 + 4×32B 缓冲(同 dbl 布局)
+        out_ << ".Lintcnt:\n";
+        out_ << "    .quad 0\n";
+        for (int i = 0; i < 32; ++i) {
+            std::string bnm = ".Lintbuf_" + std::string(i < 10 ? "0" : "") + std::to_string(i);
             out_ << bnm << ":\n";
             out_ << "    .quad 0\n";
         }
@@ -2016,12 +2145,35 @@ private:
         case ast::Stmt::Var: {
             auto& v = static_cast<ast::VarStmt&>(*s);
             // variant:数据字段槽(数据槽上方连续)必须先于数据槽分配
-            if (v.has_type && v.type.parts.size()==1) {
-                for (auto& vd : m_->variants) {
-                    if (vd.name != v.type.parts[0]) continue;
-                    int K = max_alt_fields(v.type.parts[0]);
-                    for (int d = K - 1; d >= 1; --d)
-                        slot_or_new(v.name + "#d" + std::to_string(d));
+            {
+                bool is_variant = false;
+                if (v.has_type && v.type.parts.size()==1) {
+                    for (auto& vd : m_->variants) {
+                        if (vd.name != v.type.parts[0]) continue;
+                        is_variant = true;
+                        int K = max_alt_fields(v.type.parts[0]);
+                        for (int d = K - 1; d >= 1; --d)
+                            slot_or_new(v.name + "#d" + std::to_string(d));
+                        break;
+                    }
+                }
+                if (is_variant) { slot_or_new(v.name); break; }
+            }
+            // struct 变量:预留连续字段块(字段 i 位于 base + i*8,base = 块内最低槽)。
+            // 占位槽仅保证连续性,字段实际地址一律按 base 偏移计算
+            {
+                std::string tn;
+                if (v.has_type && v.type.parts.size() == 1) tn = v.type.parts[0];
+                else if (v.init && v.init->kind() == ast::Expr::StructLit &&
+                         !static_cast<ast::StructLitExpr&>(*v.init).type_parts.empty())
+                    tn = static_cast<ast::StructLitExpr&>(*v.init).type_parts[0];
+                ast::StructDecl* sd = nullptr;
+                if (!tn.empty()) sd = find_sd(tn);
+                if (sd) {
+                    int n = (int)fields_deep(sd).size();
+                    for (int i = 1; i < n; ++i)
+                        slot_or_new(v.name + "#f" + std::to_string(i));
+                    slot_or_new(v.name);
                     break;
                 }
             }
@@ -2113,6 +2265,58 @@ private:
         }
         put("");
         cur_fn_ = nullptr;
+    }
+
+    // 发射一个 lambda 函数:rcx = env,实参自 rdx 起;捕获经 env 加载
+    void emit_lambda(std::string const& fn, ast::LambdaExpr* lx)
+    {
+        cur_fn_ = nullptr;
+        cur_sym_name_ = fn;
+        cur_struct_ = nullptr;
+        scope_stack_.clear();
+        slots_.clear();
+        push_depth_ = 0;
+        static char const* regs[] = {"rcx","rdx","r8","r9"};
+        std::vector<std::string> param_stores;
+        int r = 1;                               // rcx = env,实参从 rdx 起
+        for (size_t i = 0; i < lx->params.size(); ++i) {
+            slots_[lx->params[i].name] = slot_or_new(lx->params[i].name);
+            param_stores.push_back("mov QWORD PTR [rbp" + std::to_string(slots_[lx->params[i].name]) + "], " + regs[r]);
+            ++r;
+        }
+        int env_off = slot_or_new("$lenv");
+        scan_slots(lx->has_block_body ? lx->block_body.get() : nullptr);
+        int words = (int)lx->params.size() + (int)slots_.size() + 16;
+        int frame = ((words * 8 + 15) / 16) * 16;
+        put(fn + ":");
+        ins("push rbp");
+        ins("mov rbp, rsp");
+        if (frame > 0) ins("sub rsp, " + std::to_string(frame));
+        ins("mov QWORD PTR [rbp" + std::to_string(env_off) + "], rcx");
+        for (auto& st : param_stores) ins(st);
+        std::map<std::string, int> caps;
+        for (size_t k = 0; k < lx->captures.size(); ++k) {
+            std::string c = lx->captures[k];
+            if (!c.empty() && c[0] == '&') c = c.substr(1);
+            caps[c] = (int)k;
+        }
+        bool saved_in = in_lambda_;
+        int saved_env = lambda_ctx_env_;
+        std::map<std::string, int> saved_caps = lambda_caps_;
+        in_lambda_ = true;
+        lambda_ctx_env_ = env_off;
+        lambda_caps_ = caps;
+        std::string ret = ".Lret_" + fn;
+        if (lx->has_block_body && lx->block_body) emit_stmt(lx->block_body.get());
+        else if (lx->expr_body) { eval(lx->expr_body.get()); ins("jmp " + ret); }
+        label(ret);
+        ins("mov rsp, rbp");
+        ins("pop rbp");
+        ins("ret");
+        put("");
+        in_lambda_ = saved_in;
+        lambda_ctx_env_ = saved_env;
+        lambda_caps_ = saved_caps;
     }
 
     void emit_method(ast::StructDecl& s, ast::MethodDecl& m)
@@ -2236,45 +2440,19 @@ private:
                     for (auto& vd : m_->variants)
                         if (vd.name == v.type.parts[0]) { sd = nullptr; break; }
                 if (sd) {
-                    std::string second = v.name + "#2";
-                    int base_off, second_off;
-                    // 确保 p 的基址为低地址（x 在 lo，y 在 hi）
-                    auto it = slots_.find(v.name);
-                    auto it2 = slots_.find(second);
-                    if (it == slots_.end() && it2 == slots_.end()) {
-                        // 首次分配：先为 y 分配高地址，再为 x 分配低地址，保证 x 在 lo
-                        second_off = slot_or_new(second); // -8
-                        base_off = slot_or_new(v.name);   // -16
-                    } else if (it != slots_.end()) {
-                        base_off = it->second;
-                        second_off = (it2 == slots_.end()) ? slot_or_new(second) : it2->second;
-                    } else {
-                        second_off = it2->second;
-                        base_off = slot_or_new(v.name);
-                    }
-                    int lo = std::min(base_off, second_off);
-                    int hi = std::max(base_off, second_off);
-                    // 矫正：确保 base_off 为 lo（x 的槽）
-                    if (base_off != lo) {
-                        // 交换 slots 中 p 与 p#2 的偏移，使 p 指向 lo
-                        slots_[v.name] = lo;
-                        slots_[second] = hi;
-                        base_off = lo;
-                        second_off = hi;
-                    }
-                    {
-                        auto fds = fields_deep(sd);
-                        for (size_t i=0;i<fds.size();++i) {
-                            bool found = false;
-                            for (auto& pr : sl.fields) if (pr.first == fds[i].first->name) {
-                                eval_field_init(pr.second.get(), fds[i].first);
-                                found = true;
-                                break;
-                            }
-                            if (!found) eval_field_init(fds[i].first->init.get(), fds[i].first);
-                            int off2 = (i==0) ? lo : hi;
-                            ins("mov QWORD PTR [rbp" + std::to_string(off2) + "], rax");
+                    // 字段 i 存入 base + i*8:base 槽已由 scan_slots 预留为块内最低槽,
+                    // 与 field_offset_in / 成员访问的 base+field_off 布局一致
+                    int base_off = slot_or_new(v.name);
+                    auto fds = fields_deep(sd);
+                    for (size_t i=0;i<fds.size();++i) {
+                        bool found = false;
+                        for (auto& pr : sl.fields) if (pr.first == fds[i].first->name) {
+                            eval_field_init(pr.second.get(), fds[i].first);
+                            found = true;
+                            break;
                         }
+                        if (!found) eval_field_init(fds[i].first->init.get(), fds[i].first);
+                        ins("mov QWORD PTR [rbp" + std::to_string(base_off + fds[i].second) + "], rax");
                     }
                     break;
                 }
@@ -2333,6 +2511,8 @@ private:
             int off = slot_or_new(v.name);
             if (v.init) eval(v.init.get());
             else ins("xor eax, eax");
+            if (v.init && v.init->kind() == ast::Expr::Lambda)
+                lambda_vars_[v.name] = last_lambda_;    // 调用点按闭包间接调用
             ins("mov QWORD PTR [rbp" + std::to_string(off) + "], rax");
             break;
         }
@@ -2411,6 +2591,48 @@ private:
         case ast::Stmt::For: {
             auto& fo = static_cast<ast::ForStmt&>(*s);
             if (!fo.is_range) {
+                // 整数字面量列表迭代:for id in {a, b, c} → 元素存入连续临时槽,按索引循环
+                if (fo.iterable && fo.iterable->kind() == ast::Expr::ListLit) {
+                    auto& ll = static_cast<ast::ListLitExpr&>(*fo.iterable);
+                    for (auto& el : ll.elements)
+                        if (el->kind() != ast::Expr::Literal)
+                            unsup("iterator for-loops: only literal int lists v0");
+                    int n = (int)ll.elements.size();
+                    std::string base_name = fo.var + "#lst";
+                    for (int k = 1; k < n; ++k)            // 占位:保证元素槽连续
+                        slot_or_new(base_name + std::to_string(k));
+                    int base_off = slot_or_new(base_name); // 元素 k 位于 base + k*8
+                    for (int k = 0; k < n; ++k) {
+                        eval(ll.elements[k].get());
+                        ins("mov QWORD PTR [rbp" + std::to_string(base_off + k * 8) + "], rax");
+                    }
+                    int ioff = slot_or_new(fo.var + "#i");
+                    int voff = slot_or_new(fo.var);
+                    ins("xor eax, eax");
+                    ins("mov QWORD PTR [rbp" + std::to_string(ioff) + "], rax");
+                    std::string top = lbl("fortop"), inc = lbl("forinc"), fend = lbl("fend");
+                    label(top);
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(ioff) + "]");
+                    ins("cmp rax, " + std::to_string(n));
+                    ins("jge " + fend);
+                    break_labels_.push_back(fend);
+                    continue_labels_.push_back(inc);
+                    // var = lst[i]
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(ioff) + "]");
+                    ins("shl rax, 3");
+                    ins("lea rcx, QWORD PTR [rbp" + std::to_string(base_off) + "]");
+                    ins("add rax, rcx");
+                    ins("mov rax, QWORD PTR [rax]");
+                    ins("mov QWORD PTR [rbp" + std::to_string(voff) + "], rax");
+                    emit_stmt(fo.body.get());
+                    label(inc);
+                    ins("inc QWORD PTR [rbp" + std::to_string(ioff) + "]");
+                    ins("jmp " + top);
+                    label(fend);
+                    break_labels_.pop_back();
+                    continue_labels_.pop_back();
+                    break;
+                }
                 // string 迭代降级:for c in s → i=0; while i<strlen(s) { c=s[i]; ... }
                 if (!fo.iterable || fo.iterable->kind() != ast::Expr::Name)
                     unsup("iterator for-loops (only 'for c in <string>' v0)");
@@ -2665,6 +2887,15 @@ private:
                 unsup("qualified names");
             }
             {
+                if (in_lambda_) {
+                    // 闭包内:捕获名从 env 块加载(env = [fn_ptr][cap0]...)
+                    auto ct = lambda_caps_.find(n.parts[0]);
+                    if (ct != lambda_caps_.end()) {
+                        ins("mov rcx, QWORD PTR [rbp" + std::to_string(lambda_ctx_env_) + "]");
+                        ins("mov rax, QWORD PTR [rcx+" + std::to_string(8 + ct->second * 8) + "]");
+                        goto name_done;
+                    }
+                }
                 bool is_field = false;
                 int field_off = -1;
                 if (cur_struct_) {
@@ -2688,6 +2919,7 @@ private:
             eval(u.operand.get());
             if (u.op == "-") ins("neg rax");
             else if (u.op == "!") { ins("cmp rax, 0"); ins("sete al"); ins("movzx rax, al"); }
+            else if (u.op == "move") { /* 所有权转移:值表示不变,恒等 */ }
             else unsup("unary operator '" + u.op + "'");
             break;
         }
@@ -2744,6 +2976,85 @@ private:
         case ast::Expr::AsCast: {
             auto& ac = static_cast<ast::AsCastExpr&>(*e);
             eval(ac.operand.get());
+            break;
+        }
+        case ast::Expr::ListLit: {
+            // list 字面量 → 堆块 [count][e0][e1]...;元素须为整数字面量(v0)
+            auto& ll = static_cast<ast::ListLitExpr&>(*e);
+            for (auto& el : ll.elements)
+                if (el->kind() != ast::Expr::Literal)
+                    unsup("list literal: only int literals v0");
+            long long n = (long long)ll.elements.size();
+            int blk_off = slot_or_new("$list_ptr");
+            ins("mov rcx, " + std::to_string((n + 1) * 8));
+            ins("call cpp2_alloc");
+            ins("mov QWORD PTR [rbp" + std::to_string(blk_off) + "], rax");
+            ins("mov QWORD PTR [rax], " + std::to_string(n));
+            for (size_t k = 0; k < ll.elements.size(); ++k) {
+                eval(ll.elements[k].get());
+                ins("mov rcx, QWORD PTR [rbp" + std::to_string(blk_off) + "]");
+                ins("mov QWORD PTR [rcx+" + std::to_string((k + 1) * 8) + "], rax");
+            }
+            ins("mov rax, QWORD PTR [rbp" + std::to_string(blk_off) + "]");
+            break;
+        }
+        case ast::Expr::Index: {
+            // 下标读:容器 = 堆块 [count][e0]...;越界 trap(M2 安全默认)
+            auto& ix = static_cast<ast::IndexExpr&>(*e);
+            if (ix.base->kind() != ast::Expr::Name) unsup("index base must be name");
+            int ptr_off = slot_or_new("$ix_ptr");
+            std::string it_ = lbl("ixtrap"), id_ = lbl("ixdone");
+            eval(ix.base.get());                    // rax = 块指针
+            ins("mov QWORD PTR [rbp" + std::to_string(ptr_off) + "], rax");
+            eval(ix.index.get());                   // rax = 下标
+            ins("mov rcx, QWORD PTR [rbp" + std::to_string(ptr_off) + "]");
+            ins("cmp rax, QWORD PTR [rcx]");
+            ins("jae " + it_);
+            ins("mov rdx, rax");
+            ins("shl rdx, 3");
+            ins("add rdx, rcx");
+            ins("mov rax, QWORD PTR [rdx+8]");
+            ins("jmp " + id_);
+            label(it_);
+            ins("lea rcx, .Lfmt_ix[rip]");
+            ins("sub rsp, 32");
+            ins("xor eax, eax");
+            ins("call printf");
+            ins("add rsp, 32");
+            ins("mov rcx, 101");
+            ins("call exit");
+            label(id_);
+            break;
+        }
+        case ast::Expr::Lambda: {
+            // 闭包 v0:显式按值捕获;env = [fn_ptr][cap0][cap1]...(cpp2_alloc)
+            auto& lx = static_cast<ast::LambdaExpr&>(*e);
+            std::string fn = lbl("lambda");
+            std::vector<std::string> caps;
+            for (auto& cn : lx.captures)
+                caps.push_back(!cn.empty() && cn[0] == '&' ? cn.substr(1) : cn);
+            for (auto& c : caps) {                       // 捕获值 = 创建时快照
+                int coff = slot_of(c);
+                if (coff == 0) unsup("lambda capture '" + c + "' not found");
+                ins("mov rax, QWORD PTR [rbp" + std::to_string(coff) + "]");
+                ins("push rax");
+                ++push_depth_;
+            }
+            ins("mov rcx, " + std::to_string((caps.size() + 1) * 8));
+            ins("call cpp2_alloc");
+            int env_off = slot_or_new("$lam_" + fn);
+            ins("mov QWORD PTR [rbp" + std::to_string(env_off) + "], rax");
+            ins("lea rdx, " + fn + "[rip]");
+            ins("mov QWORD PTR [rax], rdx");
+            for (size_t k = 0; k < caps.size(); ++k) {   // 倒序弹出存入 env
+                ins("pop rcx");
+                --push_depth_;
+                ins("mov rdx, QWORD PTR [rbp" + std::to_string(env_off) + "]");
+                ins("mov QWORD PTR [rdx+" + std::to_string(8 + k * 8) + "], rcx");
+            }
+            ins("mov rax, QWORD PTR [rbp" + std::to_string(env_off) + "]");
+            last_lambda_ = LambdaInfo{fn, caps};
+            pending_lambdas_.push_back({fn, &lx});
             break;
         }
         case ast::Expr::Assign: {
@@ -2911,6 +3222,12 @@ private:
                     field_off = field_offset_in(&s, m.name);
                     if (field_off != -1) break;
                 }
+            }
+            if (field_off == -1 && m.name == "category") {
+                // err 绑定(哨兵 0)的类别:M7,经全局槽读取
+                ins("lea rax, .Lerrcat[rip]");
+                ins("mov rax, QWORD PTR [rax]");
+                return;
             }
             if (field_off == -1) unsup("unknown field '" + m.name + "'");
             int base_off = slot_of(base.parts[0]);
@@ -3156,6 +3473,41 @@ private:
                     ins("mov rax, QWORD PTR [rax]");
                     return;
                 }
+                if (mem.name == "chain") {
+                    // v1 因果链:message + (cause 非空 ? "\n  caused by: " + cause : "")
+                    ins("lea rax, .Lerrcause[rip]");
+                    ins("mov rax, QWORD PTR [rax]");
+                    ins("cmp byte PTR [rax], 0");
+                    std::string nc = lbl("nochain"), ce = lbl("chainend");
+                    std::string midlbl = intern_string("\n  caused by: ");
+                    ins("je " + nc);
+                    ins("lea rax, .Lerrmsg[rip]");
+                    ins("mov rax, QWORD PTR [rax]");
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("mov rdi, rax");
+                    ins("lea rsi, " + midlbl + "[rip]");
+#else
+                    ins("mov rcx, rax");
+                    ins("lea rdx, " + midlbl + "[rip]");
+#endif
+                    ins("call cpp2_strcat");
+#ifdef CPP2_NATIVE_HOST_OK
+                    ins("mov rdi, rax");
+                    ins("lea rsi, .Lerrcause[rip]");
+                    ins("mov rsi, QWORD PTR [rsi]");
+#else
+                    ins("mov rcx, rax");
+                    ins("lea rdx, .Lerrcause[rip]");
+                    ins("mov rdx, QWORD PTR [rdx]");
+#endif
+                    ins("call cpp2_strcat");
+                    ins("jmp " + ce);
+                    label(nc);
+                    ins("lea rax, .Lerrmsg[rip]");
+                    ins("mov rax, QWORD PTR [rax]");
+                    label(ce);
+                    return;
+                }
                 if (mem.name == "has_value") {
                     eval(mem.base.get());
                     ins("test rax, rax");
@@ -3193,28 +3545,32 @@ private:
             if (bn == "err") {
                 // v1:错误串存入全局槽 .Lerrmsg;返回 0 哨兵。
                 // 与参考实现一致,编译期拼接来源位置后缀" (路径:行号)"
+                // err(msg, cat) 二参形式:类别存 .Lerrcat(M7);同时清空因果链
                 if (!c.args.empty()) {
-                    eval(c.args[0].get());
+                    if (c.args.size() >= 2) {
+                        eval(c.args[0].get());
+                        ins("push rax");
+                        ++push_depth_;
+                        eval(c.args[1].get());
+                        ins("lea rcx, .Lerrcat[rip]");
+                        ins("mov QWORD PTR [rcx], rax");
+                        ins("pop rax");
+                        --push_depth_;
+                    } else {
+                        eval(c.args[0].get());
+                    }
                     if (!src_path_.empty()) {
                         std::string suffix = " (" + src_path_ + ":" + std::to_string(c.line) + ")";
                         std::string slbl = intern_string(suffix);
-#ifdef CPP2_NATIVE_HOST_OK
-                        ins("mov rdi, rax");
-                        ins("lea rsi, " + slbl + "[rip]");
-                        ins("call cpp2_strcat");
-#else
                         ins("mov rcx, rax");
                         ins("lea rdx, " + slbl + "[rip]");
                         ins("call cpp2_strcat");
-#endif
                     }
-#ifdef CPP2_NATIVE_HOST_OK
-                    ins("lea rdi, .Lerrmsg[rip]");
-                    ins("mov QWORD PTR [rdi], rax");
-#else
                     ins("lea rcx, .Lerrmsg[rip]");
                     ins("mov QWORD PTR [rcx], rax");
-#endif
+                    ins("lea rcx, .Lerrcause[rip]");   // 新错误无因果链:指向空串
+                    ins("lea rdx, " + intern_string("") + "[rip]");
+                    ins("mov QWORD PTR [rcx], rdx");
                 }
                 ins("xor eax, eax");  // 语言级哨兵
                 return;
@@ -3300,6 +3656,77 @@ private:
             ins("sqrtsd xmm0, xmm0");
             ins("movq rax, xmm0");
             return;
+        }
+        if (nm.qualified() && nm.parts[0] == "std" && nm.parts[1] == "to_string" && c.args.size() == 1) {
+            eval(c.args[0].get());
+            if (is_double_expr(c.args[0].get())) {
+                ins("movq xmm0, rax");
+                ins("call cpp2_dbl_str");
+            } else {
+                ins("mov rcx, rax");
+                ins("call cpp2_int_str");   // → "%lld" 文本(轮转缓冲)
+            }
+            return;
+        }
+        if (nm.qualified() && nm.parts[0] == "cpp2" && nm.parts.size() >= 2 && nm.parts[1] == "error") {
+            // cpp2::error(msg):直接构造,message = msg(无位置后缀),category = 0,清链
+            if (!c.args.empty()) {
+                eval(c.args[0].get());
+                ins("lea rcx, .Lerrmsg[rip]");
+                ins("mov QWORD PTR [rcx], rax");
+                ins("lea rcx, .Lerrcat[rip]");
+                ins("mov QWORD PTR [rcx], 0");
+                ins("lea rcx, .Lerrcause[rip]");
+                ins("lea rdx, " + intern_string("") + "[rip]");
+                ins("mov QWORD PTR [rcx], rdx");
+            }
+            ins("xor eax, eax");
+            return;
+        }
+        if (nm.qualified() && nm.parts[0] == "cpp2" && nm.parts.size() >= 2 && nm.parts[1] == "err_caused" && c.args.size() == 2) {
+            // err_caused(cause, msg):新 text = msg + " (:0)"(转译基线 file="",line=0);
+            // category 沿用 cause(即当前 .Lerrcat);cause 文本入 .Lerrcause
+            // v1 限制:cause 实参不再单独求值,链状态直接取全局槽(仅一层)
+            eval(c.args[1].get());
+            std::string slbl = intern_string(" (:0)");
+            ins("mov rcx, rax");
+            ins("lea rdx, " + slbl + "[rip]");
+            ins("call cpp2_strcat");
+            ins("push rax");
+            ++push_depth_;
+            ins("lea rcx, .Lerrmsg[rip]");
+            ins("mov rcx, QWORD PTR [rcx]");   // cause 文本
+            ins("lea rdx, " + intern_string("") + "[rip]");
+            ins("call cpp2_strcat");            // 与空串拼接 = 堆拷贝
+            ins("lea rcx, .Lerrcause[rip]");
+            ins("mov QWORD PTR [rcx], rax");
+            ins("pop rax");
+            --push_depth_;
+            ins("lea rcx, .Lerrmsg[rip]");
+            ins("mov QWORD PTR [rcx], rax");
+            ins("xor eax, eax");
+            return;
+        }
+        if (!nm.qualified()) {
+            auto lv = lambda_vars_.find(nm.parts[0]);
+            if (lv != lambda_vars_.end()) {
+                // 闭包调用:rcx = env,实参 rdx/r8/r9,经 env[0] 间接 call
+                for (auto& a : c.args) {
+                    eval(a.get());
+                    ins("push rax");
+                    ++push_depth_;
+                }
+                static char const* lregs[] = {"rdx","r8","r9"};
+                for (int i = (int)c.args.size() - 1; i >= 0; --i) {
+                    ins(std::string("pop ") + lregs[i]);
+                    --push_depth_;
+                }
+                int eoff = slot_of(nm.parts[0]);
+                ins("mov rcx, QWORD PTR [rbp" + std::to_string(eoff) + "]");
+                ins("mov rax, QWORD PTR [rcx]");
+                ins("call rax");
+                return;
+            }
         }
         if (nm.qualified()) unsup("qualified calls (std bridge)");
         // inout/out 实参传地址(裸名字且槽存在);其余传值
@@ -3428,7 +3855,10 @@ private:
                 int idx = text[pos + 1] - '0';
                 if (idx + 1 >= (int)c.args.size())
                     unsup("println placeholder {" + std::string(1, text[pos + 1]) + "} out of range");
-                cfmt += fmt_for(c.args[idx + 1].get());
+                // double 实参:{0} → %f(对齐转译基线 std::to_string 的 6 位小数);
+                // 位模式按 GP 变参直传(msvcrt printf 家族从 GP 流读,不走 xmm)
+                if (is_double_expr(c.args[idx + 1].get())) cfmt += "%f";
+                else cfmt += fmt_for(c.args[idx + 1].get());
                 pos += 2;
             } else if (text[pos] == '\\' && pos + 1 < text.size()) {
                 char nxt = text[pos + 1];
@@ -3448,10 +3878,6 @@ private:
         int nargs = (int)(c.args.size() - 1);
         for (size_t i = 1; i < c.args.size(); ++i) {
             eval(c.args[i].get());
-            if (is_double_expr(c.args[i].get())) {   // 位模式 → 字符串指针
-                ins("movq xmm0, rax");
-                ins("call cpp2_dbl_str");
-            }
             ins("push rax");
             ++push_depth_;
         }
@@ -3737,6 +4163,11 @@ std::vector<uint8_t> emit_pe(ast::Module& m, sema::Result const& r)
 std::vector<uint8_t> emit_native(const std::string& asm_text)
 {
     // 追加最小运行时(零 CRT):cpp2_write/sys_exit/... 直接走 kernel32 系统调用
+    // 注意: 本运行时导入的是 msvcrt.dll(legacy CRT)。其 printf 家族按"varargs 全部
+    //       走 GP 位置流"读取: 第 1/2/3 个变参依次取 rdx/r8/r9 的 home 槽,之后取栈槽;
+    //       xmm 寄存器与 AL 完全不参与(gdb 实测 sprintf 反汇编: va_list = rbp+0x28
+    //       即 r8 home 起始的 GP 流)。因此浮点变参必须以位模式放入下一个 GP 位置,
+    //       cpp2_dbl_str 调 sprintf 时 double 放 r9,而非 xmm3+AL。
     static char const* runtime_s = R"(
 .section .text
 .globl cpp2_write
@@ -3868,22 +4299,33 @@ cpp2_dbl_str:
     lea rax, .Ldblbuf_00[rip]
     add rax, rcx
     mov QWORD PTR [rbp-16], rax
-    mov QWORD PTR [rbp-24], 1
-.cpp2_dbl_loop:
-    mov rdx, QWORD PTR [rbp-24]
-    movsd xmm2, QWORD PTR [rbp-8]
-    lea rcx, .Lfmt_g[rip]
+    mov rcx, rax
+    lea rdx, .Lfmt_g[rip]
+    mov r8, QWORD PTR [rbp-8]
     call sprintf
-    mov rcx, QWORD PTR [rbp-16]
-    xor rdx, rdx
-    call strtod
-    movsd xmm2, QWORD PTR [rbp-8]
-    ucomisd xmm0, xmm2
-    je .cpp2_dbl_done
-    inc QWORD PTR [rbp-24]
-    cmp QWORD PTR [rbp-24], 17
-    jle .cpp2_dbl_loop
-.cpp2_dbl_done:
+    mov rax, QWORD PTR [rbp-16]
+    add rsp, 64
+    pop rbp
+    ret
+.globl cpp2_int_str
+cpp2_int_str:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 64
+    mov QWORD PTR [rbp-8], rcx
+    lea rax, .Lintcnt[rip]
+    mov rcx, QWORD PTR [rax]
+    lea rdx, [rcx+1]
+    mov QWORD PTR [rax], rdx
+    and rcx, 3
+    shl rcx, 5
+    lea rax, .Lintbuf_00[rip]
+    add rax, rcx
+    mov QWORD PTR [rbp-16], rax
+    mov rcx, rax
+    lea rdx, .Lfmt_int[rip]
+    mov r8, QWORD PTR [rbp-8]
+    call sprintf
     mov rax, QWORD PTR [rbp-16]
     add rsp, 64
     pop rbp
@@ -3891,7 +4333,11 @@ cpp2_dbl_str:
 
 .section .rodata
 .Lfmt_g:
-    .string "%.*g"
+    .string "%.6g"
+.Lfmt_int:
+    .string "%lld"
+.Lfmt_ix:
+    .string "cpp2 trap: index out of bounds\n"
 )";
     std::string full = asm_text + "\n" + runtime_s;
 

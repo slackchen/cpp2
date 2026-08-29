@@ -11,5 +11,6 @@ esac
 
 mkdir -p .cpp2build
 # shellcheck disable=SC2086
-"$CXX" -std=c++23 -O1 -Wall -Wextra tool/src/*.cpp tool/src/native/*.cpp -o "$EXE"
+# gnu++23:cygwin/glibc 严格模式隐藏 popen/pclose,需 gnu 扩展(对其他平台无影响)
+"$CXX" -std=gnu++23 -O1 -Wall -Wextra tool/src/*.cpp tool/src/native/*.cpp -o "$EXE"
 echo "built $EXE"

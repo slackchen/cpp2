@@ -121,7 +121,7 @@ int cmd_run(std::vector<std::string> const& args)
                 g0.units.at(g0.root_name).ast, p->sema.at(g0.root_name), src_norm0);
             fs::path build_dir0 = in.parent_path() / ".cpp2build" / "native";
             fs::create_directories(build_dir0);
-#ifdef _WIN32
+#if defined(_WIN32) || defined(__CYGWIN__)   // Win64 直出 PE(cygwin 宿主同权,见 native.cpp 目标平台注)
             write_file(build_dir0 / (in.stem().string() + ".asm"), asm_text);   // 失败也可查
             auto pe_bytes = cpp2::native::emit_native(asm_text);
             fs::path exe = build_dir0 / (in.stem().string() + ".exe");

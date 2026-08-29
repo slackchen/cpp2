@@ -554,15 +554,19 @@ struct Asm {
         }
 
         // ── SSE2 double 子集(native.cpp 的 double 路径专用)──────────
-        // movq GPR↔XMM(双向:第 1/2 操作数任一为 XMM)
+        // movq GPR↔XMM(双向:第 1/2 操作数任一为 XMM)。
+        // 编码上 XMM 恒占 modrm.reg,GPR 恒占 modrm.rm:
+        //   66 0F 6E /r = movq xmm, r/m64   66 0F 7E /r = movq r/m64, xmm
         if (op == "movq" && ops.size() == 2 && ops[0].kind == Op::REG &&
             ops[1].kind == Op::REG &&
             ((ops[0].reg.size == RegSize::XMM) != (ops[1].reg.size == RegSize::XMM))) {
             bool to_xmm = ops[0].reg.size == RegSize::XMM;
+            int xmm_id = to_xmm ? ops[0].reg.id : ops[1].reg.id;   // → reg 字段
+            int gpr_id = to_xmm ? ops[1].reg.id : ops[0].reg.id;   // → rm 字段
             emit8(0x66);
-            emit8(rex(true, ops[0].reg.id, -1, ops[1].reg.id));
+            emit8(rex(true, xmm_id, -1, gpr_id));
             emit8(0x0F); emit8(to_xmm ? 0x6E : 0x7E);
-            emit8(modrm(3, ops[0].reg.id, ops[1].reg.id));
+            emit8(modrm(3, xmm_id, gpr_id));
             return;
         }
         if (ops.size() == 2 && ops[0].kind == Op::REG && ops[0].reg.size == RegSize::XMM) {

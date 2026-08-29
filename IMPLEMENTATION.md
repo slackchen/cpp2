@@ -269,6 +269,40 @@ load(cpp2::in<std::string> path)
 4. **故障注入(M4/M2c,已落地)**:注入越界/溢出/空解引用/浮点转换/契约违反(pre/post)/`!` 断言失败的用例必须 trap,且断言 trap 消息携带 `.cpp2` 源位置——验证检查存在且生效
 5. **模糊测试(M4,已落地)**:内置 `cpp2 fuzz` 确定性变异 fuzzer(seed 可复现,CI 友好);libFuzzer harness 备于 `tool/fuzz/`(支持该 sanitizer 的平台使用)
 
+### 7.1 examples 的 native 模式验收(`tools/native_cmp.sh`)
+
+基准 = 转译模式 `cpp2 run` 的 stdout;native 产物(直出 PE)stdout 必须逐行一致且退出 0。
+
+```bash
+bash tools/native_cmp.sh          # 全量 examples/
+bash tools/native_cmp.sh -v 名称  # 单例(裸名或路径)+ 失败 diff
+```
+
+本机安全软件会拦截 cpp2 进程树直写的 PE("Access denied"):同字节文件经外部 shell
+`rm+cp` 重建实例后可执行。脚本因此经 `cpp2 build --backend=native` 取产物并重建文件实例;
+无此类拦截的环境可直接 `cpp2 run --backend=native`。
+
+**截至本节修订的状态**(Win64 直出 PE,cygwin 宿主):colors/contract/errors/funcs/hello/
+invariant/loops/m6b/native_demo/optional/point/shapes/types/errcat/errchain/m7b 共 16 例
+通过。已落地的关键修复与能力:
+
+- msvcrt(legacy CRT)变参约定:printf 家族从 GP 位置流(rdx/r8/r9 home,之后栈)读变参,
+  xmm/AL 完全不参与 → 浮点变参一律以位模式放入下一个 GP 位置(cpp2_dbl_str 的 sprintf、
+  `{0}`+double 的 `%f` 直传)
+- cpp2_dbl_str 对齐转译基线:单参 print(double) = `%.6g`(ostream 默认)
+- struct 局部变量改为连续字段块布局(字段 i 位于 base+i*8,scan_slots 预留),
+  与 field_offset_in/成员访问一致;asm64 修复 movq gpr←xmm 方向的 modrm 字段错位
+- M7 错误面:err(msg,cat) 类别槽 .Lerrcat、cpp2::error/err_caused/chain()、
+  e.category;err() 位置后缀在 build 路径同样生效(cmd_build 传 src_path)
+- std::to_string 桥(cpp2_int_str)、整数字面量列表迭代 for、list 字面量 +
+  下标读(越界 trap)、lambda 闭包(显式按值捕获,env=[fn_ptr][cap...],间接 call)、
+  UFCS 管道(解析期脱糖为普通调用,直接可用)
+
+已知缺口(native 构建失败,属 v0 语言子集边界):smart(unique/shared 所有权)、
+safety(ListLit 槽修复后待复测)、gc_demo(GC 运行时)、generics/showcase(concepts)、
+gc_demo/generics 类泛型、m7b 之外的 virtual_demo(vector/unique/vtable 虚分发)、
+unsafe_demo/zlib_demo(cxx_legacy 块,零工具链 PE 后端不编译 C++ 源)。
+
 ---
 
 ## 8. 风险与缓解

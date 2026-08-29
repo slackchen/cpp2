@@ -119,26 +119,17 @@ int cmd_build(std::vector<std::string> const& args)
             return 1;
         } else {
             try {
-#ifdef _WIN32
-                // Windows: emit_pe(hello 专用) 优先;其余走 asm64 + direct PE(零 g++)
-                try {
-                    auto pe_bytes = cpp2::native::emit_pe(g.units.at(g.root_name).ast,
-                                                          p->sema.at(g.root_name));
-                    fs::create_directories(build_dir);
-                    fs::path exe = in.parent_path() / ".cpp2build" / (in.stem().string() + ".exe");
-                    std::ofstream out(native(exe), std::ios::binary);
-                    out.write(reinterpret_cast<char const*>(pe_bytes.data()), pe_bytes.size());
-                    out.close();
-                    std::cerr << "[cpp2] native backend: emitting x86-64 Win64 (direct PE, no g++)\n";
-                    std::cout << exe.string() << "\n";
-                    return 0;
-                } catch (std::exception const&) {
+#if defined(_WIN32) || defined(__CYGWIN__)   // Win64 直出 PE(cygwin 宿主同权,见 native.cpp 目标平台注)
+                // asm64 + direct PE(零 g++)。emit_pe(hello 专用桩)已停用:
+                // 其守卫过弱会对非 hello 程序误发射 hello 形状的错误产物
+                {
+                    std::string src_norm = in.string();
+                    for (auto& ch : src_norm) if (ch == '\\') ch = '/';   // 位置后缀与转译模式同格式
                     std::string asm_text = cpp2::native::emit_asm(g.units.at(g.root_name).ast,
-                                                                  p->sema.at(g.root_name));
-                    fs::path native_dir = build_dir / "native";
-                    fs::create_directories(native_dir);
-                    fs::path exe = native_dir / (in.stem().string() + ".exe");
-                    write_file(native_dir / (in.stem().string() + ".s"), asm_text);
+                                                                  p->sema.at(g.root_name), src_norm);
+                    // build_dir 已含 backend 子目录(.cpp2build/native),不再叠加 "native"
+                    fs::path exe = build_dir / (in.stem().string() + ".exe");
+                    write_file(build_dir / (in.stem().string() + ".s"), asm_text);
                     auto pe_bytes = cpp2::native::emit_native(asm_text);
                     std::ofstream out(native(exe), std::ios::binary);
                     out.write(reinterpret_cast<char const*>(pe_bytes.data()), pe_bytes.size());
