@@ -11,6 +11,14 @@
 #include "sema.hpp"
 
 #include <stdexcept>
+
+// 目标平台 = 宿主平台。__CYGWIN__ 宿主也走 Win64 直出 PE:PE 是纯目标产物,
+// 生成与执行不依赖工具自身 ABI;而 cygwin/mingw 程序运行时本就是 Win64 ABI,SysV asm 无法工作。
+#if defined(_WIN32) || defined(__CYGWIN__)
+#define CPP2_NATIVE_WIN 1
+#else
+#define CPP2_NATIVE_HOST_OK 1
+#endif
 #include <string>
 
 namespace cpp2::native {
