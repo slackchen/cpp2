@@ -159,20 +159,56 @@ protected:
         }
         // enum 允许：底层 int，成员按 0..n-1 分配（与 C++ enum class 一致）
         // variant 允许：候选均为 int struct（如 Circle/Rect），match 穷尽
-        if (!m_->concepts.empty())      unsup("concepts");
+        // concept 允许：纯声明无代码形态，约束检查在 sema 完成，发射期直接略过
         for (auto& f : m_->funcs) check_func(f);
         for (auto& g : m_->globals) check_global(g);
     }
 
-    ast::StructDecl* find_sd(std::string const& n)
+    ast::StructDecl* find_sd(std::string const& n) const
     {
         for (auto& s : m_->structs) if (s.name == n) return &s;
         return nullptr;
     }
 
+    // 是否带虚表:自身或任一祖先声明了 virtual 方法(M7)。
+    // 带虚表的对象布局 = [vptr][field0][field1]...,字段偏移整体 +8
+    bool has_vtable(ast::StructDecl const* sd) const
+    {
+        while (sd) {
+            for (auto& m : sd->methods) if (m.is_virtual) return true;
+            sd = (sd->base && !sd->base->parts.empty()) ? find_sd(sd->base->parts[0]) : nullptr;
+        }
+        return false;
+    }
+
+    // vptr 垫片字节数(基类钩子:Win64 虚分发返回 8,SysV v0 不支持虚方法返回 0)
+    virtual int vptr_pad(ast::StructDecl const* sd) const { (void)sd; return 0; }
+
+    // 全字段视图(基类在前),StructLit 初始化/对象拷贝用;second = 字节偏移
+    // 带虚表的类型首槽为 vptr,字段偏移整体 +8(vptr_pad)
+    std::vector<std::pair<ast::FieldDecl*, int>> fields_deep(ast::StructDecl* sd)
+    {
+        std::vector<std::pair<ast::FieldDecl*, int>> out;
+        std::vector<ast::StructDecl*> chain;
+        for (std::string bn = (sd->base && !sd->base->parts.empty()) ? sd->base->parts[0] : "";
+             !bn.empty();) {
+            ast::StructDecl* bs = find_sd(bn);
+            if (!bs) break;
+            chain.push_back(bs);
+            bn = (bs->base && !bs->base->parts.empty()) ? bs->base->parts[0] : "";
+        }
+        int pad = vptr_pad(sd);
+        for (auto it = chain.rbegin(); it != chain.rend(); ++it)
+            for (auto& f : (*it)->fields)
+                out.push_back({&f, pad + (int)out.size() * 8});
+        for (auto& f : sd->fields)
+            out.push_back({&f, pad + (int)out.size() * 8});
+        return out;
+    }
+
     int field_offset_in(ast::StructDecl* sd, std::string const& fname)
     {
-        int off = 0;
+        int off = vptr_pad(sd);                   // vptr 占据对象首槽
         std::string bn = (sd->base && !sd->base->parts.empty()) ? sd->base->parts[0] : "";
         while (!bn.empty()) {
             ast::StructDecl* bs = find_sd(bn);
