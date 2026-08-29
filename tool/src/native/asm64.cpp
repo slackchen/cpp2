@@ -262,11 +262,12 @@ struct Asm {
             return;
         }
         if (dst.kind == Op::REG && src.kind == Op::MEM) {
-            // r ← m:方向反转 opcode(0x02 族)
+            // r ← m:方向反转 opcode(+3 = 32/64 位 r,r/m 形态;+2 恒为 8 位,
+            // REX.W 不会升级 8 位 opcode —— 曾用 +2 致 64 位比较变字节比较)
             bool w = dst.reg.size == RegSize::R64;
             if (src.size != (w ? 8 : 4)) fail("memory operand size mismatch", line);
             emit8(rex(w, dst.reg.id, src.index, src.base));
-            emit8(base_op + 2);
+            emit8(base_op + 3);
             emit_mem_rm(src, dst.reg.id);
             return;
         }

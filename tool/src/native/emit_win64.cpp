@@ -516,6 +516,10 @@ private:
         for (auto& st : param_stores) ins(st);
         if (f.name == "main" && has_any_vtables())
             ins("call cpp2_vtinit");           // 虚表运行期初始化(先于任何对象构造)
+        if (f.name == "main") {
+            ins("lea rcx, QWORD PTR [rbp]");
+            ins("call cpp2_gc_mark");          // GC 栈扫描上界 = main 帧(M6)
+        }
         std::string ret = ".Lret_" + cur_sym_name_;
         if (f.has_block_body && f.block_body)
             emit_stmt(f.block_body.get());
@@ -1579,6 +1583,8 @@ private:
                     auto& un = static_cast<ast::UnaryExpr&>(*pe->inner);
                     sema::Type pt = type_of(un.operand.get());
                     if (pt.kind == sema::Type::Kind::SmartPtr) pt = pt.deref();
+                    else if ((pt.kind == sema::Type::Kind::Pointer || pt.kind == sema::Type::Kind::ArenaPtr)
+                             && pt.pointee) pt = *pt.pointee;   // T* / arena_ptr<T>
                     if (pt.kind != sema::Type::Kind::NamedStruct)
                         unsup("deref member: unknown pointee type");
                     ast::StructDecl* rsd = find_sd(pt.name);
@@ -1639,8 +1645,17 @@ private:
             if (!sd) unsup("unknown struct '" + tname + "'");
             std::string tmp = "$tmp_struct_" + std::to_string(label_++);
             int tmp_off = slot_or_new(tmp);
-            std::string tmp2 = tmp + "_2";
-            slot_or_new(tmp2);
+            int tmp_base = tmp_off;
+            {
+                // 临时块槽位:字段数(+vptr)连续预留;槽号向下生长而字段偏移向上,
+                // 故对象基址取预留区最低槽,防止 base+i*8 踩到邻位活跃槽
+                auto fds0 = fields_deep(sd);
+                int nslots0 = (int)fds0.size() + (vptr_pad(sd) ? 1 : 0);
+                if (nslots0 < 2) nslots0 = 2;
+                for (int r = 1; r < nslots0; ++r)
+                    slot_or_new(tmp + "_r" + std::to_string(r));
+                tmp_base = tmp_off - (nslots0 - 1) * 8;
+            }
             {
                 auto fds = fields_deep(sd);
                 for (size_t i=0;i<fds.size();++i) {
@@ -1651,11 +1666,11 @@ private:
                         break;
                     }
                     if (!found) eval_field_init(fds[i].first->init.get(), fds[i].first);
-                    ins("mov QWORD PTR [rbp" + std::to_string(tmp_off + (int)fds[i].second) + "], rax");
+                    ins("mov QWORD PTR [rbp" + std::to_string(tmp_base + (int)fds[i].second) + "], rax");
                 }
-                if (vptr_pad(sd)) store_vptr(tmp_off, sd);   // 临时对象同样带 vptr(make_unique 拷贝用)
+                if (vptr_pad(sd)) store_vptr(tmp_base, sd);   // 临时对象同样带 vptr(make_unique 拷贝用)
             }
-            ins("mov rax, " + std::to_string(tmp_off));
+            ins("mov rax, " + std::to_string(tmp_base));
             break;
         }
         case ast::Expr::Call:
@@ -2375,10 +2390,16 @@ private:
         }
         // ── 泛型调用:按实参类型单态化 → 调用实例符号(实例延后发射,M2d)──
         std::string call_sym = nm.parts[0];
+        std::vector<char> mono_struct_arg;            // 泛型调用:结构体实参传帧地址
         if (ast::FuncDecl* gf = find_generic_callee(nm.parts[0], (int)c.args.size())) {
             sema::Type rt;
             call_sym = mono_request(gf, c, rt);
             if (rt.known()) mono_call_ret_[&c] = rt;
+            mono_struct_arg.assign(c.args.size(), 0);
+            for (size_t ai = 0; ai < c.args.size(); ++ai)
+                if (type_of(c.args[ai].get()).kind == sema::Type::Kind::NamedStruct
+                    || c.args[ai]->kind() == ast::Expr::StructLit)
+                    mono_struct_arg[ai] = 1;
         }
         if (!nm.qualified()) {
             auto lv = lambda_vars_.find(nm.parts[0]);
@@ -2398,6 +2419,44 @@ private:
                 ins("mov rcx, QWORD PTR [rbp" + std::to_string(eoff) + "]");
                 ins("mov rax, QWORD PTR [rcx]");
                 ins("call rax");
+                return;
+            }
+        }
+        if (nm.qualified() && nm.parts[0] == "cpp2" && nm.parts.size() >= 2) {
+            // ── GC(M6):cpp2::gc_* 运行时桥(受管分配/显式回收/统计)──
+            if (nm.parts[1] == "gc_collect" && c.args.empty()) {
+                ins("call cpp2_gc_collect");
+                ins("xor eax, eax");
+                return;
+            }
+            if (nm.parts[1] == "gc_live_bytes" && c.args.empty()) {
+                ins("call cpp2_gc_live_bytes");
+                return;
+            }
+            if (nm.parts[1] == "gc_collections" && c.args.empty()) {
+                ins("call cpp2_gc_collections");
+                return;
+            }
+            if (nm.parts[1] == "gc_new" && c.args.size() == 1) {
+                // gc_new(v):v = 对象地址(泛型包装实参传址)→ 受管块 + 整对象拷贝
+                auto vt = type_of(c.args[0].get());
+                long long gn = 8;
+                if (vt.kind == sema::Type::Kind::NamedStruct)
+                    if (ast::StructDecl* sd2 = find_sd(vt.name)) {
+                        auto fds2 = fields_deep(sd2);
+                        gn = fds2.empty() ? 8 : (long long)fds2.back().second + 8;
+                    }
+                eval(c.args[0].get());               // rax = 源地址(v 槽值/帧地址)
+                if (c.args[0]->kind() == ast::Expr::StructLit) ins("add rax, rbp");
+                ins("mov rsi, rax");
+                ins("mov rcx, " + std::to_string(gn));
+                ins("call cpp2_gc_alloc");
+                ins("mov rdi, rax");
+                for (long long q = 0; q < gn; q += 8) {
+                    ins("mov rcx, QWORD PTR [rsi+" + std::to_string(q) + "]");
+                    ins("mov QWORD PTR [rdi+" + std::to_string(q) + "], rcx");
+                }
+                ins("mov rax, rdi");
                 return;
             }
         }
@@ -2451,8 +2510,10 @@ private:
                     }
                     regslots += 1 + ak;
                 } else {
-                    pushes.push_back([this, &a]() {
+                    bool sa = i < mono_struct_arg.size() && mono_struct_arg[i] != 0;
+                    pushes.push_back([this, &a, sa]() {
                         eval(a.get());
+                        if (sa) ins("add rax, rbp");   // 结构体实参传帧地址(实例按指针读取)
                         ins("push rax");
                         ++push_depth_;
                     });
@@ -2536,6 +2597,7 @@ private:
         if (text.size() >= 2 && text.front() == '"' && text.back() == '"')
             text = text.substr(1, text.size() - 2);
         std::string cfmt;
+        std::vector<int> order;                // 占位符文本序 → 实参下标
         for (size_t pos = 0; pos < text.size(); ++pos) {
             if (text[pos] == '{' && pos + 2 < text.size() && text[pos + 1] >= '0' && text[pos + 1] <= '9' && text[pos + 2] == '}') {
                 int idx = text[pos + 1] - '0';
@@ -2547,6 +2609,7 @@ private:
                 if (is_double_expr(c.args[idx + 1].get())) cfmt += "%s";
                 else if (is_bool_expr(c.args[idx + 1].get())) cfmt += "%s";
                 else cfmt += fmt_for(c.args[idx + 1].get());
+                order.push_back(idx + 1);          // 实参按文本出现序排列(printf 位置语义)
                 pos += 2;
             } else if (text[pos] == '\\' && pos + 1 < text.size()) {
                 char nxt = text[pos + 1];
@@ -2563,13 +2626,16 @@ private:
         }
         if (newline) cfmt += "\n";
         std::string fmt_lbl = intern_string(cfmt);
-        int nargs = (int)(c.args.size() - 1);
-        for (size_t i = 1; i < c.args.size(); ++i) {
-            eval(c.args[i].get());
-            if (is_double_expr(c.args[i].get())) {   // 位模式 → 最短往返字符串
+        // 实参求值按占位符文本出现序(std::format {n} 可乱序引用,printf 按位置取参)
+        if (order.empty())
+            for (size_t i = 1; i < c.args.size(); ++i) order.push_back((int)i);
+        int nargs = (int)order.size();
+        for (int ai : order) {
+            eval(c.args[ai].get());
+            if (is_double_expr(c.args[ai].get())) {   // 位模式 → 最短往返字符串
                 ins("movq xmm0, rax");
                 ins("call cpp2_dbl_str_rt");
-            } else if (is_bool_expr(c.args[i].get())) {
+            } else if (is_bool_expr(c.args[ai].get())) {
                 emit_bool_str();
             }
             ins("push rax");
@@ -3115,6 +3181,270 @@ cpp2_int_str:
     .string "%lld"
 .Lfmt_ix:
     .string "cpp2 trap: index out of bounds\n"
+
+
+.data
+.Lgc_hi:
+    .quad 0
+.Lgc_cnt:
+    .quad 0
+.Lgc_tab:
+    .quad 0
+.Lgc_col:
+    .quad 0
+.text
+.globl cpp2_gc_mark
+cpp2_gc_mark:
+    lea rax, .Lgc_hi[rip]
+    mov QWORD PTR [rax], rcx
+    ret
+.globl cpp2_gc_alloc
+cpp2_gc_alloc:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 0x30
+    mov QWORD PTR [rbp-8], rcx
+    lea rax, .Lgc_tab[rip]
+    mov rcx, QWORD PTR [rax]
+    test rcx, rcx
+    jne .Lgca_have
+    mov rcx, 262144
+    call cpp2_alloc
+    lea rcx, .Lgc_tab[rip]
+    mov QWORD PTR [rcx], rax
+.Lgca_have:
+    sub rsp, 32
+    call GetProcessHeap
+    mov rcx, rax
+    mov rdx, 0
+    mov r8, QWORD PTR [rbp-8]
+    call HeapAlloc
+    add rsp, 32
+    mov QWORD PTR [rbp-16], rax
+    lea rcx, .Lgc_tab[rip]
+    mov rcx, QWORD PTR [rcx]
+    lea rdx, .Lgc_cnt[rip]
+    mov r8, QWORD PTR [rdx]
+    lea rdx, .Lgc_cnt[rip]
+    mov r9, r8
+    add r9, 1
+    mov QWORD PTR [rdx], r9
+    shl r8, 5
+    mov QWORD PTR [rcx+r8], rax
+    mov rdx, QWORD PTR [rbp-8]
+    mov QWORD PTR [rcx+r8+8], rdx
+    xor rdx, rdx
+    mov QWORD PTR [rcx+r8+16], rdx
+    mov rax, QWORD PTR [rbp-16]
+    add rsp, 0x30
+    pop rbp
+    ret
+.globl cpp2_gc_live_bytes
+cpp2_gc_live_bytes:
+    lea rcx, .Lgc_tab[rip]
+    mov rcx, QWORD PTR [rcx]
+    lea rdx, .Lgc_cnt[rip]
+    mov r8, QWORD PTR [rdx]
+    xor rax, rax
+    xor r9, r9
+.Lgclb_loop:
+    cmp r9, r8
+    jae .Lgclb_done
+    mov r10, r9
+    shl r10, 5
+    mov rdx, QWORD PTR [rcx+r10+8]
+    add rax, rdx
+    add r9, 1
+    jmp .Lgclb_loop
+.Lgclb_done:
+    ret
+.globl cpp2_gc_collections
+cpp2_gc_collections:
+    lea rax, .Lgc_col[rip]
+    mov rax, QWORD PTR [rax]
+    ret
+.globl cpp2_gc_collect
+cpp2_gc_collect:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 0x180
+    mov rax, rsp
+    mov QWORD PTR [rbp-0x148], rax
+    lea rax, .Lgc_tab[rip]
+    mov rcx, QWORD PTR [rax]
+    mov QWORD PTR [rbp-0x138], rcx
+    lea rax, .Lgc_cnt[rip]
+    mov rdx, QWORD PTR [rax]
+    mov QWORD PTR [rbp-0x130], rdx
+    xor rax, rax
+    mov QWORD PTR [rbp-0x108], rax
+.Lgcc_clr:
+    mov rax, QWORD PTR [rbp-0x108]
+    cmp rax, QWORD PTR [rbp-0x130]
+    jae .Lgcc_root
+    mov rcx, QWORD PTR [rbp-0x138]
+    shl rax, 5
+    xor rdx, rdx
+    mov QWORD PTR [rcx+rax+16], rdx
+    inc QWORD PTR [rbp-0x108]
+    jmp .Lgcc_clr
+.Lgcc_root:
+    lea rax, .Lgc_hi[rip]
+    mov r8, QWORD PTR [rax]
+    test r8, r8
+    je .Lgcc_fix
+    and r8, -8
+    mov QWORD PTR [rbp-0x150], r8
+.Lgcc_rloop:
+    mov r8, QWORD PTR [rbp-0x150]
+    cmp r8, QWORD PTR [rbp-0x148]
+    jb .Lgcc_fix
+    mov r9, QWORD PTR [r8]
+    mov QWORD PTR [rbp-0x120], r9
+    test r9, r9
+    je .Lgcc_rnext
+    mov r10, 0
+.Lgcc_rblk:
+    mov rax, r10
+    cmp rax, QWORD PTR [rbp-0x130]
+    jae .Lgcc_rnext
+    mov r11, QWORD PTR [rbp-0x138]
+    shl rax, 5
+    mov rcx, QWORD PTR [r11+rax]
+    cmp r9, rcx
+    jb .Lgcc_rskip
+    mov rdx, QWORD PTR [r11+rax+8]
+    add rdx, rcx
+    sub rdx, 8
+    cmp r9, rdx
+    ja .Lgcc_rskip
+    mov r11, QWORD PTR [rbp-0x138]
+    mov rax, r10
+    shl rax, 5
+    mov rdx, 1
+    mov QWORD PTR [r11+rax+16], rdx
+    jmp .Lgcc_rnext
+.Lgcc_rskip:
+    add r10, 1
+    jmp .Lgcc_rblk
+.Lgcc_rnext:
+    mov rax, QWORD PTR [rbp-0x150]
+    sub rax, 8
+    mov QWORD PTR [rbp-0x150], rax
+    jmp .Lgcc_rloop
+.Lgcc_fix:
+    mov QWORD PTR [rbp-0x128], 0
+    mov QWORD PTR [rbp-0x110], 0
+.Lgcc_fj:
+    mov rax, QWORD PTR [rbp-0x110]
+    cmp rax, QWORD PTR [rbp-0x130]
+    jae .Lgcc_fend
+    mov rcx, QWORD PTR [rbp-0x138]
+    mov rdx, QWORD PTR [rbp-0x110]
+    shl rdx, 5
+    add rcx, rdx
+    cmp QWORD PTR [rcx+16], 0
+    je .Lgcc_fjnext
+    mov r8, QWORD PTR [rcx]
+    mov QWORD PTR [rbp-0x170], r8
+    mov r9, QWORD PTR [rcx+8]
+    mov QWORD PTR [rbp-0x178], r9
+    mov QWORD PTR [rbp-0x118], 0
+.Lgcc_fk:
+    mov rax, QWORD PTR [rbp-0x118]
+    shl rax, 3
+    cmp rax, QWORD PTR [rbp-0x178]
+    jae .Lgcc_fjnext
+    mov rdx, QWORD PTR [rbp-0x170]
+    mov r9, QWORD PTR [rdx+rax]
+    mov QWORD PTR [rbp-0x120], r9
+    test r9, r9
+    je .Lgcc_fknext
+    mov QWORD PTR [rbp-0x108], 0
+.Lgcc_fi:
+    mov rax, QWORD PTR [rbp-0x108]
+    cmp rax, QWORD PTR [rbp-0x130]
+    jae .Lgcc_fknext
+    mov rcx, QWORD PTR [rbp-0x138]
+    mov rdx, QWORD PTR [rbp-0x108]
+    shl rdx, 5
+    add rcx, rdx
+    cmp QWORD PTR [rcx+16], 0
+    jne .Lgcc_finext
+    mov r8, QWORD PTR [rcx]
+    cmp r9, r8
+    jb .Lgcc_finext
+    mov rdx, QWORD PTR [rcx+8]
+    add rdx, r8
+    sub rdx, 8
+    cmp r9, rdx
+    ja .Lgcc_finext
+    mov rdx, 1
+    mov QWORD PTR [rcx+16], rdx
+    mov QWORD PTR [rbp-0x128], rdx
+.Lgcc_finext:
+    inc QWORD PTR [rbp-0x108]
+    jmp .Lgcc_fi
+.Lgcc_fknext:
+    inc QWORD PTR [rbp-0x118]
+    jmp .Lgcc_fk
+.Lgcc_fjnext:
+    inc QWORD PTR [rbp-0x110]
+    jmp .Lgcc_fj
+.Lgcc_fend:
+    cmp QWORD PTR [rbp-0x128], 0
+    jne .Lgcc_fix
+    mov QWORD PTR [rbp-0x158], 0
+    mov QWORD PTR [rbp-0x108], 0
+.Lgcc_sw:
+    mov rax, QWORD PTR [rbp-0x108]
+    cmp rax, QWORD PTR [rbp-0x130]
+    jae .Lgcc_swdone
+    mov rcx, QWORD PTR [rbp-0x138]
+    mov rdx, QWORD PTR [rbp-0x108]
+    shl rdx, 5
+    add rcx, rdx
+    mov QWORD PTR [rbp-0x160], rcx
+    cmp QWORD PTR [rcx+16], 0
+    jne .Lgcc_keep
+    mov r8, QWORD PTR [rcx]
+    mov QWORD PTR [rbp-0x170], r8
+    sub rsp, 32
+    call GetProcessHeap
+    mov rcx, rax
+    xor rdx, rdx
+    mov r8, QWORD PTR [rbp-0x170]
+    call HeapFree
+    add rsp, 32
+    jmp .Lgcc_swnext
+.Lgcc_keep:
+    mov rcx, QWORD PTR [rbp-0x138]
+    mov rdx, QWORD PTR [rbp-0x158]
+    shl rdx, 5
+    add rdx, rcx
+    mov QWORD PTR [rbp-0x178], rdx
+    mov rcx, QWORD PTR [rbp-0x160]
+    mov rax, QWORD PTR [rcx]
+    mov QWORD PTR [rdx], rax
+    mov rax, QWORD PTR [rcx+8]
+    mov QWORD PTR [rdx+8], rax
+    mov rax, QWORD PTR [rcx+16]
+    mov QWORD PTR [rdx+16], rax
+    inc QWORD PTR [rbp-0x158]
+.Lgcc_swnext:
+    inc QWORD PTR [rbp-0x108]
+    jmp .Lgcc_sw
+.Lgcc_swdone:
+    mov rax, QWORD PTR [rbp-0x158]
+    lea rcx, .Lgc_cnt[rip]
+    mov QWORD PTR [rcx], rax
+    lea rcx, .Lgc_col[rip]
+    mov rdx, QWORD PTR [rcx]
+    add rdx, 1
+    mov QWORD PTR [rcx], rdx
+    add rsp, 0x180
+    pop rbp
+    ret
 )";
     std::string full = asm_text + "\n" + runtime_s;
 
