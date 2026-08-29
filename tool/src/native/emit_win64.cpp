@@ -1405,6 +1405,15 @@ private:
             }
             if (field_off == -1) unsup("unknown field '" + m.name + "'");
             int base_off = slot_of(base.parts[0]);
+            {
+                // SmartPtr 基('.' 自动解引用):槽存堆指针,读 [ptr+field_off]
+                auto bt2 = R_ ? R_->type_of(*m.base) : sema::Type{};
+                if (bt2.kind == sema::Type::Kind::SmartPtr) {
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(base_off) + "]");
+                    ins("mov rax, QWORD PTR [rax+" + std::to_string(field_off) + "]");
+                    break;
+                }
+            }
             if (is_inout_param(base.parts[0])) {
                 ins("mov rax, QWORD PTR [rbp" + std::to_string(base_off) + "]");   // 实参地址
                 ins("mov rax, QWORD PTR [rax+" + std::to_string(field_off) + "]");
@@ -1574,6 +1583,7 @@ private:
             // 接收者静态类型优先沿继承链解析(派生方法隐藏基类同名)
             if (R_) {
                 auto bt = R_->type_of(*mem.base);
+                if (bt.kind == sema::Type::Kind::SmartPtr) bt = bt.deref();  // '.' 自动解引用
                 if (bt.kind == sema::Type::Kind::NamedStruct) {
                     ast::StructDecl* s = find_sd(bt.name);
                     while (s && !md) {
@@ -1699,7 +1709,13 @@ private:
                 ins("push rax");
                 ++push_depth_;
             }
-            ins("lea rax, QWORD PTR [rbp" + std::to_string(base_off) + "]");
+            {
+                auto bt3 = R_ ? R_->type_of(*mem.base) : sema::Type{};
+                if (bt3.kind == sema::Type::Kind::SmartPtr)   // '.' 自动解引用:this = 堆指针
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(base_off) + "]");
+                else
+                    ins("lea rax, QWORD PTR [rbp" + std::to_string(base_off) + "]");
+            }
             ins("push rax");
             ++push_depth_;
             static char const* regs[] = {"rcx","rdx","r8","r9"};
@@ -1716,6 +1732,32 @@ private:
         auto& nm = static_cast<ast::NameExpr&>(*c.callee);
         if (!nm.qualified()) {
             std::string const& bn = nm.parts[0];
+        // ── 智能指针工厂 v0:make_unique/make_shared → 堆块 + 逐字段拷贝 ──
+        // shared v0 与 unique 同构(无引用计数头,作用域结束不释放,进程退出回收);
+        // '.' 自动解引用与方法 this 解引用由 Member/emit_call 的 SmartPtr 分支承担
+        if ((bn == "make_unique" || bn == "make_shared") && c.args.size() == 1) {
+            if (c.args[0]->kind() != ast::Expr::StructLit)
+                unsup("make_unique/make_shared native v0: aggregate literal arg only");
+            auto& sl = static_cast<ast::StructLitExpr&>(*c.args[0]);
+            std::string tn = sl.type_parts.empty() ? "" : sl.type_parts[0];
+            ast::StructDecl* sd = nullptr;
+            for (auto& s : m_->structs) if (s.name == tn) { sd = &s; break; }
+            if (!sd) unsup("make_unique/make_shared: unknown struct '" + tn + "'");
+            auto fds = fields_deep(sd);
+            long long nbytes = fds.empty() ? 8 : (long long)fds.back().second + 8;
+            eval(c.args[0].get());              // StructLit → rax = 帧偏移(负)
+            ins("mov rsi, rax");
+            ins("add rsi, rbp");                // rsi = 源(栈上临时块)
+            ins("mov rcx, " + std::to_string(nbytes));
+            ins("call cpp2_alloc");             // rax = 堆块(cpp2_alloc 不动 rsi/rdi)
+            ins("mov rdi, rax");
+            for (auto& pr : fds) {
+                ins("mov rcx, QWORD PTR [rsi+" + std::to_string(pr.second) + "]");
+                ins("mov QWORD PTR [rdi+" + std::to_string(pr.second) + "], rcx");
+            }
+            ins("mov rax, rdi");
+            return;
+        }
             if (bn == "err") {
                 // v1:错误串存入全局槽 .Lerrmsg;返回 0 哨兵。
                 // 与参考实现一致,编译期拼接来源位置后缀" (路径:行号)"
