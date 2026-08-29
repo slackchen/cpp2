@@ -455,6 +455,21 @@ private:
         }
         case ast::Stmt::For: {
             auto& fo = static_cast<ast::ForStmt&>(*s);
+            // 容器 variant 元素:循环变量需完整 #d/var/#tag 槽组(扫描期一次性按序
+            // 预留,保证 data+8 恰落入 #d 占位;发射期 slot_or_new 直接复用)
+            if (!fo.is_range && fo.iterable && fo.iterable->kind() == ast::Expr::Name) {
+                auto it_t = type_of(fo.iterable.get());
+                if (it_t.kind == sema::Type::Kind::Container
+                    && it_t.elem().kind == sema::Type::Kind::Variant) {
+                    int K = max_alt_fields(it_t.elem().name);
+                    for (int d = K - 1; d >= 1; --d)
+                        slot_or_new(fo.var + "#d" + std::to_string(d));
+                    slot_or_new(fo.var);
+                    slot_or_new(fo.var + "#tag");
+                    scan_slots(fo.body.get());
+                    break;
+                }
+            }
             slot_or_new(fo.var);
             scan_slots(fo.body.get());
             break;
@@ -506,7 +521,7 @@ private:
             }
         }
         scan_slots(f.has_block_body ? f.block_body.get() : nullptr);
-        int words = (int)f.params.size() + (int)slots_.size() + 16; // +16 = temp slots + shadow
+        int words = (int)f.params.size() + (int)slots_.size() + 64; // +64 = 懒分配临时槽 + shadow
         int frame = ((words * 8 + 15) / 16) * 16;
         put(".globl " + cur_sym_name_);
         put(cur_sym_name_ + ":");
@@ -876,14 +891,17 @@ private:
                         auto et = it_t.elem();
                         int S = elem_stride(et);
                         int vec_off = slot_of(itn.parts[0]);
-                        int voff = slot_or_new(fo.var);
-                        int tag_off = 0, K = 0;
+                        int voff = 0, tag_off = 0, K = 0;
                         if (et.kind == sema::Type::Kind::Variant) {
+                            // 槽序与 variant 变量声明一致:#d 先占位,data 次之,tag 最后,
+                            // 保证 K 个数据槽自 data 槽向上落入占位区(不得先占 data 槽)
                             K = max_alt_fields(et.name);
                             for (int d = K - 1; d >= 1; --d)
                                 slot_or_new(fo.var + "#d" + std::to_string(d));
-                            slot_or_new(fo.var);
+                            voff = slot_or_new(fo.var);
                             tag_off = slot_or_new(fo.var + "#tag");
+                        } else {
+                            voff = slot_or_new(fo.var);
                         }
                         int ioff = slot_or_new(fo.var + "#i");
                         int noff = slot_or_new(fo.var + "#n");
@@ -1314,6 +1332,15 @@ private:
         case ast::Expr::AsCast: {
             auto& ac = static_cast<ast::AsCastExpr&>(*e);
             eval(ac.operand.get());
+            // 整型 → 浮点:槽存位模式,须真正转换(如 match 解构绑定 as double)
+            auto tt = ac.target.parts;
+            if (!tt.empty() && (tt[0] == "double" || tt[0] == "float")) {
+                auto ot = type_of(ac.operand.get());
+                if (ot.is_int()) {
+                    ins("cvtsi2sd xmm0, rax");
+                    ins("movq rax, xmm0");
+                }
+            }
             break;
         }
         case ast::Expr::ListLit: {
@@ -2626,11 +2653,16 @@ private:
         }
         if (newline) cfmt += "\n";
         std::string fmt_lbl = intern_string(cfmt);
-        // 实参求值按占位符文本出现序(std::format {n} 可乱序引用,printf 按位置取参)
+        // 实参求值按占位符文本出现序(std::format {n} 可乱序引用,printf 按位置取参)。
+        // 先正序求值入暂存槽,再按 Win64 变参布局压栈:rcx=fmt,rdx/r8/r9=前 3,
+        // 第 4 起位于调用点 [rsp+32] 起升序栈槽(故栈参须逆序压入)
         if (order.empty())
             for (size_t i = 1; i < c.args.size(); ++i) order.push_back((int)i);
         int nargs = (int)order.size();
+        std::vector<int> tmps;
         for (int ai : order) {
+            int t = slot_or_new("$pa" + std::to_string(label_));
+            label_++;
             eval(c.args[ai].get());
             if (is_double_expr(c.args[ai].get())) {   // 位模式 → 最短往返字符串
                 ins("movq xmm0, rax");
@@ -2638,19 +2670,51 @@ private:
             } else if (is_bool_expr(c.args[ai].get())) {
                 emit_bool_str();
             }
-            ins("push rax");
-            ++push_depth_;
+            ins("mov QWORD PTR [rbp" + std::to_string(t) + "], rax");
+            tmps.push_back(t);
         }
         static char const* argregs[] = {"rdx","r8","r9"};
-        for (int i = nargs - 1; i >= 0; --i) {
-            ins("pop " + std::string(argregs[i]));
-            --push_depth_;
+        if (nargs <= 3) {
+            for (int k = 0; k < nargs; ++k) {
+                ins("mov rax, QWORD PTR [rbp" + std::to_string(tmps[k]) + "]");
+                ins("push rax");
+                ++push_depth_;
+            }
+            for (int i = nargs - 1; i >= 0; --i) {
+                ins("pop " + std::string(argregs[i]));
+                --push_depth_;
+            }
+            ins("sub rsp, 32");
+            ins("lea rcx, " + fmt_lbl + "[rip]");
+            ins("xor eax, eax");
+            ins("call printf");
+            ins("add rsp, 32");
+        } else {
+            int K = nargs - 3;
+            int pad = (K % 2 == 1) ? 8 : 0;          // 调用点 16 对齐校平
+            if (pad) { ins("sub rsp, 8"); push_depth_++; }
+            for (int k = nargs; k >= 4; --k) {       // 栈参逆序压入 → [rsp+32] 起升序
+                ins("mov rax, QWORD PTR [rbp" + std::to_string(tmps[k - 1]) + "]");
+                ins("push rax");
+                ++push_depth_;
+            }
+            for (int k = 0; k < 3; ++k) {            // 寄存器实参
+                ins("mov rax, QWORD PTR [rbp" + std::to_string(tmps[k]) + "]");
+                ins("push rax");
+                ++push_depth_;
+            }
+            for (int i = 2; i >= 0; --i) {
+                ins("pop " + std::string(argregs[i]));
+                --push_depth_;
+            }
+            ins("sub rsp, 32");
+            ins("lea rcx, " + fmt_lbl + "[rip]");
+            ins("xor eax, eax");
+            ins("call printf");
+            ins("add rsp, 32");
+            ins("add rsp, " + std::to_string(pad + 8 * K));
+            push_depth_ -= K;
         }
-        ins("sub rsp, 32");
-        ins("lea rcx, " + fmt_lbl + "[rip]");
-        ins("xor eax, eax");
-        ins("call printf");
-        ins("add rsp, 32");
     }
 
     void eval_binary(ast::BinaryExpr& b)
