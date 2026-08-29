@@ -171,7 +171,7 @@ private:
     }
 
     // ── 函数 ────────────────────────────────────────────────────
-    void emit_func(ast::FuncDecl& f)
+    void emit_func(ast::FuncDecl& f, std::string const& sym_override = {})
     {
         cur_fn_ = &f;
         cur_sym_name_ = f.name;

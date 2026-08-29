@@ -59,7 +59,7 @@ public:
         put(".text");
         for (auto& f : m_->funcs) {
             if (f.is_extern) continue;
-            if (!f.type_params.empty()) unsup("generic functions");
+            if (!f.type_params.empty()) continue;   // 泛型:不直接发射,调用点单态化时发射实例
             check_func(f);
             emit_func(f);
         }
@@ -76,7 +76,7 @@ public:
 protected:
     virtual void emit_globals() = 0;
     virtual void check_func(ast::FuncDecl& f) = 0;
-    virtual void emit_func(ast::FuncDecl& f) = 0;
+    virtual void emit_func(ast::FuncDecl& f, std::string const& sym_override = {}) = 0;
     virtual void emit_method(ast::StructDecl& s, ast::MethodDecl& m) = 0;
     virtual void emit_rodata_strs() = 0;
     virtual void emit_dtor_call(DtorEntry const& vd) = 0;
@@ -85,7 +85,25 @@ protected:
 
     [[noreturn]] void unsup(std::string const& msg) { throw Unsupported(msg); }
 
-    sema::Type type_of(ast::Expr* e) const { return R_ ? R_->type_of(*e) : sema::Type{}; }
+    // 类型查询:泛型单态化感知。
+    //   Generic("T") → mono_map_ 中实参具体类型(实例体内查询);
+    //   Unknown 具名变量 → mono_var_types_ 中 ":= 泛型调用" 的推断结果类型
+    sema::Type type_of(ast::Expr* e) const
+    {
+        if (!R_ || !e) return sema::Type{};
+        auto t = R_->type_of(*e);
+        if (t.kind == sema::Type::Kind::Generic) {
+            auto it = mono_map_.find(t.name);
+            if (it != mono_map_.end()) return it->second;
+        }
+        if (t.kind == sema::Type::Kind::Unknown) {
+            if (auto* n = dynamic_cast<ast::NameExpr*>(e)) {
+                auto it2 = mono_var_types_.find(n->parts[0]);
+                if (it2 != mono_var_types_.end()) return it2->second;
+            }
+        }
+        return t;
+    }
 
     void ins(std::string const& s) { out_ << "    " << s << "\n"; }
 
@@ -112,7 +130,7 @@ protected:
         if (auto* lit = dynamic_cast<ast::LiteralExpr*>(e))
             if (lit->lit == ast::LitKind::String) return true;
         if (!R_) return false;
-        auto t = R_->type_of(*e);
+        auto t = type_of(e);
         using K = sema::Type::Kind;
         return t.kind == K::String || t.kind == K::StringView;
     }
@@ -290,6 +308,9 @@ protected:
     std::vector<std::string> continue_labels_;
     std::unordered_map<std::string, std::string> str_pool_;
     std::set<std::string> inout_params_;
+    // 泛型单态化上下文(发射实例函数时由派生类填充/保存恢复)
+    std::map<std::string, sema::Type> mono_map_;         // 类型参数名 → 实参具体类型
+    std::map<std::string, sema::Type> mono_var_types_;   // ":= 泛型调用" 变量 → 结果类型
     ast::StructDecl* cur_struct_ = nullptr;   // 方法发射时的所属类型(经 this 字段访问)
     std::vector<std::vector<DtorEntry>> scope_stack_;
 };

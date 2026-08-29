@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cstring>
 #include <functional>
+#include <deque>
 #include <iostream>
 #include <set>
 #include <sstream>
@@ -42,7 +43,7 @@ public:
         put(".text");
         for (auto& f : m_->funcs) {
             if (f.is_extern) continue;
-            if (!f.type_params.empty()) unsup("generic functions");
+            if (!f.type_params.empty()) continue;   // 泛型:调用点单态化时发射实例
             check_func(f);
             emit_func(f);
         }
@@ -56,6 +57,7 @@ public:
             pending_lambdas_.erase(pending_lambdas_.begin());
             emit_lambda(pl.first, pl.second);
         }
+        drain_mono_queue();                     // 泛型实例:全部函数体发射完成后统一落位
         emit_rodata_strs();
         return out_.str();
     }
@@ -72,8 +74,6 @@ private:
 
     [[noreturn]] void unsup(std::string const& msg) { throw Unsupported(msg); }
 
-    sema::Type type_of(ast::Expr* e) const { return R_ ? R_->type_of(*e) : sema::Type{}; }
-
     // printf 格式符按静态类型选择(string 在 native v0 = NUL 结尾 char 指针)
     char const* fmt_for(ast::Expr* e)
     {
@@ -86,7 +86,7 @@ private:
                 if (mn == "message" || mn == "chain") return "%s";
             }
         }
-        auto t = R_->type_of(*e);
+        auto t = type_of(e);
         using K = sema::Type::Kind;
         switch (t.kind) {
         case K::String: case K::StringView: return "%s";
@@ -104,7 +104,7 @@ private:
         if (auto* lit = dynamic_cast<ast::LiteralExpr*>(e))
             if (lit->lit == ast::LitKind::String) return true;
         if (!R_) return false;
-        auto t = R_->type_of(*e);
+        auto t = type_of(e);
         using K = sema::Type::Kind;
         return t.kind == K::String || t.kind == K::StringView;
     }
@@ -181,7 +181,7 @@ private:
 
     bool is_bool_expr(ast::Expr* e) const
     {
-        return R_ && e && R_->type_of(*e).kind == sema::Type::Kind::Bool;
+        return R_ && e && type_of(e).kind == sema::Type::Kind::Bool;
     }
 
     bool has_any_vtables() const
@@ -300,7 +300,7 @@ private:
     void check_func(ast::FuncDecl& f)
     {
         // throws:expected<R> 语义 v0 简化为值返回(err() 调用点 unsup)
-        if (!f.type_params.empty()) unsup("generic functions");
+        // 泛型函数不在此发射:调用点单态化时经 emit_func(f, 实例符号) 发射
         int regslots = 0;
         for (auto& p : f.params) {
             if (is_variant_type(p.type)) regslots += 1 + max_alt_fields(p.type.parts[0]);
@@ -320,7 +320,7 @@ private:
     // double 静态判定(位模式表示:槽/rax 恒存 IEEE754 位)
     bool is_double_expr(ast::Expr* e) const
     {
-        return R_ && e && R_->type_of(*e).kind == sema::Type::Kind::Double;
+        return R_ && e && type_of(e).kind == sema::Type::Kind::Double;
     }
     bool is_double_field(ast::FieldDecl* fd) const
     {
@@ -469,10 +469,10 @@ private:
         }
     }
 
-    void emit_func(ast::FuncDecl& f)
+    void emit_func(ast::FuncDecl& f, std::string const& sym_override = {})
     {
         cur_fn_ = &f;
-        cur_sym_name_ = f.name;
+        cur_sym_name_ = sym_override.empty() ? f.name : sym_override;   // 泛型实例 = 重整符号
         cur_struct_ = nullptr;
         scope_stack_.clear();
         slots_.clear();
@@ -508,15 +508,15 @@ private:
         scan_slots(f.has_block_body ? f.block_body.get() : nullptr);
         int words = (int)f.params.size() + (int)slots_.size() + 16; // +16 = temp slots + shadow
         int frame = ((words * 8 + 15) / 16) * 16;
-        put(".globl " + f.name);
-        put(f.name + ":");
+        put(".globl " + cur_sym_name_);
+        put(cur_sym_name_ + ":");
         ins("push rbp");
         ins("mov rbp, rsp");
         if (frame > 0) ins("sub rsp, " + std::to_string(frame));
         for (auto& st : param_stores) ins(st);
         if (f.name == "main" && has_any_vtables())
             ins("call cpp2_vtinit");           // 虚表运行期初始化(先于任何对象构造)
-        std::string ret = ".Lret_" + f.name;
+        std::string ret = ".Lret_" + cur_sym_name_;
         if (f.has_block_body && f.block_body)
             emit_stmt(f.block_body.get());
         else if (f.expr_body) {
@@ -668,7 +668,7 @@ private:
                 std::string tn;
                 if (v.has_type && !v.type.parts.empty()) tn = v.type.parts[0];
                 else if (R_ && v.init) {
-                    auto vt = R_->type_of(*v.init);
+                    auto vt = type_of(v.init.get());
                     if (vt.kind == sema::Type::Kind::NamedStruct) tn = vt.name;
                 }
                 if (tn.empty()) continue;
@@ -780,6 +780,11 @@ private:
             else ins("xor eax, eax");
             if (v.init && v.init->kind() == ast::Expr::Lambda)
                 lambda_vars_[v.name] = last_lambda_;    // 调用点按闭包间接调用
+            if (v.init && v.init->kind() == ast::Expr::Call) {
+                // := 泛型调用:记录实例返回类型(sema 对泛型结果不推断,printf 等按此取型)
+                auto it = mono_call_ret_.find(v.init.get());
+                if (it != mono_call_ret_.end()) mono_var_types_[v.name] = it->second;
+            }
             ins("mov QWORD PTR [rbp" + std::to_string(off) + "], rax");
             break;
         }
@@ -797,7 +802,7 @@ private:
             if (has_dtors) { ins("push rax"); ++push_depth_; }
             emit_all_dtors_for_return(skip);
             if (has_dtors) { ins("pop rax"); --push_depth_; }
-            ins("jmp .Lret_" + (cur_fn_ ? cur_fn_->name : cur_sym_name_));
+            ins("jmp .Lret_" + cur_sym_name_);
             break;
         }
         case ast::Stmt::If: {
@@ -862,7 +867,7 @@ private:
                 // variant 元素复制到循环变量的 #tag/#d 槽布局(match 直读)
                 if (fo.iterable && fo.iterable->kind() == ast::Expr::Name) {
                     auto& itn = static_cast<ast::NameExpr&>(*fo.iterable);
-                    auto it_t = R_ ? R_->type_of(*fo.iterable) : sema::Type{};
+                    auto it_t = type_of(fo.iterable.get());
                     if (it_t.kind == sema::Type::Kind::Container) {
                         auto et = it_t.elem();
                         int S = elem_stride(et);
@@ -1266,7 +1271,7 @@ private:
             ins("test rax, rax");
             ins("jne " + ok);
             ins("xor eax, eax");
-            ins("jmp .Lret_" + (cur_fn_ ? cur_fn_->name : cur_sym_name_));
+            ins("jmp .Lret_" + cur_sym_name_);
             label(ok);
             break;
         }
@@ -1314,7 +1319,7 @@ private:
             long long n = (long long)ll.elements.size();
             int S = 8;
             if (!ll.elements.empty()) {
-                auto et0 = R_ ? R_->type_of(*ll.elements[0]) : sema::Type{};
+                auto et0 = type_of(ll.elements[0].get());
                 S = elem_stride(et0);
             }
             int blk_off = slot_or_new("$list_ptr");
@@ -1324,7 +1329,7 @@ private:
             ins("mov QWORD PTR [rax], " + std::to_string(n));
             int base = 8;
             for (size_t k = 0; k < ll.elements.size(); ++k) {
-                auto et = R_ ? R_->type_of(*ll.elements[k]) : sema::Type{};
+                auto et = type_of(ll.elements[k].get());
                 if (et.kind == sema::Type::Kind::Variant) {
                     // variant 元素:须为具名变量(有 #tag/#d 槽),整块复制
                     if (ll.elements[k]->kind() != ast::Expr::Name)
@@ -1425,7 +1430,7 @@ private:
                 auto& base = static_cast<ast::NameExpr&>(*m.base);
                 int field_off = -1;
                 if (R_) {
-                    auto bt = R_->type_of(*m.base);
+                    auto bt = type_of(m.base.get());
                     if (bt.kind == sema::Type::Kind::NamedStruct) {
                         if (ast::StructDecl* rsd = find_sd(bt.name))
                             field_off = field_offset_in(rsd, m.name);
@@ -1572,7 +1577,7 @@ private:
                 if (pe->inner->kind() == ast::Expr::Unary
                     && static_cast<ast::UnaryExpr&>(*pe->inner).op == "*") {
                     auto& un = static_cast<ast::UnaryExpr&>(*pe->inner);
-                    sema::Type pt = R_ ? R_->type_of(*un.operand) : sema::Type{};
+                    sema::Type pt = type_of(un.operand.get());
                     if (pt.kind == sema::Type::Kind::SmartPtr) pt = pt.deref();
                     if (pt.kind != sema::Type::Kind::NamedStruct)
                         unsup("deref member: unknown pointee type");
@@ -1589,7 +1594,7 @@ private:
             auto& base = static_cast<ast::NameExpr&>(*m.base);
             int field_off = -1;
             if (R_) {
-                auto bt = R_->type_of(*m.base);
+                auto bt = type_of(m.base.get());
                 if (bt.kind == sema::Type::Kind::NamedStruct) {
                     if (ast::StructDecl* rsd = find_sd(bt.name))
                         field_off = field_offset_in(rsd, m.name);
@@ -1611,7 +1616,7 @@ private:
             int base_off = slot_of(base.parts[0]);
             {
                 // SmartPtr 基('.' 自动解引用):槽存堆指针,读 [ptr+field_off]
-                auto bt2 = R_ ? R_->type_of(*m.base) : sema::Type{};
+                auto bt2 = type_of(m.base.get());
                 if (bt2.kind == sema::Type::Kind::SmartPtr) {
                     ins("mov rax, QWORD PTR [rbp" + std::to_string(base_off) + "]");
                     ins("mov rax, QWORD PTR [rax+" + std::to_string(field_off) + "]");
@@ -1777,6 +1782,183 @@ private:
         }
     }
 
+    // ── 泛型单态化(M2d):调用点按实参类型实例化,实例体内 Generic("T")
+    //    查询经基类 type_of 替换为具体类型;lambda 实参形参(F)经 env 间接调用 ──
+    std::set<std::string> mono_done_;            // 已发射实例符号
+    std::set<std::string> mono_lambda_params_;   // 当前实例的 lambda 形参名
+    std::set<std::string> mono_type_params_;     // 当前实例的类型参数名
+    std::map<ast::Expr*, sema::Type> mono_call_ret_;   // 泛型调用表达式 → 结果类型
+
+    ast::FuncDecl* find_generic_callee(std::string const& name, int arity)
+    {
+        for (auto& f : m_->funcs)
+            if (!f.type_params.empty() && !f.is_extern && f.name == name
+                && (int)f.params.size() == arity)
+                return &f;
+        return nullptr;
+    }
+
+    std::string mono_type_key(sema::Type const& t, bool isl)
+    {
+        using K = sema::Type::Kind;
+        if (isl) return "L";
+        switch (t.kind) {
+        case K::Int: return "i32";
+        case K::I8: return "i8";   case K::I16: return "i16";
+        case K::I32: return "i32"; case K::I64: return "i64";
+        case K::U8: return "u8";   case K::U16: return "u16";
+        case K::U32: return "u32"; case K::U64: return "u64";
+        case K::Double: case K::Float: return "f64";
+        case K::Bool: return "b";  case K::Char: return "c";
+        case K::String: case K::StringView: return "str";
+        case K::NamedStruct: return t.name;
+        case K::Container: return "V" + (t.element ? mono_type_key(*t.element, false) : std::string("x"));
+        case K::SmartPtr: return "P" + (t.pointee ? mono_type_key(*t.pointee, false) : std::string("x"));
+        case K::Pointer: return "p";
+        case K::ArenaPtr: return "ap";
+        default: return t.name.empty() ? "x" : t.name;
+        }
+    }
+
+    void mono_bind_name(std::string const& n, sema::Type const& t)
+    {
+        if (mono_type_params_.count(n)) mono_map_[n] = t;
+    }
+
+    // 形参类型 ↔ 实参类型合一:绑定类型参数;lambda 实参标记 F 为间接调用形参
+    void mono_bind(ast::FuncDecl* gf, ast::CallExpr& c,
+                   std::vector<sema::Type> const& ats, std::vector<char> const& isl)
+    {
+        for (size_t i = 0; i < gf->params.size() && i < c.args.size(); ++i) {
+            auto& tu = gf->params[i].type;
+            // vector<T> 形参:绑元素类型(parts 或 args 两种解析形态都接)
+            if (tu.parts.size() >= 2 && tu.parts[0] == "vector") {
+                if (ats[i].kind == sema::Type::Kind::Container)
+                    mono_bind_name(tu.parts[1], ats[i].elem());
+                continue;
+            }
+            if (tu.parts.size() == 1 && !tu.args.empty()
+                && tu.parts[0] == "vector" && tu.args[0].parts.size() == 1) {
+                if (ats[i].kind == sema::Type::Kind::Container)
+                    mono_bind_name(tu.args[0].parts[0], ats[i].elem());
+                continue;
+            }
+            if (tu.parts.size() == 1) {
+                if (isl[i]) { mono_lambda_params_.insert(gf->params[i].name); continue; }   // 形参名(非类型名)→ lambda_vars_
+                mono_bind_name(tu.parts[0], ats[i]);
+            }
+        }
+    }
+
+    // 返回类型替换:T → 具体类型;vector<T> → Container(具体元素)
+    sema::Type mono_subst_ret(std::optional<ast::TypeUse> const& ret)
+    {
+        using K = sema::Type::Kind;
+        if (!ret) { sema::Type t{}; t.kind = K::Int; return t; }
+        auto& tu = *ret;
+        if (tu.parts.size() == 1) {
+            auto it = mono_map_.find(tu.parts[0]);
+            if (it != mono_map_.end()) return it->second;
+            if (find_sd(tu.parts[0])) {
+                sema::Type t{}; t.kind = K::NamedStruct; t.name = tu.parts[0];
+                return t;
+            }
+            return sema::Type{};                     // int/double 等具体类型:sema 已知
+        }
+        if (tu.parts.size() >= 2 && tu.parts[0] == "vector") {
+            sema::Type c{}; c.kind = K::Container; c.name = "vector";
+            ast::TypeUse elem;
+            elem.parts = std::vector<std::string>(tu.parts.begin() + 1, tu.parts.end());
+            c.element = std::make_shared<sema::Type>(mono_subst_ret(elem));
+            return c;
+        }
+        return sema::Type{};
+    }
+
+    // 单态化请求:排队延后发射(不得在调用方函数体内联插入函数体,
+    // 否则调用方序言会直落进实例体,实例 ret 会直接返回调用方 caller)
+    struct MonoReq {
+        ast::FuncDecl* gf;
+        std::string sym;
+        std::map<std::string, sema::Type> binds;      // 类型参数 → 实参具体类型
+        std::set<std::string> lams;                   // lambda 形参名
+    };
+    std::deque<MonoReq> mono_queue_;
+
+    // 归一:实参类型合一 → 绑定;返回实例重整符号(结果类型经 ret_out 带回)
+    std::string mono_request(ast::FuncDecl* gf, ast::CallExpr& c, sema::Type& ret_out)
+    {
+        std::vector<sema::Type> ats;
+        std::vector<char> isl;
+        std::string key;
+        for (auto& a : c.args) {
+            bool il = (a->kind() == ast::Expr::Lambda);
+            isl.push_back(il ? 1 : 0);
+            ats.push_back(type_of(a.get()));
+            key += (key.empty() ? "" : "_") + mono_type_key(ats.back(), il);
+        }
+        std::string sym = gf->name + "$m_" + key;
+        // 外层(可能处于另一实例体内)绑定上下文保存恢复
+        auto sv_tp = mono_type_params_;
+        auto sv_map = mono_map_;
+        auto sv_lam = mono_lambda_params_;
+        mono_type_params_.clear();
+        for (auto& tp : gf->type_params) mono_type_params_.insert(tp.name);
+        mono_map_.clear();
+        mono_lambda_params_.clear();
+        mono_bind(gf, c, ats, isl);
+        ret_out = mono_subst_ret(gf->ret);
+        if (!mono_done_.count(sym)) {
+            mono_done_.insert(sym);
+            mono_queue_.push_back({gf, sym, mono_map_, mono_lambda_params_});
+        }
+        mono_type_params_ = sv_tp;
+        mono_map_ = sv_map;
+        mono_lambda_params_ = sv_lam;
+        return sym;
+    }
+
+    // 排空实例队列:逐个设置替换上下文后发射实例函数体
+    // (实例体内再调泛型 → 嵌套排队,由本循环继续排空)
+    void drain_mono_queue()
+    {
+        while (!mono_queue_.empty()) {
+            MonoReq rq = std::move(mono_queue_.front());
+            mono_queue_.pop_front();
+            auto sv_slots = std::move(slots_);
+            auto sv_scope = std::move(scope_stack_);
+            int sv_push = push_depth_;
+            auto* sv_fn = cur_fn_;
+            auto sv_sym = cur_sym_name_;
+            auto* sv_struct = cur_struct_;
+            auto sv_brk = break_labels_;
+            auto sv_cnt = continue_labels_;
+            auto sv_inout = inout_params_;
+            auto sv_lvars = lambda_vars_;
+            auto sv_mmap = std::move(mono_map_);
+            auto sv_mvar = std::move(mono_var_types_);
+            auto sv_tp = mono_type_params_;
+            mono_map_ = rq.binds;
+            mono_lambda_params_ = rq.lams;
+            for (auto& pnm : mono_lambda_params_)
+                lambda_vars_[pnm] = LambdaInfo{"", {}};   // 形参槽存 env 指针 → 间接调用
+            emit_func(*rq.gf, rq.sym);
+            slots_ = std::move(sv_slots);
+            scope_stack_ = std::move(sv_scope);
+            push_depth_ = sv_push;
+            cur_fn_ = sv_fn;
+            cur_sym_name_ = sv_sym;
+            cur_struct_ = sv_struct;
+            break_labels_ = std::move(sv_brk);
+            continue_labels_ = std::move(sv_cnt);
+            inout_params_ = std::move(sv_inout);
+            lambda_vars_ = std::move(sv_lvars);
+            mono_map_ = std::move(sv_mmap);
+            mono_var_types_ = std::move(sv_mvar);
+            mono_type_params_ = sv_tp;
+        }
+    }
+
     void emit_call(ast::CallExpr& c)
     {
         if (c.callee->kind() == ast::Expr::Member) {
@@ -1801,7 +1983,7 @@ private:
             ast::MethodDecl* md = nullptr;
             // 接收者静态类型优先沿继承链解析(派生方法隐藏基类同名)
             if (R_) {
-                auto bt = R_->type_of(*mem.base);
+                auto bt = type_of(mem.base.get());
                 if (bt.kind == sema::Type::Kind::SmartPtr) bt = bt.deref();  // '.' 自动解引用
                 if (bt.kind == sema::Type::Kind::NamedStruct) {
                     ast::StructDecl* s = find_sd(bt.name);
@@ -1822,7 +2004,7 @@ private:
             if (!sd || !md) {
                 // 容器方法桥:vector 增长(push_back)
                 if (mem.name == "push_back") {
-                    auto btt = R_ ? R_->type_of(*mem.base) : sema::Type{};
+                    auto btt = type_of(mem.base.get());
                     if (btt.kind == sema::Type::Kind::Container) {
                         emit_vector_push_back(base_name, c);
                         return;
@@ -1831,14 +2013,14 @@ private:
                 // UFCS 桥:n.to_string() ≡ to_string(n)(int/double)
                 if (mem.name == "to_string") {
                     eval(mem.base.get());
-                    if (R_ && R_->type_of(*mem.base).kind == sema::Type::Kind::Double) {
+                    if (R_ && type_of(mem.base.get()).kind == sema::Type::Kind::Double) {
                         ins("movq xmm0, rax");
                         ins("call cpp2_dbl_str");
                     } else {
 #ifdef CPP2_NATIVE_HOST_OK
-                        ins("mov rcx, rax");
-#else
                         ins("mov rdi, rax");
+#else
+                        ins("mov rcx, rax");
 #endif
                         ins("call cpp2_int_str");
                     }
@@ -1956,7 +2138,7 @@ private:
                 eval(rbase);                       // rax = 指针(unique/裸指针同形)
             } else {
                 int base_off = slot_of(base_name);
-                auto bt3 = R_ ? R_->type_of(*mem.base) : sema::Type{};
+                auto bt3 = type_of(mem.base.get());
                 if (bt3.kind == sema::Type::Kind::SmartPtr)   // '.' 自动解引用:this = 堆指针
                     ins("mov rax, QWORD PTR [rbp" + std::to_string(base_off) + "]");
                 else
@@ -1998,7 +2180,7 @@ private:
                 tn = static_cast<ast::StructLitExpr&>(*mkarg).type_parts.empty()
                          ? "" : static_cast<ast::StructLitExpr&>(*mkarg).type_parts[0];
             } else if (mkarg->kind() == ast::Expr::Name) {
-                auto at = R_ ? R_->type_of(*mkarg) : sema::Type{};
+                auto at = type_of(mkarg);
                 if (at.kind == sema::Type::Kind::NamedStruct) tn = at.name;
             }
             ast::StructDecl* sd = nullptr;
@@ -2191,6 +2373,13 @@ private:
             ins("xor eax, eax");
             return;
         }
+        // ── 泛型调用:按实参类型单态化 → 调用实例符号(实例延后发射,M2d)──
+        std::string call_sym = nm.parts[0];
+        if (ast::FuncDecl* gf = find_generic_callee(nm.parts[0], (int)c.args.size())) {
+            sema::Type rt;
+            call_sym = mono_request(gf, c, rt);
+            if (rt.known()) mono_call_ret_[&c] = rt;
+        }
         if (!nm.qualified()) {
             auto lv = lambda_vars_.find(nm.parts[0]);
             if (lv != lambda_vars_.end()) {
@@ -2281,11 +2470,11 @@ private:
         if (push_depth_ % 2 == 1) {              // call 前 rsp 16 对齐(奇数次 8B push)
             ins("sub rsp, 8");
             ins("sub rsp, 32");
-            ins("call " + nm.parts[0]);
+            ins("call " + call_sym);
             ins("add rsp, 40");
         } else {
             ins("sub rsp, 32");
-            ins("call " + nm.parts[0]);
+            ins("call " + call_sym);
             ins("add rsp, 32");
         }
     }
@@ -2442,8 +2631,11 @@ private:
             else if (b.op == "<" || b.op == ">" || b.op == "<=" || b.op == ">=" ||
                      b.op == "==" || b.op == "!=") {
                 ins("comisd xmm1, xmm0");
-                std::string cc = (b.op=="<")?"setl":(b.op==">")?"setg":(b.op=="<=")?"setle":
-                                 (b.op==">=")?"setge":(b.op=="==")?"sete":"setne";
+                // comisd 只置 ZF/PF/CF(SF/OF 恒 0):大小比较须用无符号后缀
+                //   a>b = CF=0∧ZF=0 → seta;a<b = CF=1 → setb;
+                //   a<=b = CF=1∨ZF=1 → setbe;a>=b = CF=0 → setae
+                std::string cc = (b.op=="<")?"setb":(b.op==">")?"seta":(b.op=="<=")?"setbe":
+                                 (b.op==">=")?"setae":(b.op=="==")?"sete":"setne";
                 ins(cc + " al");
                 ins("movzx rax, al");
                 return;
@@ -2519,6 +2711,19 @@ private:
                 return;
             }
             if (b.op == "==" || b.op == "!=" || b.op == "<" || b.op == ">" || b.op == "<=" || b.op == ">=") {
+                if (is_double_expr(b.lhs.get()) || is_double_expr(b.rhs.get())) {
+                    // double 比较:eval_binary 的 comisd 路径产出布尔值,再转分支
+                    //(泛型实例内 v < lo:T 已替换为具体类型,复用同一逻辑)
+                    eval_binary(b);
+                    ins("test rax, rax");
+                    if (!t_true.empty()) {
+                        ins("jne " + t_true);
+                        if (!t_false.empty()) ins("jmp " + t_false);
+                    } else if (!t_false.empty()) {
+                        ins("je " + t_false);
+                    }
+                    return;
+                }
                 eval(b.lhs.get());
                 ins("push rax");
                 ++push_depth_;
