@@ -1993,9 +1993,9 @@ private:
                 if (newline) cfmt += "\n";
                 std::string fmt_lbl = intern_string(cfmt);
                 eval(c.args[0].get());
-                if (is_double_expr(c.args[0].get())) {   // 位模式 → 短环表示字符串
+                if (is_double_expr(c.args[0].get())) {   // 位模式 → 最短往返字符串(对齐 std::format 默认)
                     ins("movq xmm0, rax");
-                    ins("call cpp2_dbl_str");
+                    ins("call cpp2_dbl_str_rt");
                 }
 #ifdef CPP2_NATIVE_HOST_OK
                 ins("mov rsi, rax");
@@ -2029,9 +2029,9 @@ private:
                 int idx = text[pos + 1] - '0';
                 if (idx + 1 >= (int)c.args.size())
                     unsup("println placeholder {" + std::string(1, text[pos + 1]) + "} out of range");
-                // double 实参:{0} → %f(对齐转译基线 std::to_string 的 6 位小数);
-                // 位模式按 GP 变参直传(msvcrt printf 家族从 GP 流读,不走 xmm)
-                if (is_double_expr(c.args[idx + 1].get())) cfmt += "%f";
+                // double 实参:{0} → %s(先经 cpp2_dbl_str_rt 转最短往返字符串,
+                // 对齐转译基线 std::format 默认 = 最短表示;曾用 %f,输出 12.566360 与基线 12.56636 不一致)
+                if (is_double_expr(c.args[idx + 1].get())) cfmt += "%s";
                 else cfmt += fmt_for(c.args[idx + 1].get());
                 pos += 2;
             } else if (text[pos] == '\\' && pos + 1 < text.size()) {
@@ -2052,6 +2052,10 @@ private:
         int nargs = (int)(c.args.size() - 1);
         for (size_t i = 1; i < c.args.size(); ++i) {
             eval(c.args[i].get());
+            if (is_double_expr(c.args[i].get())) {   // 位模式 → 最短往返字符串
+                ins("movq xmm0, rax");
+                ins("call cpp2_dbl_str_rt");
+            }
             ins("push rax");
             ++push_depth_;
         }
@@ -2477,6 +2481,61 @@ cpp2_dbl_str:
     lea rdx, .Lfmt_g[rip]
     mov r8, QWORD PTR [rbp-8]
     call sprintf
+    mov rax, QWORD PTR [rbp-16]
+    add rsp, 64
+    pop rbp
+    ret
+.globl cpp2_dbl_str_rt
+cpp2_dbl_str_rt:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 64
+    movsd QWORD PTR [rbp-8], xmm0
+    mov DWORD PTR [rbp-24], 1
+.cpp2_dblrt_loop:
+    lea rax, [rbp-32]
+    mov BYTE PTR [rax], 37
+    mov BYTE PTR [rax+1], 46
+    mov ecx, DWORD PTR [rbp-24]
+    cmp ecx, 10
+    jb .cpp2_dblrt_one
+    mov BYTE PTR [rax+2], 49
+    add ecx, 38
+    mov BYTE PTR [rax+3], cl
+    mov BYTE PTR [rax+4], 103
+    mov BYTE PTR [rax+5], 0
+    jmp .cpp2_dblrt_have
+.cpp2_dblrt_one:
+    add ecx, 48
+    mov BYTE PTR [rax+2], cl
+    mov BYTE PTR [rax+3], 103
+    mov BYTE PTR [rax+4], 0
+.cpp2_dblrt_have:
+    lea rax, .Ldblcnt[rip]
+    mov rcx, QWORD PTR [rax]
+    lea rdx, [rcx+1]
+    mov QWORD PTR [rax], rdx
+    and rcx, 3
+    shl rcx, 5
+    lea rax, .Ldblbuf_00[rip]
+    add rax, rcx
+    mov QWORD PTR [rbp-16], rax
+    mov rcx, rax
+    lea rdx, [rbp-32]
+    mov r8, QWORD PTR [rbp-8]
+    call sprintf
+    mov rcx, QWORD PTR [rbp-16]
+    xor rdx, rdx
+    call strtod
+    comisd xmm0, QWORD PTR [rbp-8]
+    je .cpp2_dblrt_done
+    mov eax, DWORD PTR [rbp-24]
+    cmp eax, 17
+    jae .cpp2_dblrt_done
+    add eax, 1
+    mov DWORD PTR [rbp-24], eax
+    jmp .cpp2_dblrt_loop
+.cpp2_dblrt_done:
     mov rax, QWORD PTR [rbp-16]
     add rsp, 64
     pop rbp
