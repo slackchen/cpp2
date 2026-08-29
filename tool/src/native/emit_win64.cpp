@@ -621,6 +621,14 @@ private:
                 }
                 if (is_variant) { slot_or_new(v.name); break; }
             }
+            // arena 变量(M5-L6):3 连槽 [buf][off][live],字段自 base 向上
+            // (#a1/#a2 先分配在上,name 最后 = 组内最低槽,与 struct 布局一致)
+            if (v.has_type && v.type.parts.size() == 1 && v.type.parts[0] == "arena") {
+                slot_or_new(v.name + "#a1");
+                slot_or_new(v.name + "#a2");
+                slot_or_new(v.name);
+                break;
+            }
             // struct 变量:预留连续字段块(字段 i 位于 base + i*8,base = 块内最低槽)。
             // 占位槽仅保证连续性,字段实际地址一律按 base 偏移计算
             {
@@ -903,6 +911,13 @@ private:
             break;
         case ast::Stmt::Var: {
             auto& v = static_cast<ast::VarStmt&>(*s);
+            // arena 变量(M5-L6):[buf][off][live] 三连槽置零(init arena{} 无需求值)
+            if (v.has_type && v.type.parts.size() == 1 && v.type.parts[0] == "arena") {
+                int aoff = slot_or_new(v.name);
+                for (int k = 0; k < 3; ++k)
+                    ins("mov QWORD PTR [rbp" + std::to_string(aoff + k * 8) + "], 0");
+                break;
+            }
             // 特殊处理 Point 等 struct 的 StructLit 初始化：直接按字段存入 p 的连续槽
             if (v.init && v.init->kind() == ast::Expr::StructLit) {
                 auto& sl = static_cast<ast::StructLitExpr&>(*v.init);
@@ -2383,6 +2398,102 @@ private:
                     ins("movzx rax, al");
                     return;
                 }
+                // ── arena 方法桥(M5-L6):不透明 rt 对象,3 连槽 [buf][off][live] ──
+                {
+                    auto at = type_of(mem.base.get());
+                    if (at.kind == sema::Type::Kind::NamedStruct && at.name == "arena") {
+                        if (mem.base->kind() != ast::Expr::Name) unsup("arena receiver must be name");
+                        auto& an = static_cast<ast::NameExpr&>(*mem.base);
+                        int aoff = slot_of(an.parts[0]);
+                        // arena 地址:inout 参数槽存调用方地址(间接),局部变量槽即基址
+                        auto arena_addr = [&]() {
+                            if (is_inout_param(an.parts[0]))
+                                ins("mov rax, QWORD PTR [rbp" + std::to_string(aoff) + "]");
+                            else
+                                ins("lea rax, QWORD PTR [rbp" + std::to_string(aoff) + "]");
+                        };
+                        if (mem.name == "live" && c.args.empty()) {
+                            arena_addr();
+                            ins("mov rax, QWORD PTR [rax+16]");
+                            return;
+                        }
+                        if (mem.name == "reset" && c.args.empty()) {
+                            arena_addr();
+                            ins("mov QWORD PTR [rax+8], 0");
+                            ins("mov QWORD PTR [rax+16], 0");
+                            ins("xor eax, eax");
+                            return;
+                        }
+                        if (mem.name == "create" && c.args.size() == 1) {
+                            // 返回 arena_ptr<T>(对象地址 = buf + 登记时的 off)
+                            auto vt = type_of(c.args[0].get());
+                            long long gn = 8;
+                            if (vt.kind == sema::Type::Kind::NamedStruct)
+                                if (ast::StructDecl* sd2 = find_sd(vt.name)) {
+                                    auto fds2 = fields_deep(sd2);
+                                    gn = fds2.empty() ? 8 : (long long)fds2.back().second + 8;
+                                }
+                            int t = slot_or_new("$arn" + std::to_string(label_++));
+                            arena_addr();
+                            ins("mov QWORD PTR [rbp" + std::to_string(t) + "], rax");   // 跨 cpp2_alloc 重取
+                            // 源地址:字面量 → 临时块帧地址;具名结构体 → 参数槽存地址
+                            // (mono 传址)/局部变量 → 槽即基址;标量 → 值入临时槽
+                            ast::Expr* arg = c.args[0].get();
+                            if (arg->kind() == ast::Expr::StructLit) {
+                                eval(arg);
+                                ins("add rax, rbp");
+                            } else if (arg->kind() == ast::Expr::Name
+                                       && vt.kind == sema::Type::Kind::NamedStruct) {
+                                auto& vn2 = static_cast<ast::NameExpr&>(*arg);
+                                int voff = slot_of(vn2.parts[0]);
+                                bool is_param = false;
+                                if (cur_fn_)
+                                    for (auto& pp : cur_fn_->params)
+                                        if (pp.name == vn2.parts[0]) { is_param = true; break; }
+                                if (is_param)
+                                    ins("mov rax, QWORD PTR [rbp" + std::to_string(voff) + "]");
+                                else
+                                    ins("lea rax, QWORD PTR [rbp" + std::to_string(voff) + "]");
+                            } else {
+                                int toff = slot_or_new("$arnv" + std::to_string(label_++));
+                                eval(arg);
+                                ins("mov QWORD PTR [rbp" + std::to_string(toff) + "], rax");
+                                ins("lea rax, QWORD PTR [rbp" + std::to_string(toff) + "]");
+                            }
+                            ins("mov rsi, rax");                    // src(cpp2_alloc 不动 rsi)
+                            ins("mov r10, QWORD PTR [rbp" + std::to_string(t) + "]");
+                            ins("mov rcx, QWORD PTR [r10]");        // buf
+                            std::string have = lbl("arnh"), cp = lbl("arnc"), cd = lbl("arnd");
+                            ins("test rcx, rcx");
+                            ins("jne " + have);
+                            ins("mov rcx, 65536");                  // 首次 create:64KB 缓冲
+                            ins("sub rsp, 32");
+                            ins("call cpp2_alloc");
+                            ins("add rsp, 32");
+                            ins("mov r10, QWORD PTR [rbp" + std::to_string(t) + "]");
+                            ins("mov QWORD PTR [r10], rax");
+                            ins("mov rcx, rax");
+                            label(have);
+                            ins("mov rdx, QWORD PTR [r10+8]");      // off
+                            ins("xor r11, r11");
+                            label(cp);
+                            ins("cmp r11, " + std::to_string(gn));
+                            ins("jae " + cd);
+                            ins("mov rax, QWORD PTR [rsi+r11]");    // 逐 8B 拷贝
+                            ins("mov QWORD PTR [rcx+rdx], rax");
+                            ins("add rdx, 8");
+                            ins("add r11, 8");
+                            ins("jmp " + cp);
+                            label(cd);
+                            ins("mov QWORD PTR [r10+8], rdx");      // off += gn
+                            ins("inc QWORD PTR [r10+16]");          // live++
+                            ins("sub rdx, " + std::to_string(gn));
+                            ins("mov rax, rcx");                    // 对象地址 = buf + 旧 off
+                            ins("add rax, rdx");
+                            return;
+                        }
+                    }
+                }
                 unsup("unknown method '" + mem.name + "'");
             }
             // 实参先求值压栈,this 最后压栈(rcx 最先弹出)
@@ -2935,6 +3046,24 @@ private:
 
     void eval_binary(ast::BinaryExpr& b)
     {
+        // 指针算术(M5-L5,@unsafe 域):p ± n → p ± n*8
+        {
+            auto lt = type_of(b.lhs.get());
+            using K = sema::Type::Kind;
+            if ((lt.kind == K::Pointer || lt.kind == K::SmartPtr || lt.kind == K::ArenaPtr)
+                && (b.op == "+" || b.op == "-")) {
+                eval(b.lhs.get());
+                ins("push rax");
+                ++push_depth_;
+                eval(b.rhs.get());
+                ins("shl rax, 3");
+                ins("mov rcx, rax");
+                ins("pop rax");
+                --push_depth_;
+                ins(b.op == "+" ? "add rax, rcx" : "sub rax, rcx");
+                return;
+            }
+        }
         if (b.op == "&&" || b.op == "||") {
             std::string tT = lbl("ltrue"), fF = lbl("lfalse"), eE = lbl("lend");
             if (b.op == "&&") {

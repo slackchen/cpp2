@@ -24,7 +24,9 @@ tmp="examples/.cpp2build/native"
 mkdir -p "$tmp"
 for f in "${files[@]}"; do
   name=$(basename "$f" .cpp2)
-  base=$("$CPP2" run "$f" 2>/dev/null | tr -d '\r'); brc=$?
+  # 基线:先落盘取真实 rc(管道/命令替换会掩盖失败),再归一 \r
+  "$CPP2" run "$f" > "$tmp/${name}.base" 2>/dev/null; brc=$?
+  base=$(tr -d '\r' < "$tmp/${name}.base")
   if [[ $brc -ne 0 ]]; then
     echo "SKIP $f (转译基线失败 rc=$brc)"; skip=$((skip+1))
     continue
