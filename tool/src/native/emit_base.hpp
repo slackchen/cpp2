@@ -164,7 +164,7 @@ protected:
             }
             if (_im_name != "std") unsup("imports (only 'std' allowed in native v0)");
         }
-        if (!m_->legacy_blocks.empty()) unsup("cxx_legacy blocks");
+        check_legacy_blocks();               // 钩子:Win64 mini-C 解析;默认不支持
         for (auto& s : m_->structs) {
             for (auto& f : s.fields) {
                 auto k = scalar_kind(f.type);
@@ -201,6 +201,11 @@ protected:
 
     // vptr 垫片字节数(基类钩子:Win64 虚分发返回 8,SysV v0 不支持虚方法返回 0)
     virtual int vptr_pad(ast::StructDecl const* sd) const { (void)sd; return 0; }
+
+    // cxx_legacy 块处理(M6):基类不支持;Win64 覆写为 mini-C 解析
+    virtual void check_legacy_blocks() {
+        if (!m_->legacy_blocks.empty()) unsup("cxx_legacy blocks");
+    }
 
     // 全字段视图(基类在前),StructLit 初始化/对象拷贝用;second = 字节偏移
     // 带虚表的类型首槽为 vptr,字段偏移整体 +8(vptr_pad)
