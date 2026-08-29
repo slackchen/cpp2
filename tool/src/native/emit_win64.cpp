@@ -58,6 +58,7 @@ public:
             emit_lambda(pl.first, pl.second);
         }
         drain_mono_queue();                     // 泛型实例:全部函数体发射完成后统一落位
+        emit_legacy_funcs();                    // cxx_legacy mini-C 函数(M6):与无体声明配对
         emit_rodata_strs();
         return out_.str();
     }
@@ -122,6 +123,194 @@ private:
     int vptr_pad(ast::StructDecl const* sd) const override
     {
         return has_vtable(sd) ? 8 : 0;
+    }
+
+    // ── cxx_legacy 块(M6):mini-C 解析 ──
+    // 仅支持 int fn(int a, int b) { return EXPR; } 形态(表达式含 + - * / % 括号
+    // 一元负号、int 字面量、参数名);复杂原文(zlib 的 char*/引用 shim)不支持,
+    // 解析失败 → unsup,与基类默认行为一致
+    struct LegacyFunc { std::vector<std::string> params; std::string expr; };
+    std::map<std::string, LegacyFunc> legacy_funcs_;
+
+    void check_legacy_blocks() override
+    {
+        for (auto& lb : m_->legacy_blocks)
+            parse_legacy_block(lb.code);
+    }
+
+    void parse_legacy_block(std::string const& code)
+    {
+        size_t i = 0;
+        auto ws = [&]() {
+            for (;;) {
+                while (i < code.size() && isspace((unsigned char)code[i])) ++i;
+                if (i + 1 < code.size() && code[i] == '/' && code[i + 1] == '/') {
+                    while (i < code.size() && code[i] != '\n') ++i;   // 行注释
+                    continue;
+                }
+                if (i + 1 < code.size() && code[i] == '/' && code[i + 1] == '*') {
+                    i += 2;                                           // 块注释
+                    while (i + 1 < code.size() && !(code[i] == '*' && code[i + 1] == '/')) ++i;
+                    i = (i + 1 < code.size()) ? i + 2 : code.size();
+                    continue;
+                }
+                if (i < code.size() && code[i] == '#') {
+                    while (i < code.size() && code[i] != '\n') ++i;   // 预处理行整行跳过
+                    continue;
+                }
+                break;
+            }
+        };
+        auto word = [&](std::string const& w) {
+            ws();
+            if (code.compare(i, w.size(), w) != 0) return false;
+            size_t j = i + w.size();
+            if (j < code.size() && (isalnum((unsigned char)code[j]) || code[j] == '_')) return false;
+            i = j;
+            return true;
+        };
+        auto ident = [&](std::string& out_id) {
+            ws();
+            if (i >= code.size() || !(isalpha((unsigned char)code[i]) || code[i] == '_')) return false;
+            size_t j = i;
+            while (j < code.size() && (isalnum((unsigned char)code[j]) || code[j] == '_')) ++j;
+            out_id = code.substr(i, j - i);
+            i = j;
+            return true;
+        };
+        auto ch = [&](char c) { ws(); if (i < code.size() && code[i] == c) { ++i; return true; } return false; };
+        for (;;) {
+            ws();
+            if (i >= code.size()) break;
+            if (!word("int")) unsup("cxx_legacy blocks (mini-C 仅支持 int fn(int..) { return EXPR; })");
+            std::string name;
+            if (!ident(name)) unsup("cxx_legacy blocks (期望函数名)");
+            if (!ch('(')) unsup("cxx_legacy blocks (期望 '(')");
+            LegacyFunc lf;
+            if (!ch(')')) {
+                for (;;) {
+                    if (!word("int")) unsup("cxx_legacy blocks (参数须为 int)");
+                    std::string pn;
+                    if (!ident(pn)) unsup("cxx_legacy blocks (期望参数名)");
+                    lf.params.push_back(pn);
+                    if (ch(',')) continue;
+                    if (ch(')')) break;
+                    unsup("cxx_legacy blocks (期望 ',' 或 ')')");
+                }
+            }
+            if (!ch('{')) unsup("cxx_legacy blocks (期望 '{')");
+            if (!word("return")) unsup("cxx_legacy blocks (函数体仅支持 return EXPR;)");
+            ws();
+            size_t e0 = i;
+            while (i < code.size() && code[i] != ';') ++i;
+            if (i >= code.size()) unsup("cxx_legacy blocks (缺少 ';')");
+            lf.expr = code.substr(e0, i - e0);
+            ++i;
+            if (!ch('}')) unsup("cxx_legacy blocks (期望 '}')");
+            legacy_funcs_[name] = lf;
+        }
+    }
+
+    // mini-C 函数发射:Win64 序言 + 参数槽 + 表达式求值;符号 = 原名
+    // (与无体声明配对,C++ 链接,调用点 call legacy_add 直达)
+    void emit_legacy_funcs()
+    {
+        for (auto& [name, lf] : legacy_funcs_) {
+            put(".text");
+            put(".globl " + name);
+            put(name + ":");
+            ins("push rbp");
+            ins("mov rbp, rsp");
+            int words = (int)lf.params.size() + 16;   // 表达式纯寄存器求值,无需额外槽
+            ins("sub rsp, " + std::to_string(words * 8));
+            static char const* regs[] = {"rcx","rdx","r8","r9"};
+            std::map<std::string, int> cslots;
+            for (size_t k = 0; k < lf.params.size(); ++k) {
+                int off = -(8 * ((int)k + 1));
+                cslots[lf.params[k]] = off;
+                ins(std::string("mov QWORD PTR [rbp") + std::to_string(off) + "], " + regs[k]);
+            }
+            c_expr(lf.expr, cslots);
+            ins("mov rsp, rbp");
+            ins("pop rbp");
+            ins("ret");
+        }
+    }
+
+    // mini-C 表达式递归下降:rax = 结果;除法 C 语义(除零 UB,不做检查)
+    std::string csrc_;
+    size_t cpos_ = 0;
+    std::map<std::string, int> cslots_;
+    void c_expr(std::string const& src, std::map<std::string, int> const& slots)
+    {
+        csrc_ = src;
+        cpos_ = 0;
+        cslots_ = slots;
+        c_add();
+        cws();
+        if (cpos_ != csrc_.size()) unsup("cxx_legacy blocks (表达式尾部多余字符)");
+    }
+    void cws() { while (cpos_ < csrc_.size() && isspace((unsigned char)csrc_[cpos_])) ++cpos_; }
+    bool cch(char c) { cws(); if (cpos_ < csrc_.size() && csrc_[cpos_] == c) { ++cpos_; return true; } return false; }
+    void c_add()
+    {
+        c_mul();
+        for (;;) {
+            if (cch('+')) { ins("mov rcx, rax"); c_mul(); ins("add rax, rcx"); }
+            else if (cch('-')) { ins("mov rcx, rax"); c_mul(); ins("sub rax, rcx"); }
+            else break;
+        }
+    }
+    void c_mul()
+    {
+        c_unary();
+        for (;;) {
+            if (cch('*')) { ins("mov rcx, rax"); c_unary(); ins("imul rax, rcx"); }
+            else if (cch('/') || cch('%')) {
+                char op = csrc_[cpos_ - 1];
+                ins("push rax");                    // 左值暂存(idiv 用 rax/rcx)
+                ++push_depth_;
+                c_unary();
+                ins("mov rcx, rax");
+                ins("pop rax");
+                --push_depth_;
+                ins("cqo");
+                ins("idiv rcx");
+                if (op == '%') ins("mov rax, rdx"); // 余数在 rdx
+            }
+            else break;
+        }
+    }
+    void c_unary()
+    {
+        if (cch('-')) { c_unary(); ins("neg rax"); return; }
+        c_atom();
+    }
+    void c_atom()
+    {
+        cws();
+        if (cch('(')) {
+            c_add();
+            if (!cch(')')) unsup("cxx_legacy blocks (期望 ')')");
+            return;
+        }
+        size_t j = cpos_;
+        if (j < csrc_.size() && isdigit((unsigned char)csrc_[j])) {
+            while (j < csrc_.size() && isdigit((unsigned char)csrc_[j])) ++j;
+            ins("mov rax, " + csrc_.substr(cpos_, j - cpos_));
+            cpos_ = j;
+            return;
+        }
+        if (j < csrc_.size() && (isalpha((unsigned char)csrc_[j]) || csrc_[j] == '_')) {
+            while (j < csrc_.size() && (isalnum((unsigned char)csrc_[j]) || csrc_[j] == '_')) ++j;
+            std::string nm = csrc_.substr(cpos_, j - cpos_);
+            auto it = cslots_.find(nm);
+            if (it == cslots_.end()) unsup("cxx_legacy blocks (未知标识符 '" + nm + "')");
+            cpos_ = j;
+            ins("mov rax, QWORD PTR [rbp" + std::to_string(it->second) + "]");
+            return;
+        }
+        unsup("cxx_legacy blocks (表达式解析失败)");
     }
 
     // 虚表槽位表:(方法名, 实现函数名),按根→派生声明序;派生同名方法覆盖基类槽位
@@ -1272,6 +1461,19 @@ private:
         }
         case ast::Expr::Unary: {
             auto& u = static_cast<ast::UnaryExpr&>(*e);
+            if (u.op == "*") {                   // 解引用(M5-L5,@unsafe 域):rax = [rax]
+                eval(u.operand.get());
+                ins("mov rax, QWORD PTR [rax]");
+                break;
+            }
+            if (u.op == "&") {                   // 取地址(M5-L5,@unsafe 域)
+                if (u.operand->kind() != ast::Expr::Name)
+                    unsup("'&' operand must be a named variable");
+                auto& on = static_cast<ast::NameExpr&>(*u.operand);
+                int ooff = slot_or_new(on.parts[0]);
+                ins("lea rax, QWORD PTR [rbp" + std::to_string(ooff) + "]");
+                break;
+            }
             eval(u.operand.get());
             if (u.op == "-") ins("neg rax");
             else if (u.op == "!") { ins("cmp rax, 0"); ins("sete al"); ins("movzx rax, al"); }
@@ -1503,6 +1705,20 @@ private:
                 } else {
                     ins("mov QWORD PTR [rbp" + std::to_string(tgt_off) + "], rax");
                 }
+                break;
+            }
+            // 指针解引用目标:*p = v(M5-L5,@unsafe 域)
+            if (a.target->kind() == ast::Expr::Unary
+                && static_cast<ast::UnaryExpr&>(*a.target).op == "*") {
+                if (a.op != "=") unsup("compound assign through pointer");
+                auto& un = static_cast<ast::UnaryExpr&>(*a.target);
+                eval(un.operand.get());          // rax = 指针
+                ins("push rax");
+                ++push_depth_;
+                eval(a.value.get());
+                ins("pop rcx");
+                --push_depth_;
+                ins("mov QWORD PTR [rcx], rax");
                 break;
             }
             if (a.target->kind() != ast::Expr::Name) unsup("assignment form");
