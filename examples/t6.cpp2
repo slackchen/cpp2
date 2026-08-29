@@ -1,7 +1,0 @@
-module t6;
-import std;
-id2: <T> (v: T) -> T = { return v; }
-main: () -> int = {
-    a: int := id2(5);
-    return a;
-}
