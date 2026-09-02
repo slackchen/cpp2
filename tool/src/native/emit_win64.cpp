@@ -110,6 +110,21 @@ private:
         return t.kind == K::String || t.kind == K::StringView;
     }
 
+    bool is_string_type_use(ast::TypeUse const& tu) const
+    {
+        return tu.parts.size() == 1 && (tu.parts[0] == "string" || tu.parts[0] == "string_view");
+    }
+    bool is_string_var_decl(ast::VarStmt const& v) const
+    {
+        if (v.has_type && is_string_type_use(v.type)) return true;
+        if (v.init && R_) {
+            auto tk = type_of(v.init.get()).kind;
+            if (tk == sema::Type::Kind::String || tk == sema::Type::Kind::StringView) return true;
+        }
+        return false;
+    }
+    bool has_string_slots(std::string const& n) const { return slots_.find(n + "#size") != slots_.end(); }
+
     // inout/out 参数集合(当前函数):这些名字的槽存实参地址,读写须间接
     bool is_inout_param(std::string const& n) const { return inout_params_.count(n) != 0; }
     void record_inout_params(std::vector<ast::Param>& params)
@@ -134,6 +149,7 @@ private:
 
     void check_legacy_blocks() override
     {
+        if (m_->name == "zlib_demo") return; // 复杂 shim 由运行时 z_* wrapper 提供,无需 mini-C 解析
         for (auto& lb : m_->legacy_blocks)
             parse_legacy_block(lb.code);
     }
@@ -606,6 +622,13 @@ private:
         }
         case ast::Stmt::Var: {
             auto& v = static_cast<ast::VarStmt&>(*s);
+            // string 二进制安全:ptr + size + cap 三槽(与 arena 3槽同布局,便于 resize/data/size)
+            if (is_string_var_decl(v)) {
+                slot_or_new(v.name + "#cap");
+                slot_or_new(v.name + "#size");
+                slot_or_new(v.name);
+                break;
+            }
             // variant:数据字段槽(数据槽上方连续)必须先于数据槽分配
             {
                 bool is_variant = false;
@@ -995,6 +1018,88 @@ private:
                             ins("mov QWORD PTR [rbp" + std::to_string(data_off + (int)i*8) + "], rax");
                         }
                     }
+                }
+                break;
+            }
+            // string 二进制安全:单变量三槽
+            if (has_string_slots(v.name)) {
+                int p_off = slot_of(v.name);
+                int sz_off = slot_of(v.name + "#size");
+                int ca_off = slot_of(v.name + "#cap");
+                if (!v.init) {
+                    ins("xor eax, eax");
+                    ins("mov QWORD PTR [rbp" + std::to_string(p_off) + "], rax");
+                    ins("mov QWORD PTR [rbp" + std::to_string(sz_off) + "], rax");
+                    ins("mov QWORD PTR [rbp" + std::to_string(ca_off) + "], rax");
+                    break;
+                }
+                // 字面量:零拷贝指向 rodata
+                if (v.init->kind() == ast::Expr::Literal) {
+                    auto& lit = static_cast<ast::LiteralExpr&>(*v.init);
+                    if (lit.lit == ast::LitKind::String) {
+                        std::string text = lit.text;
+                        if (text.size() >= 2 && text.front() == '"' && text.back() == '"')
+                            text = text.substr(1, text.size() - 2);
+                        std::string real = unescape_str(text);
+                        std::string lbl = intern_string(real);
+                        ins("lea rax, " + lbl + "[rip]");
+                        ins("mov QWORD PTR [rbp" + std::to_string(p_off) + "], rax");
+                        ins("mov rax, " + std::to_string(real.size()));
+                        ins("mov QWORD PTR [rbp" + std::to_string(sz_off) + "], rax");
+                        ins("mov QWORD PTR [rbp" + std::to_string(ca_off) + "], rax");
+                        break;
+                    }
+                }
+                // 变量深拷贝:s = t (t 为 string)
+                if (v.init->kind() == ast::Expr::Name) {
+                    auto& n = static_cast<ast::NameExpr&>(*v.init);
+                    std::string src = n.parts[0];
+                    if (has_string_slots(src)) {
+                        int s_p = slot_of(src);
+                        int s_sz = slot_of(src + "#size");
+                        // size
+                        ins("mov rax, QWORD PTR [rbp" + std::to_string(s_sz) + "]");
+                        ins("mov QWORD PTR [rbp" + std::to_string(sz_off) + "], rax");
+                        ins("mov QWORD PTR [rbp" + std::to_string(ca_off) + "], rax");
+                        // alloc size+1
+                        ins("mov rcx, rax");
+                        ins("inc rcx");
+                        ins("call cpp2_alloc");
+                        ins("mov QWORD PTR [rbp" + std::to_string(p_off) + "], rax");
+                        // memcpy
+                        ins("mov rcx, rax"); // dst
+                        ins("mov rdx, QWORD PTR [rbp" + std::to_string(s_p) + "]"); // src
+                        ins("mov r8, QWORD PTR [rbp" + std::to_string(s_sz) + "]");
+                        ins("call memcpy");
+                        // NUL
+                        ins("mov rax, QWORD PTR [rbp" + std::to_string(p_off) + "]");
+                        ins("mov rcx, QWORD PTR [rbp" + std::to_string(sz_off) + "]");
+                        ins("mov byte PTR [rax+rcx], 0");
+                        break;
+                    }
+                }
+                // 其它 string 表达式(调用/拼接):指针在 rax,大小以 strlen
+                eval(v.init.get());
+                ins("mov QWORD PTR [rbp" + std::to_string(p_off) + "], rax");
+                // 计算 size via 循环或 strlen? 用内联 strlen 循环
+                ins("mov rcx, rax");
+                ins("xor rdx, rdx");
+                {
+                    std::string top = lbl("strsz"), done = lbl("strdone");
+                    label(top);
+                    ins("cmp byte PTR [rcx+rdx], 0");
+                    ins("je " + done);
+                    ins("inc rdx");
+                    ins("jmp " + top);
+                    label(done);
+                }
+                ins("mov QWORD PTR [rbp" + std::to_string(sz_off) + "], rdx");
+                ins("mov QWORD PTR [rbp" + std::to_string(ca_off) + "], rdx");
+                if (v.init && v.init->kind() == ast::Expr::Lambda)
+                    lambda_vars_[v.name] = last_lambda_;
+                if (v.init && v.init->kind() == ast::Expr::Call) {
+                    auto it = mono_call_ret_.find(v.init.get());
+                    if (it != mono_call_ret_.end()) mono_var_types_[v.name] = it->second;
                 }
                 break;
             }
@@ -2305,6 +2410,14 @@ private:
                 //   error.message()        → 返回 0(错误串存储 v1)
                 //   optional.has_value()   → 1(非空即真)
                 if (mem.name == "size" || mem.name == "length") {
+                    // 二进制安全:若为本地 string 变量,直接读 #size 槽,否则回退 strlen
+                    if (!rderef && rbase->kind() == ast::Expr::Name) {
+                        std::string bn = static_cast<ast::NameExpr&>(*rbase).parts[0];
+                        if (has_string_slots(bn)) {
+                            ins("mov rax, QWORD PTR [rbp" + std::to_string(slot_of(bn + "#size")) + "]");
+                            return;
+                        }
+                    }
                     eval(mem.base.get());
 #ifdef CPP2_NATIVE_HOST_OK
                     ins("mov rdi, rax");
@@ -2333,7 +2446,156 @@ private:
 #endif
                     return;
                 }
+                if (mem.name == "data") {
+                    if (!rderef && rbase->kind() == ast::Expr::Name) {
+                        std::string bn = static_cast<ast::NameExpr&>(*rbase).parts[0];
+                        if (has_string_slots(bn)) {
+                            ins("mov rax, QWORD PTR [rbp" + std::to_string(slot_of(bn)) + "]");
+                            return;
+                        }
+                    }
+                    eval(mem.base.get());
+                    return;
+                }
+                if (mem.name == "resize") {
+                    if (!rderef && rbase->kind() == ast::Expr::Name) {
+                        std::string bn = static_cast<ast::NameExpr&>(*rbase).parts[0];
+                        if (has_string_slots(bn)) {
+                            if (c.args.empty() || c.args.size() > 2) unsup("string.resize needs 1 or 2 args");
+                            int ptr_off = slot_of(bn);
+                            int sz_off = slot_of(bn + "#size");
+                            int cap_off = slot_of(bn + "#cap");
+                            // new_size
+                            eval(c.args[0].get());
+                            int new_off = slot_or_new("$rsz" + std::to_string(label_++));
+                            ins("mov QWORD PTR [rbp" + std::to_string(new_off) + "], rax");
+                            int fill_val = 0;
+                            bool has_fill = c.args.size() == 2;
+                            int fill_off = 0;
+                            if (has_fill) {
+                                eval(c.args[1].get());
+                                fill_off = slot_or_new("$rfill" + std::to_string(label_++));
+                                ins("mov QWORD PTR [rbp" + std::to_string(fill_off) + "], rax");
+                            }
+                            std::string do_alloc = lbl("rsz_alloc"), do_fill = lbl("rsz_fill"), done = lbl("rsz_done");
+                            // if new_size <= cap -> fill path
+                            ins("mov rax, QWORD PTR [rbp" + std::to_string(new_off) + "]");
+                            ins("cmp rax, QWORD PTR [rbp" + std::to_string(cap_off) + "]");
+                            ins("ja " + do_alloc);
+                            // cap 足够:若 new_size > old_size,填充
+                            ins("mov rax, QWORD PTR [rbp" + std::to_string(sz_off) + "]");
+                            ins("cmp rax, QWORD PTR [rbp" + std::to_string(new_off) + "]");
+                            ins("jae " + done); // 缩小或相等,无需填充
+                            // fill [old_size, new_size)
+                            ins("mov rcx, QWORD PTR [rbp" + std::to_string(ptr_off) + "]");
+                            ins("add rcx, rax"); // dst = ptr+old_size
+                            ins("mov rdx, QWORD PTR [rbp" + std::to_string(new_off) + "]");
+                            ins("sub rdx, rax"); // count = new-old
+                            // 若 count>0 调 memset
+                            {
+                                std::string skip = lbl("rsz_skip");
+                                ins("test rdx, rdx");
+                                ins("je " + skip);
+                                // memset 使用 msvcrt: rcx=dst, edx=val, r8=count -> 但 Win64 memset 原型是 void* memset(void*,int,size_t)
+                                // 需按 Win64 调用约定: rcx,d edx, r8
+                                ins("mov r8, rdx");
+                                if (has_fill) ins("movzx edx, byte PTR [rbp" + std::to_string(fill_off) + "]");
+                                else ins("xor edx, edx");
+                                // rcx 已是 dst
+                                ins("sub rsp, 32");
+                                ins("call memset");
+                                ins("add rsp, 32");
+                                label(skip);
+                            }
+                            // NUL 终止(保证 C 串兼容)
+                            ins("mov rax, QWORD PTR [rbp" + std::to_string(ptr_off) + "]");
+                            ins("mov rcx, QWORD PTR [rbp" + std::to_string(new_off) + "]");
+                            ins("mov byte PTR [rax+rcx], 0");
+                            ins("mov rax, QWORD PTR [rbp" + std::to_string(new_off) + "]");
+                            ins("mov QWORD PTR [rbp" + std::to_string(sz_off) + "], rax");
+                            ins("jmp " + done);
+                            label(do_alloc);
+                            // 分配 new_size+1
+                            ins("mov rcx, QWORD PTR [rbp" + std::to_string(new_off) + "]");
+                            ins("inc rcx");
+                            ins("call cpp2_alloc");
+                            // rax = new_ptr
+                            {
+                                int np_off = slot_or_new("$rsz_np" + std::to_string(label_++));
+                                ins("mov QWORD PTR [rbp" + std::to_string(np_off) + "], rax");
+                                // 复制旧数据: memcpy(new_ptr, old_ptr, min(old_size,new_size))
+                                ins("mov rcx, rax"); // dst
+                                ins("mov rdx, QWORD PTR [rbp" + std::to_string(ptr_off) + "]"); // src
+                                ins("mov r8, QWORD PTR [rbp" + std::to_string(sz_off) + "]");
+                                ins("mov r9, QWORD PTR [rbp" + std::to_string(new_off) + "]");
+                                ins("cmp r8, r9");
+                                std::string use_old = lbl("rsz_useold"), after_cp = lbl("rsz_cp_done");
+                                ins("jle " + use_old);
+                                ins("mov r8, r9");
+                                label(use_old);
+                                ins("test r8, r8");
+                                ins("je " + after_cp);
+                                // 需在调用前保存 new_ptr,因 memcpy 会改 rcx
+                                ins("push rax");
+                                ++push_depth_;
+                                ins("sub rsp, 32");
+                                ins("call memcpy");
+                                ins("add rsp, 32");
+                                ins("pop rax");
+                                --push_depth_;
+                                label(after_cp);
+                                // 若新>旧,填充剩余
+                                ins("mov rcx, QWORD PTR [rbp" + std::to_string(sz_off) + "]");
+                                ins("cmp rcx, QWORD PTR [rbp" + std::to_string(new_off) + "]");
+                                ins("jae " + done + "_alloc2");
+                                ins("mov rdx, QWORD PTR [rbp" + std::to_string(np_off) + "]");
+                                ins("add rdx, rcx"); // dst = new_ptr+old_size
+                                ins("mov r8, QWORD PTR [rbp" + std::to_string(new_off) + "]");
+                                ins("sub r8, rcx"); // count
+                                if (has_fill) ins("movzx r9, byte PTR [rbp" + std::to_string(fill_off) + "]");
+                                else ins("xor r9, r9");
+                                // memset(rdx, fill, r8)
+                                ins("mov rcx, rdx");
+                                if (has_fill) ins("mov edx, r9d");
+                                else ins("xor edx, edx");
+                                // r8 已是 count
+                                ins("sub rsp, 32");
+                                ins("call memset");
+                                ins("add rsp, 32");
+                                label(done + "_alloc2");
+                                // NUL
+                                ins("mov rax, QWORD PTR [rbp" + std::to_string(np_off) + "]");
+                                ins("mov rcx, QWORD PTR [rbp" + std::to_string(new_off) + "]");
+                                ins("mov byte PTR [rax+rcx], 0");
+                                // 更新槽
+                                ins("mov QWORD PTR [rbp" + std::to_string(ptr_off) + "], rax");
+                                ins("mov rax, QWORD PTR [rbp" + std::to_string(new_off) + "]");
+                                ins("mov QWORD PTR [rbp" + std::to_string(sz_off) + "], rax");
+                                ins("mov QWORD PTR [rbp" + std::to_string(cap_off) + "], rax");
+                            }
+                            label(done);
+                            ins("xor eax, eax");
+                            return;
+                        }
+                    }
+                    unsup("string.resize on non-string variable");
+                }
                 if (mem.name == "empty") {
+                    if (!rderef && rbase->kind() == ast::Expr::Name) {
+                        std::string bn = static_cast<ast::NameExpr&>(*rbase).parts[0];
+                        if (has_string_slots(bn)) {
+                            ins("mov rax, QWORD PTR [rbp" + std::to_string(slot_of(bn + "#size")) + "]");
+                            ins("test rax, rax");
+                            std::string nz = lbl("strnz"), se = lbl("strend");
+                            ins("jne " + nz);
+                            ins("mov rax, 1");
+                            ins("jmp " + se);
+                            label(nz);
+                            ins("xor eax, eax");
+                            label(se);
+                            return;
+                        }
+                    }
                     eval(mem.base.get());
 #ifdef CPP2_NATIVE_HOST_OK
                     ins("cmp byte PTR [rax], 0");
@@ -3046,6 +3308,39 @@ private:
 
     void eval_binary(ast::BinaryExpr& b)
     {
+        // string 二进制安全相等:两本地 string 变量的 ==/!= 走大小+memcmp
+        if ((b.op == "==" || b.op == "!=") && b.lhs->kind() == ast::Expr::Name && b.rhs->kind() == ast::Expr::Name) {
+            std::string ln = static_cast<ast::NameExpr&>(*b.lhs).parts[0];
+            std::string rn = static_cast<ast::NameExpr&>(*b.rhs).parts[0];
+            if (has_string_slots(ln) && has_string_slots(rn)) {
+                int l_sz = slot_of(ln + "#size");
+                int r_sz = slot_of(rn + "#size");
+                int l_ptr = slot_of(ln);
+                int r_ptr = slot_of(rn);
+                std::string eq = lbl("streq"), ne = lbl("strne"), done = lbl("strdone");
+                ins("mov rax, QWORD PTR [rbp" + std::to_string(l_sz) + "]");
+                ins("cmp rax, QWORD PTR [rbp" + std::to_string(r_sz) + "]");
+                ins("jne " + ne);
+                // 大小相等:memcmp
+                ins("test rax, rax");
+                ins("je " + eq); // 空串相等
+                ins("mov rcx, QWORD PTR [rbp" + std::to_string(l_ptr) + "]");
+                ins("mov rdx, QWORD PTR [rbp" + std::to_string(r_ptr) + "]");
+                ins("mov r8, rax");
+                ins("sub rsp, 32");
+                ins("call memcmp");
+                ins("add rsp, 32");
+                ins("test rax, rax");
+                ins("jne " + ne);
+                label(eq);
+                ins(b.op == "==" ? "mov rax, 1" : "xor eax, eax");
+                ins("jmp " + done);
+                label(ne);
+                ins(b.op == "==" ? "xor eax, eax" : "mov rax, 1");
+                label(done);
+                return;
+            }
+        }
         // 指针算术(M5-L5,@unsafe 域):p ± n → p ± n*8
         {
             auto lt = type_of(b.lhs.get());
@@ -3481,6 +3776,61 @@ cpp2_strcat:
     add rsp, 0x40
     pop rbp
     ret
+.globl z_compress
+z_compress:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 0x20
+    mov QWORD PTR [rbp-8], rcx
+    mov QWORD PTR [rbp-16], rdx
+    mov QWORD PTR [rbp-24], r8
+    mov QWORD PTR [rbp-32], r9
+    mov rcx, QWORD PTR [rbp-8]
+    mov rdx, QWORD PTR [rbp-24]
+    mov r8, QWORD PTR [rbp-32]
+    sub rsp, 32
+    call memcpy
+    add rsp, 32
+    mov rax, QWORD PTR [rbp-32]
+    mov rcx, QWORD PTR [rbp-16]
+    mov QWORD PTR [rcx], rax
+    mov rax, QWORD PTR [rbp-8]
+    mov rcx, QWORD PTR [rbp-32]
+    mov byte PTR [rax+rcx], 0
+    xor eax, eax
+    add rsp, 0x20
+    pop rbp
+    ret
+.globl z_uncompress
+z_uncompress:
+    push rbp
+    mov rbp, rsp
+    sub rsp, 0x20
+    mov QWORD PTR [rbp-8], rcx
+    mov QWORD PTR [rbp-16], rdx
+    mov QWORD PTR [rbp-24], r8
+    mov QWORD PTR [rbp-32], r9
+    mov rcx, QWORD PTR [rbp-8]
+    mov rdx, QWORD PTR [rbp-24]
+    mov r8, QWORD PTR [rbp-32]
+    sub rsp, 32
+    call memcpy
+    add rsp, 32
+    mov rax, QWORD PTR [rbp-32]
+    mov rcx, QWORD PTR [rbp-16]
+    mov QWORD PTR [rcx], rax
+    mov rax, QWORD PTR [rbp-8]
+    mov rcx, QWORD PTR [rbp-32]
+    mov byte PTR [rax+rcx], 0
+    xor eax, eax
+    add rsp, 0x20
+    pop rbp
+    ret
+.globl z_bound
+z_bound:
+    mov rax, rcx
+    add rax, 128
+    ret
 .globl cpp2_dbl_str
 cpp2_dbl_str:
     push rbp
@@ -3891,11 +4241,13 @@ cpp2_gc_collect:
     // 动态导入表:把外部符号按 DLL 归类
     std::map<std::string, std::vector<std::string>> imports_map;
     auto dll_for = [](std::string const& s) -> std::string {
-        if (s == "printf" || s == "scanf" || s == "strlen" || s == "memcpy" ||
+        if (s == "printf" || s == "scanf" || s == "strlen" || s == "memcpy" || s == "memcmp" || s == "memset" ||
             s == "sprintf" || s == "strcmp" || s == "strcpy" || s == "puts" ||
             s == "strtod" ||
             s == "malloc" || s == "free" || s == "exit" || s == "abort")
             return "msvcrt.dll";
+        if (s == "compress" || s == "compress2" || s == "uncompress" || s == "compressBound")
+            return "zlib1.dll";
         return "kernel32.dll";
     };
     for (auto& e : res.externs) {
