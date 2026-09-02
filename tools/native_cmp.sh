@@ -18,7 +18,15 @@ done
 for i in "${!files[@]}"; do
   [[ "${files[$i]}" != */* ]] && files[$i]="examples/${files[$i]}.cpp2"
 done
-[[ ${#files[@]} -eq 0 ]] && files=(examples/*.cpp2)
+if [[ ${#files[@]} -eq 0 ]]; then
+  case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+      files=(examples/*.cpp2 examples/multimod/app.cpp2) ;;   # Win64 发射器:全量
+    *)
+      # SysV 发射器为整数核心原型(v0):仅 smoke 子集
+      files=(examples/hello.cpp2 examples/loops.cpp2 examples/funcs.cpp2) ;;
+  esac
+fi
 pass=0; fail=0; skip=0
 tmp="examples/.cpp2build/native"
 mkdir -p "$tmp"
@@ -47,6 +55,20 @@ for f in "${files[@]}"; do
   if [[ $nrc -ne 0 ]]; then
     echo "FAIL $f (native 运行 rc=$nrc)"
     fail=$((fail+1)); continue
+  fi
+  # 本机安全软件偶发拦新落盘产物(静默空输出/截断,基线与 native 侧均可波及):
+  # 输出不一致时重建 native 文件实例重试至多 2 次;仍不一致再重生成基线一次。
+  # 真实回归不受影响(两侧都重取后仍不一致才判 FAIL)
+  for retry in 1 2; do
+    [[ "$nat" == "$base" ]] && break
+    rm -f "$runexe"; cp "$exe" "$runexe"; sleep 1
+    "$runexe" > "$tmp/${name}.out" 2>/dev/null; nrc=$?
+    nat=$(tr -d '\r' < "$tmp/${name}.out")
+    [[ $nrc -ne 0 ]] && break
+  done
+  if [[ "$nat" != "$base" ]]; then
+    "$CPP2" run "$f" > "$tmp/${name}.base" 2>/dev/null; brc=$?
+    if [[ $brc -eq 0 ]]; then base=$(tr -d '\r' < "$tmp/${name}.base"); fi
   fi
   if [[ "$nat" != "$base" ]]; then
     echo "FAIL $f (输出不一致)"

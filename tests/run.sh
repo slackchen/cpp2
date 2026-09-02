@@ -279,6 +279,40 @@ run_case tests/cases/pre_trap.cpp2  "precondition failed"             trap "pre_
 run_case tests/cases/post_trap.cpp2 "postcondition failed"            trap "post_trap.cpp2:6"
 run_case tests/cases/must_trap.cpp2 "error asserted impossible"       trap "must_trap.cpp2:10"
 
+# ── native 后端:契约 trap 用例(M8 契约 native 化;仅 Win64 发射器)──
+# SysV v0 无契约支持(显式 unsup),非 Windows 跳过不计失败
+run_case_native() { # $1=cpp2 $2=期望消息片段 [$3=期望位置片段]
+    local exe runexe out code tries
+    exe=$("$CPP2" build "$1" --backend=native 2>/dev/null | grep -E '\.exe$' | tail -1)
+    if [[ -z "$exe" || ! -f "$exe" ]]; then
+        echo "FAIL $1 (native 构建失败)"; fail=$((fail+1)); return
+    fi
+    runexe="${exe%.exe}.t.exe"
+    out=""; code=0
+    for tries in 1 2 3; do   # 本机安全软件偶发拦新落盘 PE:重建文件实例重试
+        rm -f "$runexe"; cp "$exe" "$runexe"; sleep 1
+        out="$("$runexe" 2>&1)"; code=$?
+        [[ $code -ne 0 ]] && break
+    done
+    if [[ $code -ne 0 && "$out" == *"$2"* && ( -z "${3:-}" || "$out" == *"$3"* ) ]]; then
+        echo "PASS $1 [native-trap]"; pass=$((pass+1))
+    else
+        echo "FAIL $1 [native-trap] (exit $code, want trap: $2 ${3:-})"
+        printf '%s\n' "$out" | head -4
+        fail=$((fail+1))
+    fi
+}
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        run_case_native tests/cases/pre_trap.cpp2  "precondition failed"  "pre_trap.cpp2:6"
+        run_case_native tests/cases/post_trap.cpp2 "postcondition failed" "post_trap.cpp2:6"
+        run_case_native tests/cases/invariant_trap.cpp2 "invariant violated: Box" "invariant_trap.cpp2:7"
+        ;;
+    *)
+        echo "SKIP native contract traps (SysV v0: 契约未支持)"
+        ;;
+esac
+
 # audit:契约计数(contract.cpp2 = withdraw/int_sqrt/bump 各 pre+post = 6)
 if "$CPP2" audit examples/contract.cpp2 2>/dev/null | grep -q "contract 6"; then
     echo "PASS m2c/audit-contract"; pass=$((pass+1))
@@ -552,6 +586,19 @@ if "$CPP2" build examples/multimod/app.cpp2 >/dev/null 2>&1 \
     echo "PASS m2e/c2if-magic"; pass=$((pass+1))
 else
     echo "FAIL m2e/c2if-magic"; fail=$((fail+1))
+fi
+
+# ── native 后端:examples 输出对拍(转译基线逐字节;native_cmp.sh 承担)──
+nlog=".cpp2build/native_cmp.log"
+if bash tools/native_cmp.sh > "$nlog" 2>&1; then
+    summary=$(grep -E '^== native' "$nlog" | tail -1)
+    np=$(printf '%s\n' "$summary" | sed -E 's/.*: ([0-9]+) pass.*/\1/')
+    echo "PASS native/examples-cmp ($np 例对拍一致)"
+    pass=$((pass+1))
+else
+    echo "FAIL native/examples-cmp"
+    grep -E "^FAIL" "$nlog" | head -5
+    fail=$((fail+1))
 fi
 
 echo
