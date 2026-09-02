@@ -73,7 +73,105 @@ private:
     int lambda_ctx_env_ = 0;                                    // 体内 env 所在槽
     std::map<std::string, int> lambda_caps_;                    // 捕获名 → env 索引
 
+    // 契约(M2c / DESIGN §6.5):post 上下文拦截 old()/result;old 快照槽在函数
+    // 入口求值缓存。泛型实例/闭包均为排队后置发射,不会在契约求值中途重入。
+    bool in_post_ = false;
+    std::map<ast::CallExpr*, int> post_old_slots_;               // old(...) 调用 → 快照槽
+    int post_result_off_ = 0;                                   // result 缓存槽(0 = 无)
+
     [[noreturn]] void unsup(std::string const& msg) { throw Unsupported(msg); }
+
+    // post 表达式中的 old(expr) 调用收集(表达式级;语句级容器 post 走不到)
+    void collect_post_olds(ast::Expr& e, std::vector<ast::CallExpr*>& out)
+    {
+        switch (e.kind()) {
+        case ast::Expr::Literal:
+        case ast::Expr::Name:
+            return;
+        case ast::Expr::Paren:
+            return collect_post_olds(*static_cast<ast::ParenExpr&>(e).inner, out);
+        case ast::Expr::Call: {
+            auto& c = static_cast<ast::CallExpr&>(e);
+            if (c.callee->kind() == ast::Expr::Name
+                && static_cast<ast::NameExpr&>(*c.callee).parts.size() == 1
+                && static_cast<ast::NameExpr&>(*c.callee).parts[0] == "old"
+                && c.args.size() == 1)
+                out.push_back(&c);
+            for (auto& a : c.args) collect_post_olds(*a, out);
+            return;
+        }
+        case ast::Expr::Binary: {
+            auto& b = static_cast<ast::BinaryExpr&>(e);
+            collect_post_olds(*b.lhs, out);
+            collect_post_olds(*b.rhs, out);
+            return;
+        }
+        case ast::Expr::Unary:
+            return collect_post_olds(*static_cast<ast::UnaryExpr&>(e).operand, out);
+        case ast::Expr::Index: {
+            auto& x = static_cast<ast::IndexExpr&>(e);
+            collect_post_olds(*x.base, out);
+            collect_post_olds(*x.index, out);
+            return;
+        }
+        case ast::Expr::Member:
+            return collect_post_olds(*static_cast<ast::MemberExpr&>(e).base, out);
+        case ast::Expr::AsCast:
+            return collect_post_olds(*static_cast<ast::AsCastExpr&>(e).operand, out);
+        case ast::Expr::ListLit: {
+            for (auto& el : static_cast<ast::ListLitExpr&>(e).elements)
+                collect_post_olds(*el, out);
+            return;
+        }
+        default:
+            return;
+        }
+    }
+
+    // 契约槽预分配(帧尺寸计算前调用):old() 快照 + result 缓存
+    void alloc_contract_slots(ast::Expr* post, bool want_result)
+    {
+        post_old_slots_.clear();
+        post_result_off_ = 0;
+        if (!post && !want_result) return;
+        if (post) {
+            std::vector<ast::CallExpr*> olds;
+            collect_post_olds(*post, olds);
+            for (size_t i = 0; i < olds.size(); ++i)
+                post_old_slots_[olds[i]] = slot_or_new("$old" + std::to_string(i));
+        }
+        if (want_result) post_result_off_ = slot_or_new("$result");
+    }
+
+    // old() 入口快照发射(参数落槽后、pre 前)
+    void emit_post_olds()
+    {
+        for (auto const& [call, off] : post_old_slots_) {
+            eval(call->args[0].get());
+            ins("mov QWORD PTR [rbp" + std::to_string(off) + "], rax");
+        }
+    }
+
+    // 契约检查:cond 求值为假 → printf trap 消息 + exit(101)(与 ixtrap 同形)。
+    // 消息格式与转译路径 cpp2::trap 对齐(供 run.sh 断言复用)
+    void emit_check_trap(ast::Expr& cond, std::string const& what, int line)
+    {
+        eval(&cond);
+        std::string ok = lbl("cok");
+        ins("test rax, rax");
+        ins("jnz " + ok);                       // 真 → 跳过 trap 体
+        std::string msg = "cpp2 trap: " + what;
+        if (!src_path_.empty())
+            msg += " (" + src_path_ + ":" + std::to_string(line) + ")";
+        ins("lea rcx, " + intern_string(msg + "\n") + "[rip]");
+        ins("sub rsp, 32");
+        ins("xor eax, eax");
+        ins("call printf");
+        ins("add rsp, 32");
+        ins("mov rcx, 101");
+        ins("call exit");
+        label(ok);
+    }
 
     // printf 格式符按静态类型选择(string 在 native v0 = NUL 结尾 char 指针)
     char const* fmt_for(ast::Expr* e)
@@ -741,6 +839,8 @@ private:
             }
         }
         scan_slots(f.has_block_body ? f.block_body.get() : nullptr);
+        bool f_has_ret = f.ret && !f.ret->empty();
+        alloc_contract_slots(f.post.get(), f_has_ret);      // 契约槽计入帧尺寸
         int words = (int)f.params.size() + (int)slots_.size() + 64; // +64 = 懒分配临时槽 + shadow
         int frame = ((words * 8 + 15) / 16) * 16;
         put(".globl " + cur_sym_name_);
@@ -749,6 +849,9 @@ private:
         ins("mov rbp, rsp");
         if (frame > 0) ins("sub rsp, " + std::to_string(frame));
         for (auto& st : param_stores) ins(st);
+        emit_post_olds();                                   // old() 入口快照(post 前置依赖)
+        if (f.pre)                                           // pre:违反 = bug → trap(DESIGN §6)
+            emit_check_trap(*f.pre, "precondition failed: " + f.name, f.pre->line);
         if (f.name == "main" && has_any_vtables())
             ins("call cpp2_vtinit");           // 虚表运行期初始化(先于任何对象构造)
         if (f.name == "main") {
@@ -765,6 +868,14 @@ private:
             ins("jmp " + ret);
         }
         label(ret);
+        // 契约出口检查:统一返回点(所有 return 均跳此);rax 先缓存再还原
+        if (f.post) {
+            if (f_has_ret) ins("mov QWORD PTR [rbp" + std::to_string(post_result_off_) + "], rax");
+            in_post_ = true;
+            emit_check_trap(*f.post, "postcondition failed: " + f.name, f.post->line);
+            in_post_ = false;
+            if (f_has_ret) ins("mov rax, QWORD PTR [rbp" + std::to_string(post_result_off_) + "]");
+        }
         if (f.name == "main") {
             if (f.ret && !f.ret->empty())
                 ins("mov rcx, rax");
@@ -848,6 +959,8 @@ private:
         for (size_t i = 0; i < m.params.size(); ++i)
             slots_[m.params[i].name] = -(8 * (int)(i + 2));
         if (m.has_block_body && m.block_body) scan_slots(m.block_body.get());
+        bool m_has_ret = m.ret && !m.ret->empty();
+        alloc_contract_slots(m.post.get(), (m.post || s.invariant) && m_has_ret); // 契约槽计入帧尺寸
         int words = 1 + (int)m.params.size() + (int)slots_.size() + 16; // +16 temp
         int frame = ((words * 8 + 15) / 16) * 16;
         put(".globl " + mname);
@@ -859,6 +972,11 @@ private:
         ins("mov QWORD PTR [rbp-8], rcx");
         for (size_t i = 0; i < m.params.size(); ++i)
             ins(std::string("mov QWORD PTR [rbp") + std::to_string(-(8*(int)(i+2))) + "], " + regs[i+1]);
+        emit_post_olds();                                   // old() 入口快照
+        if (m.pre)                                           // 方法契约:pre → trap
+            emit_check_trap(*m.pre, "precondition failed: " + s.name + "." + m.name, m.pre->line);
+        if (s.invariant)                                     // invariant 入口(DESIGN §6.5)
+            emit_check_trap(*s.invariant, "invariant violated: " + s.name, s.invariant_line);
         std::string ret = ".Lret_" + mname;
         if (m.has_block_body && m.block_body)
             emit_stmt(m.block_body.get());
@@ -867,6 +985,18 @@ private:
             ins("jmp " + ret);
         }
         label(ret);
+        // 契约出口:先 invariant 后 post(与转译路径同序);检查会打翻 rax,
+        // 有返回值时先缓存后还原(invariant 同样适用 —— 检查结果是 bool)
+        bool m_exit_checks = s.invariant || m.post;
+        if (m_exit_checks && m_has_ret) ins("mov QWORD PTR [rbp" + std::to_string(post_result_off_) + "], rax");
+        if (s.invariant)
+            emit_check_trap(*s.invariant, "invariant violated: " + s.name, s.invariant_line);
+        if (m.post) {
+            in_post_ = true;
+            emit_check_trap(*m.post, "postcondition failed: " + s.name + "." + m.name, m.post->line);
+            in_post_ = false;
+        }
+        if (m_exit_checks && m_has_ret) ins("mov rax, QWORD PTR [rbp" + std::to_string(post_result_off_) + "]");
         ins("mov rsp, rbp");
         ins("pop rbp");
         ins("ret");
@@ -1552,6 +1682,11 @@ private:
                 unsup("qualified names");
             }
             {
+                // post 上下文:result = 出口缓存槽(统一返回点的 rax)
+                if (in_post_ && n.parts[0] == "result" && post_result_off_ != 0) {
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(post_result_off_) + "]");
+                    goto name_done;
+                }
                 if (in_lambda_) {
                     // 闭包内:捕获名从 env 块加载(env = [fn_ptr][cap0]...)
                     auto ct = lambda_caps_.find(n.parts[0]);
@@ -2799,6 +2934,14 @@ private:
         auto& nm = static_cast<ast::NameExpr&>(*c.callee);
         if (!nm.qualified()) {
             std::string const& bn = nm.parts[0];
+            // post 上下文:old(expr) → 入口快照槽(emit_post_olds 预求值)
+            if (in_post_ && bn == "old" && c.args.size() == 1) {
+                auto it = post_old_slots_.find(&c);
+                if (it == post_old_slots_.end())
+                    unsup("old() in post without entry snapshot");
+                ins("mov rax, QWORD PTR [rbp" + std::to_string(it->second) + "]");
+                return;
+            }
         // ── 智能指针工厂 v0:make_unique/make_shared → 堆块 + 整对象拷贝 ──
         // 实参:聚合字面量(栈上临时)或具名变量;含 vptr 的类型整槽拷贝后
         // 动态类型随对象保留(虚分发语义)。shared v0 与 unique 同构(无引用
@@ -3453,12 +3596,15 @@ private:
             else               ins("sar rax, cl");
             return;
         }
-        if (b.op == "==") { ins("cmp rax, rcx"); ins("sete al"); ins("movzx rax, al"); return; }
-        if (b.op == "!=") { ins("cmp rax, rcx"); ins("setne al"); ins("movzx rax, al"); return; }
-        if (b.op == "<")  { ins("cmp rax, rcx"); ins("setl al"); ins("movzx rax, al"); return; }
-        if (b.op == ">")  { ins("cmp rax, rcx"); ins("setg al"); ins("movzx rax, al"); return; }
-        if (b.op == "<=") { ins("cmp rax, rcx"); ins("setle al"); ins("movzx rax, al"); return; }
-        if (b.op == ">=") { ins("cmp rax, rcx"); ins("setge al"); ins("movzx rax, al"); return; }
+        // 操作数序:rcx = lhs(pop),rax = rhs;非交换比较须 cmp lhs, rhs。
+        // (此前 cmp rax, rcx 方向颠倒,if/while 走专用跳转路径未暴露;契约把
+        //  比较当值求值首次踩中 —— M8 契约 native 化修复)
+        if (b.op == "==") { ins("cmp rcx, rax"); ins("sete al"); ins("movzx rax, al"); return; }
+        if (b.op == "!=") { ins("cmp rcx, rax"); ins("setne al"); ins("movzx rax, al"); return; }
+        if (b.op == "<")  { ins("cmp rcx, rax"); ins("setl al"); ins("movzx rax, al"); return; }
+        if (b.op == ">")  { ins("cmp rcx, rax"); ins("setg al"); ins("movzx rax, al"); return; }
+        if (b.op == "<=") { ins("cmp rcx, rax"); ins("setle al"); ins("movzx rax, al"); return; }
+        if (b.op == ">=") { ins("cmp rcx, rax"); ins("setge al"); ins("movzx rax, al"); return; }
         unsup("binary operator '" + b.op + "'");
     }
 
