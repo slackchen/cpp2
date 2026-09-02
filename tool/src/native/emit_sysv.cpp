@@ -221,6 +221,12 @@ private:
 
     void emit_method(ast::StructDecl& s, ast::MethodDecl& m)
     {
+        // SysV v0 无 vtable:虚方法若照常发射将静默退化为静态分发(行为错误),
+        // 显式拒绝而非产出错误产物(Win64 发射器才支持虚分发)
+        if (m.is_virtual) unsup("virtual methods (SysV v0: no vtable support)");
+        // 契约/不变量:SysV v0 未实现,显式拒绝而非静默丢弃(Win64 已支持)
+        if (m.pre || m.post) unsup("contracts on '" + s.name + "." + m.name + "' (SysV v0)");
+        if (s.invariant) unsup("invariant on '" + s.name + "' (SysV v0)");
         std::cerr << "[native] emit_method " << s.name << "_" << m.name << std::endl;
         std::string mname = s.name + "_" + m.name;
         cur_fn_ = nullptr;

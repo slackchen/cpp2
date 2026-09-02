@@ -27,6 +27,11 @@ jobs:
         run: bash build.sh
       - name: Full regression (examples + traps + modules + audit + fuzz)
         run: bash tests/run.sh
+      - name: Native backend smoke (SysV, integer-core examples)
+        # SysV 发射器为整数核心原型:hello/loops/funcs 经 asm+g++ 汇编链接执行,
+        # 输出与转译模式对拍(native_cmp.sh Linux 默认列表)。
+        # 契约/虚方法/泛型等 SysV v0 显式 unsup,不在 smoke 范围
+        run: bash tools/native_cmp.sh -v hello loops funcs
       - name: Fuzz with emit pipeline (libFuzzer-independent deterministic fuzzer)
         run: |
           ./.cpp2build/cpp2 fuzz examples/*.cpp2 examples/multimod/*.cpp2 \
