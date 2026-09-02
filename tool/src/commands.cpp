@@ -115,10 +115,19 @@ int cmd_run(std::vector<std::string> const& args)
     if (want_native && !in.parent_path().empty()) {
         try {
             auto& g0 = p->graph;
+            // 多模块:整程序摊平(搬空原 AST;native 路径此后不再读 graph/sema)
+            auto merged0 = merge_for_native(g0, in);
+            if (!merged0 && g0.order.size() > 1) {
+                std::cerr << "native compilation failed (no fallback)\n";
+                return 1;
+            }
+            ast::Module&  emit_mod0 = merged0 ? merged0->mod
+                                              : g0.units.at(g0.root_name).ast;
+            sema::Result& emit_sr0  = merged0 ? merged0->sema
+                                              : p->sema.at(g0.root_name);
             std::string src_norm0 = in.string();
             for (auto& ch : src_norm0) if (ch == '\\') ch = '/';   // 位置后缀与转译模式同格式
-            auto asm_text = cpp2::native::emit_asm(
-                g0.units.at(g0.root_name).ast, p->sema.at(g0.root_name), src_norm0);
+            auto asm_text = cpp2::native::emit_asm(emit_mod0, emit_sr0, src_norm0);
             fs::path build_dir0 = in.parent_path() / ".cpp2build" / "native";
             fs::create_directories(build_dir0);
 #if defined(_WIN32) || defined(__CYGWIN__)   // Win64 直出 PE(cygwin 宿主同权,见 native.cpp 目标平台注)

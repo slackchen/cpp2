@@ -155,6 +155,69 @@ std::optional<Prepared> prepare(fs::path const& root, bool quick)
     return p;
 }
 
+// ── native 多模块整程序摊平(M8)─────────────────────────────────
+std::optional<NativeMerged> merge_for_native(mods::Graph& g, fs::path const& root_file)
+{
+    if (g.order.size() <= 1) return std::nullopt;       // 单模块:走原路径
+
+    // 重名检测:跨模块同名声明(含未导出的内部名)合并后无法区分
+    std::unordered_map<std::string, std::string> owner;
+    bool clash = false;
+    auto claim = [&](std::string const& mod, std::string const& n) {
+        if (n == "main") return;
+        auto it = owner.find(n);
+        if (it != owner.end()) {
+            if (it->second != mod) {
+                print_diag(root_file.string(), "error", 0, 1,
+                           "native flatten: duplicate declaration '" + n
+                               + "' in modules '" + it->second + "' and '" + mod + "'");
+                clash = true;
+            }
+        } else {
+            owner.emplace(n, mod);
+        }
+    };
+    for (auto const& name : g.order) {
+        auto const& m = g.units.at(name).ast;
+        for (auto& s : m.structs)  claim(name, s.name);
+        for (auto& e : m.enums)    claim(name, e.name);
+        for (auto& v : m.variants) claim(name, v.name);
+        for (auto& gl : m.globals) claim(name, gl.name);
+        for (auto& f : m.funcs)    claim(name, f.name);
+    }
+    if (clash) return std::nullopt;
+
+    NativeMerged out;
+    out.mod.name = g.root_name;
+    auto move_into = [](ast::Module& dst, ast::Module&& src) {
+        for (auto& x : src.structs)       dst.structs.push_back(std::move(x));
+        for (auto& x : src.enums)         dst.enums.push_back(std::move(x));
+        for (auto& x : src.variants)      dst.variants.push_back(std::move(x));
+        for (auto& x : src.concepts)      dst.concepts.push_back(std::move(x));
+        for (auto& x : src.globals)       dst.globals.push_back(std::move(x));
+        for (auto& x : src.funcs)         dst.funcs.push_back(std::move(x));
+        for (auto& x : src.legacy_blocks) dst.legacy_blocks.push_back(std::move(x));
+    };
+    for (auto const& name : g.order) {
+        if (name == g.root_name) continue;
+        move_into(out.mod, std::move(g.units.at(name).ast));
+    }
+    auto& root_ast = g.units.at(g.root_name).ast;
+    for (auto& im : root_ast.imports)
+        if (!im.module_parts.empty() && im.module_parts[0] == "std")
+            out.mod.imports.push_back(std::move(im));   // 仅保留 std;其余已摊平
+    move_into(out.mod, std::move(root_ast));
+
+    std::cerr << "[cpp2] native backend: flattened " << g.order.size()
+              << " modules into one unit\n";
+    out.sema = sema::check(out.mod, {});
+    std::string file = root_file.string();
+    for (auto const& e : out.sema.errors)
+        print_diag(file, "error", e.line, e.col > 0 ? e.col : 1, e.msg);
+    if (!out.sema.ok()) return std::nullopt;
+    return out;
+}
+
 // ── .cpp2cache:.c2i 格式 v1(冻结,M2e)────────────────────────────
 namespace {
 constexpr char kMagic[4] = {'C', '2', 'I', 'F'};

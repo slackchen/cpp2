@@ -111,13 +111,18 @@ int cmd_build(std::vector<std::string> const& args)
     fs::create_directories(obj_dir);
     if (!headers_backend && !native_backend) fs::create_directories(bmi_dir);
 
-    // ── native 后端(P1 原型):单模块整数子集 → x86-64 汇编 ──
+    // ── native 后端(P1 原型):整数子集 → x86-64 汇编 ──
+    // 多模块:整程序摊平(merge_for_native)后走单模块发射。
+    // 注意:摊平会搬空各模块 AST,仅 native 路径可调用(此后即 return)。
+    auto merged = native_backend ? merge_for_native(g, in) : std::nullopt;
+    if (native_backend && !merged && g.order.size() > 1) {  // 合并失败(诊断已打印)
+        std::cerr << "native compilation failed (no fallback)\n";
+        return 1;
+    }
     if (native_backend) {
-        if (g.order.size() != 1) {
-            std::cerr << "[cpp2] native backend error: multi-module program not supported in native v0 (only single module)\n";
-            std::cerr << "native compilation failed (no fallback)\n";
-            return 1;
-        } else {
+        {
+            ast::Module&  emit_mod = merged ? merged->mod : g.units.at(g.root_name).ast;
+            sema::Result& emit_sr  = merged ? merged->sema : p->sema.at(g.root_name);
             try {
 #if defined(_WIN32) || defined(__CYGWIN__)   // Win64 直出 PE(cygwin 宿主同权,见 native.cpp 目标平台注)
                 // asm64 + direct PE(零 g++)。emit_pe(hello 专用桩)已停用:
@@ -125,8 +130,7 @@ int cmd_build(std::vector<std::string> const& args)
                 {
                     std::string src_norm = in.string();
                     for (auto& ch : src_norm) if (ch == '\\') ch = '/';   // 位置后缀与转译模式同格式
-                    std::string asm_text = cpp2::native::emit_asm(g.units.at(g.root_name).ast,
-                                                                  p->sema.at(g.root_name), src_norm);
+                    std::string asm_text = cpp2::native::emit_asm(emit_mod, emit_sr, src_norm);
                     // build_dir 已含 backend 子目录(.cpp2build/native),不再叠加 "native"
                     fs::path exe = build_dir / (in.stem().string() + ".exe");
                     write_file(build_dir / (in.stem().string() + ".s"), asm_text);
@@ -140,8 +144,7 @@ int cmd_build(std::vector<std::string> const& args)
                 }
 #else
                 std::string asm_text =
-                    cpp2::native::emit_asm(g.units.at(g.root_name).ast,
-                                           p->sema.at(g.root_name));
+                    cpp2::native::emit_asm(emit_mod, emit_sr);
                 fs::create_directories(build_dir);
                 fs::path s_file = build_dir / (in.stem().string() + ".s");
                 fs::path prog_o = build_dir / "prog.o";

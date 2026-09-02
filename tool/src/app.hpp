@@ -111,6 +111,16 @@ struct Prepared {
 
 std::optional<Prepared> prepare(fs::path const& root, bool quick = false);
 
+// ── native 多模块整程序摊平 ─────────────────────────────────────
+// 依赖模块声明按拓扑序合并进单个模块并重跑一遍 sema(std 为虚拟模块不参与)。
+// 单模块程序返回空 optional(调用方走原路径);重名/检查失败返回空并已打印诊断。
+// 注意:成功时各模块 AST 声明已被搬空,graph/sema 仅作容器勿再读。
+struct NativeMerged {
+    ast::Module mod;
+    sema::Result sema;
+};
+std::optional<NativeMerged> merge_for_native(mods::Graph& g, fs::path const& root_file);
+
 // ── .cpp2cache:.c2i v1(冻结)────────────────────────────────────
 struct CacheRec {
     std::string src_hash;
