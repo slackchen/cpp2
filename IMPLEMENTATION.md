@@ -282,9 +282,12 @@ bash tools/native_cmp.sh -v 名称  # 单例(裸名或路径)+ 失败 diff
 `rm+cp` 重建实例后可执行。脚本因此经 `cpp2 build --backend=native` 取产物并重建文件实例;
 无此类拦截的环境可直接 `cpp2 run --backend=native`。
 
-**截至本节修订的状态**(Win64 直出 PE,cygwin 宿主):colors/contract/errors/funcs/hello/
-invariant/loops/m6b/native_demo/optional/point/shapes/types/errcat/errchain/m7b 共 16 例
-通过。已落地的关键修复与能力:
+**截至本节修订(2026-09-02)的状态**(Win64 直出 PE,cygwin 宿主):**examples 全量 24 例 +
+multimod/app 整程序摊平,共 25 例对拍全绿**(zlib_demo 于本机受安全软件拦截 SKIP,CI 覆盖);
+契约 trap 用例(pre/post/invariant)在 native 下同样 trap,消息与退出码(101)同转译路径格式。
+此前的已知缺口(smart/safety/gc_demo/generics/showcase/virtual_demo/unsafe_demo/zlib_demo)
+已全部清偿,详见 §9 M8 系列完成记录。当前 v0 边界:SysV 发射器仍是整数核心原型
+(契约/虚方法/泛型等显式 unsup,CI smoke 子集 hello/loops/funcs)。已落地的关键修复与能力:
 
 - msvcrt(legacy CRT)变参约定:printf 家族从 GP 位置流(rdx/r8/r9 home,之后栈)读变参,
   xmm/AL 完全不参与 → 浮点变参一律以位模式放入下一个 GP 位置(cpp2_dbl_str 的 sprintf、
@@ -297,11 +300,6 @@ invariant/loops/m6b/native_demo/optional/point/shapes/types/errcat/errchain/m7b 
 - std::to_string 桥(cpp2_int_str)、整数字面量列表迭代 for、list 字面量 +
   下标读(越界 trap)、lambda 闭包(显式按值捕获,env=[fn_ptr][cap...],间接 call)、
   UFCS 管道(解析期脱糖为普通调用,直接可用)
-
-已知缺口(native 构建失败,属 v0 语言子集边界):smart(unique/shared 所有权)、
-safety(ListLit 槽修复后待复测)、gc_demo(GC 运行时)、generics/showcase(concepts)、
-gc_demo/generics 类泛型、m7b 之外的 virtual_demo(vector/unique/vtable 虚分发)、
-unsafe_demo/zlib_demo(cxx_legacy 块,零工具链 PE 后端不编译 C++ 源)。
 
 ---
 
@@ -342,6 +340,7 @@ M3 实现偏差(相对本章早先的设想,均待后续里程碑消除):
 | ~~M5~~ **已完成** | 生存期 Lite L1–L6 | ~~悬垂测试集编译期捕获率报告~~ **14/14 = 100%**(L4 以 @unsafe 显式担责定档,见收口记录) |
 | ~~M6~~ **已完成** | `cxx_legacy` 增强、`gc<T>`(保守式) | 与 zlib 双向互操作(结构化交付:本机缺库由 CI ubuntu 实测,见收口记录) |
 | M7+ | 自举实验、原生后端评估(**进行中**:M7a bench_gen 进 CI ✓;M7b/M7c 挂账清偿 ✓;M7 第二批 lifetime_runner/c2i_verify/ABI 文档 ✓——见各完成记录) | — |
+| M8 | 原生后端整编:多模块摊平、契约落地、回归/CI 接入(**已完成**,见 M8 系列完成记录) | examples 全量 + 契约 trap 于 native 全绿 |
 
 **M4 完成记录(2026-08-20)**:检查器补齐空安全(智能指针 `.` 自动解引用 → `cpp2::deref(p)->m` 空检 trap,`@unsafe`/`@unchecked` 可退出,块形式语法落地——DESIGN §6.2/§6.6 原样)与浮点→整型转换越界检查(`narrow_cast` 浮点重载,2^N 精确边界,NaN 一并捕获);`cpp2 audit` 输出每模块检查注入点计数(arith/index/deref/narrow,谓词与发射侧一致)与全部 `@unsafe`/`@unchecked` 位置(含行号);故障注入套件扩至 5 例(溢出/越界/除零/空解引用/浮点转换),全部断言 trap 消息**与 `.cpp2` 源位置**;模糊测试:`cpp2 fuzz` 内置确定性变异 fuzzer(seed 可复现,regression 内置 10000 次迭代零崩溃),parser 增加递归深度防护(3000 层嵌套 → 干净诊断而非爆栈);编译器矩阵:`toolchain.cpp` 按 `--version` 输出探测家族(本机 `g++` 为 clang 别名,仅看名字会误判),模块编译参数按 clang/gcc/msvc 分派;生成码缓存键混入工具版本,emit 演进不再被旧缓存掩盖。
 
@@ -498,6 +497,15 @@ M1–M6 至此全部完成。剩余为 M7+(自举实验、原生后端评估,研
 - **管线接线**:`run`/`build --backend=native`(Windows)改走 emit_native,替换 g++ 汇编/链接回退;build.sh 收编 native/*.cpp。
 - **语言覆盖对齐转译语义**:循环(字面量与非字面量界)、函数调用、inout 参数(形参记录 + 调用点传址,含 Out)、沿基类链的字段偏移与方法查找、字符串拼接(cpp2_strcat + .data)、printf 格式化按类型分发、err() 携带源位置(.Lerrmsg)、析构器 return 跳过、div0 trap(.Lfmt_div0 rodata)。
 - 验证:循环累加(test_sum:`1..=100` 非字面量界 = 5050)、printf 多参、循环内 print 等 native 直出全部正确。
+
+**原生后端 M8 系列完成记录(2026-08-28 → 09-02)**:P1 之后至 M8 的整编,examples 全量(24+1)native 对拍全绿、契约 trap 对齐、验收入回归/CI。
+- **语言覆盖扩展**(Win64 发射器):保守式 GC 运行时(`cpp2_gc_alloc/mark/collect`,汇编写入,块表 `.Lgc_tab`,main 帧锚定扫描上界)+ `cpp2::gc_*` 桥;泛型单态化(调用点按实参类型实例化,`drain_mono_queue` 统一落位);variant 循环变量槽序(scan 期整组预留)+ int→double as-cast;虚分发 M7(vtable 全局槽 + `cpp2_vtinit` 启动填充 + vptr 间接 call,once virtual always virtual);智能指针 `make_unique/make_shared` v0(整对象拷贝,动态类型随对象保留)与 list 字面量/push_back/下标 trap;`@unsafe` 指针域(解引用/取地址/算术/赋值)与 arena 三连槽(`create/reset` 桥)。
+- **string 三槽二进制安全**(0667516):`ptr+size+cap` 自有表示替换 NUL 指针,`resize/data/size` 方法;**ABI 破坏性变更**,abi-freeze 升 v2(见该文 §6)。
+- **zlib native PASS**:z_* wrapper 走 zlib1.dll 导入表直连(compress/uncompress),cxx_legacy 块按模块特判豁免 mini-C 解析。
+- **M8 多模块整程序摊平**(`merge_for_native`,app 层公共设施):依赖模块声明按拓扑序搬移合并进单模块(含未导出内部名),导入表仅留 std,重跑单遍 sema 后走单模块发射;跨模块同名声明(含内部名)冲突显式报错;`run`/`build` 双路接入。multimod/app 三断言全对。
+- **契约落地(正确性修复)**:emit_win64 此前无 pre/post/invariant 任何引用,contract/invariant 示例属"假阳性通过"(检查被静默丢弃)。现于函数/方法入口发射 pre + invariant、统一返回点 `.Lret_` 发射 post + invariant(rax 缓存还原),`old()` 入口快照槽 + post 上下文拦截、`result` 读缓存槽;trap 消息 `cpp2 trap: <what> (<file>:<line>)` + exit(101) 与转译路径同格式,run.sh 断言复用。**顺带修复存量缺陷**:表达式路径 Binary 比较操作数序颠倒(`cmp rax,rcx` 实为 rhs OP lhs;if/while 走专用跳转路径从未暴露,契约把比较当值求值首次踩中)。
+- **验收接入回归/CI**:run.sh 增 native 段(契约 trap 用例 `run_case_native` ×3 + examples 输出对拍经 native_cmp.sh 汇总),回归 **111 用例全绿**;native_cmp.sh 默认列表平台化(Win64 全量 / SysV smoke 子集)+ 本机安全软件抖动双侧重试(native 文件实例重建 ×2 + 基线重生成);CI 增 native smoke 步骤。
+- **SysV 行为修复**:virtual/契约/不变量显式 unsup——此前 virtual 静默降级为静态分发(行为错误不报错)、契约静默丢弃;现均为干净失败。SysV 整体对齐(泛型/虚分发/GC/string 三槽等)记为挂账。
 
 ## 10. v0.x 明确不做
 

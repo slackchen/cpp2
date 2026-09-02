@@ -1,6 +1,6 @@
-# cpp2 运行时 ABI 冻结文档 v1(P0)
+# cpp2 运行时 ABI 冻结文档 v2(P0)
 
-> 状态:**v1 冻结草案** | 日期 2026-08-24 | 关联 [native-backend-eval.md](native-backend-eval.md) P0
+> 状态:**v2 冻结草案** | v1 2026-08-24,v2 2026-09-02(string 三槽,见 §6) | 关联 [native-backend-eval.md](native-backend-eval.md) P0
 > 本文定义任何原生后端(P1 直译后端起)必须保持的对外可见契约。
 > 冻结范围 = **转译模式下已隐式依赖的全部可观察行为**;未列出的 C++ 实现细节不属于 ABI。
 
@@ -12,7 +12,7 @@
 | `u8/u16/u32/u64` | 对应宽度无符号,LE | |
 | `float/double` | IEEE-754 单/双精度 | |
 | `bool/char/byte` | 1 字节 | `byte` = std::byte |
-| `string` | std::string(libstdc++/libc++ 布局) | 原生后端 P2 前**按不透明处理**,仅经运行时函数触碰 |
+| `string` | 转译模式:std::string(libstdc++/libc++ 布局);native(Win64):自有 `ptr+size+cap` 三槽(8B×3,二进制安全,`resize/data/size` 经槽访问) | **v2 变更**:native 自有表示取代"按不透明处理"(0667516);跨边界仅经 §5 运行时函数触碰的约束不变 |
 | `string_view` | ptr + len(16B) | |
 | `vector<T>/list<T>` | std::vector<T> | 同上,不透明 |
 | `T?` | std::optional<T> | |
@@ -71,7 +71,8 @@ expected<T> ≈ { uint8 index; union { T value; error error; } }   // index: 0=v
 
 ## 6. 版本化
 
-- `CPP2_ABI_VERSION = 1`(本文)
+- `CPP2_ABI_VERSION = 2`(本文)
+- **v1 → v2(2026-09-02)**:native(Win64)string 表示从"std::string 不透明"改为自有 `ptr+size+cap` 三槽——破坏性变更,缓存全量失效
 - 工具版本串(kVersion)混入缓存键:任何 ABI 破坏性变更必须提升版本 → 缓存全量失效
 - .c2i v1(SHA-256 接口哈希)独立演进;接口文本格式变更同样使缓存失效
 
