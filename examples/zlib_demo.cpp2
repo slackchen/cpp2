@@ -57,7 +57,9 @@ main: () -> int = {
     ulen: i64 = msg.size() as i64;
     rc2 := z_uncompress(raw.data(), ulen, packed.data(), dlen);
 
-    std::println("compress rc={0}: {1} -> {2} bytes", rc1, msg.size(), dlen);
+    // 压缩后字节数是实现细节(真 zlib deflate 与 native z_* shim stored-block 不同),
+    // 只打印对拍两侧一致的事实:rc、载荷大小、往返一致性
+    std::println("compress rc={0}: payload {1} bytes", rc1, msg.size());
     std::println("uncompress rc={0}: roundtrip-equal={1}", rc2, raw == msg);
     return 0;
 }

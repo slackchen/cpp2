@@ -1,14 +1,14 @@
 # cpp2 — 演进式 C++ 2.0
 
 与 C++ 生态 100% 互操作、零开销、重写语法与编译模型的"下一代 C++"。
-**M1–M8 完成**(转译器全链路 + 生存期安全 + 区域/保守 GC 内存层 + 原生后端:Win64 零 CRT 直出 PE、契约落地、多模块摊平),回归 **111 用例全绿**,examples 于 native 模式 **24+1 全对拍**。
+**M1–M8 完成**(转译器全链路 + 生存期安全 + 区域/保守 GC 内存层 + 原生后端:Win64 零 CRT 直出 PE、契约落地、多模块摊平),回归 **113 用例全绿**,examples 于 native 模式 **24+1 全对拍**。
 
 ## 快速上手
 
 ```bash
 bash build.sh                       # 构建 cpp2 工具(llvm-mingw / gcc / clang,C++23)
 ./.cpp2build/cpp2.exe run examples/showcase.cpp2    # 全特性一览:编译 + 运行(Linux/macOS 产物无 .exe 后缀)
-bash tests/run.sh                   # 全量回归 111 项(末段含 native 对拍)
+bash tests/run.sh                   # 全量回归 113 项(末段含 native 对拍)
 ```
 
 编辑器:`editors/vscode` 插件(语法分色 / `cpp2 check` 实时诊断 / 补全 / 大纲 / Run),
@@ -56,7 +56,7 @@ main: () -> int = {
 | 类型 | type/方法/继承/invariant、enum、variant(match 穷尽)、泛型 + concept、optional(`T?`) |
 | 安全 | 下标/溢出/除零/空解引用/收窄 trap;契约 pre/post/old/result;**生存期 Lite L1–L6**(悬垂捕获率 14/14);`@unsafe`/`@unchecked` 白纸黑字 |
 | 错误 | `throws` → `cpp2::expected`;`?`/`!`/`or`/if-let/match;编译器强制处理 |
-| 互操作 | cxx_legacy 原文块、无体声明、zlib 双向(CI 实测);export-headers 供纯 Cpp1 消费 |
+| 互操作 | cxx_legacy 原文块、无体声明、zlib 双向(vendored 库本机实测 + CI 矩阵);export-headers 供纯 Cpp1 消费 |
 | 内存 | unique/shared/weak、arena(+arena_ptr 逃逸检查)、可选保守式 gc |
 | 工具 | run/check/build/transpile/export-headers/audit/fuzz;千单元压测(24.7s 全量 / 1.8s no-op);`.c2i` v1(SHA-256) |
 | 原生后端 | Win64 零 CRT 直出 PE(examples 24+1 对拍)+ SysV 整数核心 smoke(CI);契约 pre/post/invariant/old()/result 出入口检查;泛型单态化、虚分发、保守 GC、string 三槽、vector v0、cxx_legacy mini-C + unsafe 指针、zlib;多模块整程序摊平 |

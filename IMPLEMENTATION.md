@@ -282,8 +282,8 @@ bash tools/native_cmp.sh -v 名称  # 单例(裸名或路径)+ 失败 diff
 `rm+cp` 重建实例后可执行。脚本因此经 `cpp2 build --backend=native` 取产物并重建文件实例;
 无此类拦截的环境可直接 `cpp2 run --backend=native`。
 
-**截至本节修订(2026-09-02)的状态**(Win64 直出 PE,cygwin 宿主):**examples 全量 24 例 +
-multimod/app 整程序摊平,共 25 例对拍全绿**(zlib_demo 于本机受安全软件拦截 SKIP,CI 覆盖);
+**截至本节修订(2026-09-04)的状态**(Win64 直出 PE,cygwin 宿主):**examples 全量 24 例 +
+multimod/app 整程序摊平,共 25 例对拍全绿**(zlib_demo 经 vendored 库本机实测,见 §9 M8 系列 2026-09-04 记录);
 契约 trap 用例(pre/post/invariant)在 native 下同样 trap,消息与退出码(101)同转译路径格式。
 此前的已知缺口(smart/safety/gc_demo/generics/showcase/virtual_demo/unsafe_demo/zlib_demo)
 已全部清偿,详见 §9 M8 系列完成记录。当前 v0 边界:SysV 发射器仍是整数核心原型
@@ -352,7 +352,7 @@ M4 实现偏差:
 | gcc/msvc 模块参数 | 文档形态;真机验证由 `.github/workflows/ci.yml` 承担(ubuntu 真 gcc/clang 矩阵;本机 llvm-mingw 的 g++ 实为 clang 别名) | CI 首跑后按实际输出修正 |
 | libFuzzer | llvm-mingw(windows-gnu)不支持 `-fsanitize=fuzzer`(实测报错);harness 已备(`tool/fuzz/`),内置变异 fuzzer 承担本机职责;**Linux CI 工作流已就位**(M4 收口) | CI 首跑接入 libFuzzer 任务 |
 | ~~fuzz 覆盖~~ | ~~emit 未入 fuzz~~ **M4 收口已纳入**:sema 通过的输入继续过 emit_flatten + emit_headers 全管线(3000 迭代零崩溃);模块图加载仍走回归用例覆盖 | — |
-| zlib 环境 | 本机 llvm-mingw 缺 zlib.h/libz → 示例结构化交付 + run.sh 条件跳过;CI ubuntu 预装 zlib1g-dev 承担出口判据实测 | CI 首跑确认 |
+| ~~zlib 环境~~ | ~~本机 llvm-mingw 缺 zlib.h/libz~~ **已解(2026-09-04)**:zlib 1.3.1 vendored 源入库,本地构建 libz.a(产物不入库);run.sh 探测系统 -lz 失败时自动注入 vendored 路径;CI ubuntu zlib1g-dev 仍承担编译器矩阵实测 | — |
 | gc v1 边界 | 保守式:单线程/显式触发/无终结器/POD 式生命周期;死帧残留指针延迟回收(非确定,安全方向) | 可插拔后端接口按真实消费者需求评估 |
 
 **M2c 完成记录(2026-08-21)**:错误通道全链路落地——`throws` 函数签名降为 `cpp2::expected<R>`(`rt`:`std::expected` 单参别名 + `error{message()}` + `err(msg, loc)` + `must(e, loc)`);`?` 机械展开(求值到临时量 → 失败提前 `return std::unexpected(error)` → 解包),合法位置 = 变量初始化/赋值右值/`return`/裸语句,嵌套使用 sema 干净报错;`f()!` → `cpp2::must`(任意表达式位置);`f() or 默认` → `value_or`;`match f() { ok x / err e }` → `has_value()` 分支(穷尽性 = 恰好一 ok 一 err);`if x := f() { } else e := it { }` 同构展开;`err("消息")` 自动附 `.cpp2:行` 源位置。**编译器强制处理**:错误通道值出现在裸调用/`if`/`while` 条件/二元运算等未处理位置一律 sema 报错(DESIGN §8.1 "调用方必须处理"由类型系统背书)。契约:`pre:`/`post:`(函数与方法),`old()` 入口求值缓存,`result` 绑定返回值;post 时体包进 lambda——throws 函数 lambda 返回 `expected<R>`(`return R` 隐式转换、`?` 传播同型直达出口,失败跳过 post),非 throws 函数返回 `R` 本身;契约违反 → trap 不可捕获。audit 新增 contract 计数。接口哈希:方法签名补 `throws` 标记(签名变更触发依赖者重编)。过程中修复一个存量词法缺陷:`!=` 从未有过双字符规则(此前所有示例恰好只用 `==`),postfix `!` 落地后暴露,已补 `Ne` 词法。
@@ -506,6 +506,7 @@ M1–M6 至此全部完成。剩余为 M7+(自举实验、原生后端评估,研
 - **契约落地(正确性修复)**:emit_win64 此前无 pre/post/invariant 任何引用,contract/invariant 示例属"假阳性通过"(检查被静默丢弃)。现于函数/方法入口发射 pre + invariant、统一返回点 `.Lret_` 发射 post + invariant(rax 缓存还原),`old()` 入口快照槽 + post 上下文拦截、`result` 读缓存槽;trap 消息 `cpp2 trap: <what> (<file>:<line>)` + exit(101) 与转译路径同格式,run.sh 断言复用。**顺带修复存量缺陷**:表达式路径 Binary 比较操作数序颠倒(`cmp rax,rcx` 实为 rhs OP lhs;if/while 走专用跳转路径从未暴露,契约把比较当值求值首次踩中)。
 - **验收接入回归/CI**:run.sh 增 native 段(契约 trap 用例 `run_case_native` ×3 + examples 输出对拍经 native_cmp.sh 汇总),回归 **111 用例全绿**;native_cmp.sh 默认列表平台化(Win64 全量 / SysV smoke 子集)+ 本机安全软件抖动双侧重试(native 文件实例重建 ×2 + 基线重生成);CI 增 native smoke 步骤。
 - **SysV 行为修复**:virtual/契约/不变量显式 unsup——此前 virtual 静默降级为静态分发(行为错误不报错)、契约静默丢弃;现均为干净失败。SysV 整体对齐(泛型/虚分发/GC/string 三槽等)记为挂账。
+- **vendored zlib 本机收口(2026-09-04)**:third_party/zlib-1.3.1 本地构建 libz.a(产物照旧不入库);run.sh zlib 探测增 vendored 兜底(系统 -lz 优先;vendored 以相对路径注入——cpp2 将 CPP2_LDFLAGS 原样拼给后端编译器,Git Bash 风格绝对路径在 Windows 宿主会失配;探测通过后保持导出,末尾 native 段基线同链)。**顺带修真实缺陷**:zlib_demo 打印压缩后字节数,而 native z_* shim 为 stored-block(60→60)与真 zlib deflate(60→71)本就不同——输出改为后端无关事实(rc/载荷/往返一致),对拍才可比。回归 111→**113 用例全绿**(+m6/zlib ×2),native 对拍 24→**25 例**全对;third_party/README.md 修复字节损坏并补自动探测说明。
 
 ## 10. v0.x 明确不做
 

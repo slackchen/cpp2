@@ -161,17 +161,24 @@ run_case examples/gc_demo.cpp2 "kept.id=42 (survived)"      ok
 run_case examples/gc_demo.cpp2 "churn-last=998"             ok
 run_case examples/gc_demo.cpp2 "collections=1"              ok
 
-# zlib:头 + 链接双探测;可用时经 CPP2_LDFLAGS 注入 -lz(缺失则 CI 实测)
-ZLIB_OK=0
+# zlib:头 + 链接双探测;可用时经 CPP2_LDFLAGS 注入(系统 -lz 优先,vendored
+# third_party/zlib-1.3.1 兜底;均缺失则跳过、CI(ubuntu zlib1g-dev)实测)。
+# 相对路径注入:cpp2 以仓库根为 cwd 原样拼给后端编译器,POSIX/Windows 宿主通用。
+# CPP2_LDFLAGS 保持导出:末尾 native 段的 zlib_demo 基线同样需要链接 zlib。
+ZLIB_FLAGS=""
 printf '#include <zlib.h>\nint main(){return 0;}\n' > .cpp2build/zt.c
-if g++ .cpp2build/zt.c -lz -o .cpp2build/zt.bin >/dev/null 2>&1; then ZLIB_OK=1; fi
-if [[ $ZLIB_OK == 1 ]]; then
-    export CPP2_LDFLAGS="-lz"
+if g++ .cpp2build/zt.c -lz -o .cpp2build/zt.bin >/dev/null 2>&1; then
+    ZLIB_FLAGS="-lz"
+elif [[ -f third_party/zlib-1.3.1/libz.a ]] \
+     && g++ .cpp2build/zt.c -Ithird_party/zlib-1.3.1 -Lthird_party/zlib-1.3.1 -lz -o .cpp2build/zt.bin >/dev/null 2>&1; then
+    ZLIB_FLAGS="-Ithird_party/zlib-1.3.1 -Lthird_party/zlib-1.3.1 -lz"
+fi
+if [[ -n $ZLIB_FLAGS ]]; then
+    export CPP2_LDFLAGS="$ZLIB_FLAGS"
     run_case examples/zlib_demo.cpp2 "compress rc=0"        ok
     run_case examples/zlib_demo.cpp2 "roundtrip-equal=true" ok
-    unset CPP2_LDFLAGS
 else
-    echo "SKIP m6/zlib (zlib not linkable on this host; covered by CI)"
+    echo "SKIP m6/zlib (zlib not linkable; build vendored lib per third_party/README.md; covered by CI)"
 fi
 
 # ── M7b:挂账清偿冒烟(移位/管道/显式捕获/if 表达式体/out 出口)──
