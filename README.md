@@ -7,8 +7,8 @@
 
 ```bash
 bash build.sh                       # 构建 cpp2 工具(llvm-mingw / gcc / clang,C++23)
-./.cpp2build/cpp2.exe run examples/showcase.cpp2    # 全特性一览:编译 + 运行
-bash tests/run.sh                   # 全量回归 94 项
+./.cpp2build/cpp2.exe run examples/showcase.cpp2    # 全特性一览:编译 + 运行(Linux/macOS 产物无 .exe 后缀)
+bash tests/run.sh                   # 全量回归 111 项(末段含 native 对拍)
 ```
 
 编辑器:`editors/vscode` 插件(语法分色 / `cpp2 check` 实时诊断 / 补全 / 大纲 / Run),
@@ -48,7 +48,7 @@ main: () -> int = {
 }
 ```
 
-## 特性矩阵(M1–M6)
+## 特性矩阵(M1–M8)
 
 | 域 | 内容 |
 |---|---|
@@ -59,11 +59,13 @@ main: () -> int = {
 | 互操作 | cxx_legacy 原文块、无体声明、zlib 双向(CI 实测);export-headers 供纯 Cpp1 消费 |
 | 内存 | unique/shared/weak、arena(+arena_ptr 逃逸检查)、可选保守式 gc |
 | 工具 | run/check/build/transpile/export-headers/audit/fuzz;千单元压测(24.7s 全量 / 1.8s no-op);`.c2i` v1(SHA-256) |
+| 原生后端 | Win64 零 CRT 直出 PE(examples 24+1 对拍)+ SysV 整数核心 smoke(CI);契约 pre/post/invariant/old()/result 出入口检查;泛型单态化、虚分发、保守 GC、string 三槽、vector v0、cxx_legacy mini-C + unsafe 指针、zlib;多模块整程序摊平 |
 
 ## 文档
 
 - [DESIGN.md](DESIGN.md) — 语言规范(v0.1)
 - [IMPLEMENTATION.md](IMPLEMENTATION.md) — 实现方案 + 全里程碑完成记录与偏差表
+- [docs/abi-freeze.md](docs/abi-freeze.md) — 运行时 ABI 冻结文档(v2)
 - [docs/native-backend-eval.md](docs/native-backend-eval.md) — M7 原生后端评估
 
 ## 定位
