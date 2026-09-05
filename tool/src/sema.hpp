@@ -19,7 +19,8 @@ struct Type {
         U8, U16, U32, U64,               // 无符号
         Float, Double, String, StringView,
         NamedStruct, NamedEnum,
-        Container,                        // vector/list/map/... 有下标
+        Container,                        // vector/list/... 有下标
+        Map,                              // map<K,V>:键值容器,无整数下标(M9)
         SmartPtr,                         // unique/shared/weak → pointee
         Error,                            // cpp2::error 值(match err 臂 / else 绑定)
         ErrVal,                           // err("msg") 的构造值(return 时转 unexpected)
@@ -33,7 +34,8 @@ struct Type {
     Kind kind = Unknown;
     std::string name;                     // 结构体/枚举/variant 名,或容器名
     std::shared_ptr<Type> pointee;        // SmartPtr 指向类型(间接:避免自包含)
-    std::shared_ptr<Type> element;        // Container 元素类型
+    std::shared_ptr<Type> element;        // Container 元素类型 / Map 值类型
+    std::shared_ptr<Type> key;            // Map 键类型(M9)
     bool is_const = false;
     bool is_expected = false;             // 错误通道值:expected<value, error>(throws 调用结果)
     std::shared_ptr<Type> value;          // expected 的值类型(is_expected 时有效)
@@ -108,6 +110,8 @@ struct Type {
         case NamedStruct: return name;
         case NamedEnum: return name;
         case Container: return name + "<" + elem().display() + ">";
+        case Map: return name + "<" + (key ? key->display() : "?") + ", "
+                       + elem().display() + ">";
         case SmartPtr: return "unique<" + deref().display() + ">";
         case Error: return "error";
         case ErrVal: return "err-value";

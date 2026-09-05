@@ -5,6 +5,7 @@
 #pragma once
 #include "../native.hpp"
 
+#include <functional>
 #include <iostream>
 #include <map>
 #include <set>
@@ -152,6 +153,49 @@ protected:
             unsup("global '" + g.name + "' requires an integer literal initializer");
     }
 
+    // M9:bare map 在 native 显式 unsup(无降级实现,转译回退兜底);
+    // 扫描形参 + 函数体内的局部声明,凡 map<K,V> 即拒。
+    void check_native_no_map(ast::FuncDecl& f)
+    {
+        auto is_map_type = [](ast::TypeUse const& t) {
+            return t.parts.size() == 1 && t.parts[0] == "map";
+        };
+        for (auto& p : f.params)
+            if (is_map_type(p.type))
+                unsup("map is not supported on the native backend: '" + f.name + "'");
+        std::function<void(ast::Stmt*)> walk = [&](ast::Stmt* s) {
+            if (!s) return;
+            switch (s->kind()) {
+            case ast::Stmt::Block:
+                for (auto& st : static_cast<ast::BlockStmt*>(s)->stmts) walk(st.get());
+                break;
+            case ast::Stmt::Var: {
+                auto& v = static_cast<ast::VarStmt&>(*s);
+                if (v.has_type && is_map_type(v.type))
+                    unsup("map is not supported on the native backend: '" + f.name + "'");
+                break;
+            }
+            case ast::Stmt::If: {
+                auto& i = static_cast<ast::IfStmt&>(*s);
+                walk(i.then_block.get());
+                walk(i.else_block.get());
+                break;
+            }
+            case ast::Stmt::While:
+                walk(static_cast<ast::WhileStmt&>(*s).body.get());
+                break;
+            case ast::Stmt::For:
+                walk(static_cast<ast::ForStmt&>(*s).body.get());
+                break;
+            case ast::Stmt::Match:
+                for (auto& arm : static_cast<ast::MatchStmt&>(*s).arms) walk(arm.body.get());
+                break;
+            default: break;
+            }
+        };
+        if (f.has_block_body) walk(f.block_body.get());
+    }
+
     void precheck()
     {
         std::cerr << "[native] precheck structs " << m_->structs.size() << " funcs " << m_->funcs.size() << std::endl;
@@ -178,7 +222,7 @@ protected:
         // enum 允许：底层 int，成员按 0..n-1 分配（与 C++ enum class 一致）
         // variant 允许：候选均为 int struct（如 Circle/Rect），match 穷尽
         // concept 允许：纯声明无代码形态，约束检查在 sema 完成，发射期直接略过
-        for (auto& f : m_->funcs) check_func(f);
+        for (auto& f : m_->funcs) { check_func(f); check_native_no_map(f); }
         for (auto& g : m_->globals) check_global(g);
     }
 

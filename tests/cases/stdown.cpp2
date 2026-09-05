@@ -1,0 +1,91 @@
+// stdown.cpp2 — M9:自研 std 面(string/vector/map,rt/cpp2/std)冒烟
+// 接口 = cpp2 风格层:len/at/find/push/pop/first/last/get/insert/...
+// 内部 = 私有 rep_ 包 std 实现;语料另走 std 兼容层(size/push_back/...)
+module stdown;
+import std;
+
+word_count: (line: string) -> int = {
+    n: int = 0;
+    in_word: bool = false;
+    for c in line {
+        if c == ' ' { in_word = false; }
+        else {
+            if !in_word { n += 1; }
+            in_word = true;
+        }
+    }
+    return n;
+}
+
+main: () -> int = {
+    // ── string:len/at/substr/starts_with/find(T? 取代 npos)/+ ──
+    s: string = "hello cpp2";
+    std::println("S1: len={0} at4={1}", s.len(), s.at(4) == 'o');
+    std::println("S2: sub={0} starts={1}", s.substr(6, 4), s.starts_with("hello"));
+    p := s.find("cpp2");
+    if p {
+        std::println("S3: find={0}", *p);
+    } else {
+        std::println("S3: missing");
+    }
+    miss := s.find("rust");
+    if miss {
+        std::println("S4: unexpected {0}", *miss);
+    } else {
+        std::println("S4: none=true");
+    }
+    joined := s + "!" + "ok";
+    std::println("S5: {0}", joined);
+
+    // ── vector:字面量 CTAD/push/pop/at/first/last/for-in ──
+    v: vector<int> := {3, 1, 2};
+    v.push(9);
+    std::println("V1: len={0} at={1} first={2} last={3}", v.len(), v.at(0), *v.first(), *v.last());
+    top := v.pop();
+    if top {
+        std::println("V2: pop={0} len={1}", *top, v.len());
+    }
+    sum: int = 0;
+    for x in v { sum += x; }
+    std::println("V3: sum={0}", sum);
+
+    // ── map:insert/get/contains/remove/for-in(有序迭代)/无 m[k] ──
+    ages: map<string, int> := {};
+    ages.insert("ada", 36);
+    ages.insert("grace", 45);
+    ages.insert("alan", 41);
+    g := ages.get("grace");
+    if g {
+        std::println("M1: get grace={0}", *g);
+    } else {
+        std::println("M1: missing");
+    }
+    g2 := ages.get("knuth");
+    if g2 {
+        std::println("M2: unexpected {0}", *g2);
+    } else {
+        std::println("M2: none=true");
+    }
+    std::println("M3: contains ada={0} knuth={1} len={2}",
+                 ages.contains("ada"), ages.contains("knuth"), ages.len());
+    ages.remove("alan");
+    std::println("M4: after remove len={0} has alan={1}", ages.len(), ages.contains("alan"));
+    joined2: string = "";
+    for kv in ages {
+        if joined2.len() > 0 { joined2 += ","; }
+        joined2 += kv.first + "=";
+        joined2 += std::to_string(kv.second);
+    }
+    std::println("M5: {0}", joined2);
+
+    // ── 混合:string 进函数,map 持 string 键(有序容器用 <=>)──
+    std::println("W: words={0}", word_count("one two  three"));
+
+    // ── std 兼容层(语料零迁移路径):size/push_back/[]/== ──
+    s2: string = "compat";
+    std::println("C1: size={0} eq={1}", s2.size(), s2 == "compat");
+    w: vector<int> := {1, 2};
+    w.push_back(3);
+    std::println("C2: size={0} at2={1}", w.size(), w[2]);
+    return 0;
+}

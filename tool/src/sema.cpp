@@ -56,6 +56,7 @@ std::string base_key(Type const& t)
     case Type::NamedEnum:
     case Type::Variant:
     case Type::Container:
+    case Type::Map:
         return t.name;
     default:
         return t.display();
@@ -250,6 +251,16 @@ private:
                 r.element = std::make_shared<Type>(type_from_use(tu.args[0]));
             return r;
         };
+        auto map_kv = [&]() -> Type {           // M9:map<K,V> 独立 kind(无整数下标)
+            Type r;
+            r.kind = Type::Map;
+            r.name = last;
+            if (!tu.args.empty())
+                r.key = std::make_shared<Type>(type_from_use(tu.args[0]));
+            if (tu.args.size() > 1)
+                r.element = std::make_shared<Type>(type_from_use(tu.args[1]));
+            return r;
+        };
 
         if (tu.parts.size() == 1) {
             if (last == "self") return t;            // concept 接口里的占位类型
@@ -285,8 +296,9 @@ private:
                 return p;
             }
             if (last == "vector" || last == "list" || last == "array"
-                || last == "span" || last == "map" || last == "set")
+                || last == "span" || last == "set")
             { t = container(); t.is_const = tu.is_const; return t; }
+            if (last == "map") { t = map_kv(); t.is_const = tu.is_const; return t; }
             if (last == "void") return t;      // Unknown
             if (find_struct(last)) {
                 t.kind = Type::NamedStruct; t.name = last;
@@ -1140,6 +1152,13 @@ private:
             if (b.kind == Type::Container) return b.elem();
             if (b.kind == Type::String || b.kind == Type::StringView)
                 return Type::of(Type::Char);
+            // M9:map 无 m[k] 下标(缺失键不许静默插入);取值走 get/at
+            if (b.kind == Type::Map) {
+                err(x.line, x.col,
+                    "map does not support subscripting; use get(k) (missing key as "
+                    "optional) or at(k) (missing key traps)");
+                return b.elem();
+            }
             // M6:指针下标 = 解引用语义(p[i] ≡ *(p+i);算术门禁在二元层)
             if (b.kind == Type::Pointer) return b.deref();
             return {};                              // 未知基类型:放行

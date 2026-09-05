@@ -2,6 +2,7 @@
 //                          + M3b headers 后端)
 #include "emit.hpp"
 #include "util.hpp"
+#include "stdbridge/registry.hpp"           // M9:stdbridge 单表(类型面)
 
 #include <unordered_map>
 #include <unordered_set>
@@ -45,6 +46,7 @@ std::string escape_path(std::string p)
 std::string prelude_includes()
 {
     return std::string("#include \"cpp2/support.hpp\"\n")
+         + "#include \"cpp2/std.hpp\"\n"        // M9:自研 std(string/vector/map)
          + "#include <cmath>\n#include <cstdint>\n#include <filesystem>\n"
            "#include <fstream>\n#include <optional>\n#include <string>\n"
            "#include <utility>\n#include <variant>\n#include <vector>\n";
@@ -371,24 +373,13 @@ private:
     }
 
     // ── 类型与名字映射(IMPL §4.7 stdbridge)───────────────────────
+    // 落点统一收进 stdbridge/registry.hpp 单表:string/vector/list/map →
+    // 自研 std(rt/cpp2/std),其余条目见该表;未注册名原样透传
+    // (std::... 直写 = 互操作 escape hatch,DESIGN §9.1)。
     static std::string map_type_name(std::string const& n)
     {
-        static std::unordered_map<std::string, std::string> const map{
-            {"int", "int"}, {"double", "double"}, {"float", "float"},
-            {"bool", "bool"}, {"void", "void"}, {"char", "char"},
-            {"i8", "std::int8_t"}, {"i16", "std::int16_t"},
-            {"i32", "std::int32_t"}, {"i64", "std::int64_t"},
-            {"u8", "std::uint8_t"}, {"u16", "std::uint16_t"},
-            {"u32", "std::uint32_t"}, {"u64", "std::uint64_t"},
-            {"string", "std::string"}, {"string_view", "std::string_view"},
-            {"list", "std::vector"}, {"vector", "std::vector"},
-            {"byte", "std::byte"},
-            {"unique", "std::unique_ptr"}, {"shared", "std::shared_ptr"},
-            {"weak", "std::weak_ptr"},
-            {"arena", "cpp2::arena"}, {"arena_ptr", "cpp2::arena_ptr"},   // M6
-        };
-        auto it = map.find(n);
-        return it != map.end() ? it->second : n;
+        if (auto* r = stdbridge::map_type(n)) return *r;
+        return n;
     }
 
     std::string type_str(ast::TypeUse const& t)
@@ -633,7 +624,8 @@ private:
         case ast::Expr::ListLit: {
             auto& l = static_cast<ast::ListLitExpr&>(e);
             if (l.elements.empty()) return "{}";   // 声明侧已定型:list<int> v = {}
-            std::string s = "std::vector{";
+            // M9:自研 vector CTAD(list/vector 都落 cpp2::vector,rgstr 表驱动)
+            std::string s = map_type_name("vector") + "{";
             for (size_t i = 0; i < l.elements.size(); ++i) {
                 if (i) s += ", ";
                 s += expr(*l.elements[i]);
@@ -1131,7 +1123,7 @@ private:
         case sema::Type::Char: return "char";
         case sema::Type::Float: return "float";
         case sema::Type::Double: return "double";
-        case sema::Type::String: return "std::string";
+        case sema::Type::String: return map_type_name("string");   // cpp2::string(M9)
         case sema::Type::StringView: return "std::string_view";
         case sema::Type::NamedStruct:
         case sema::Type::NamedEnum:
@@ -1140,6 +1132,9 @@ private:
             return t.name;
         case sema::Type::Container:
             return map_type_name(t.name) + "<" + sema_type_cpp(t.elem()) + ">";
+        case sema::Type::Map:                                       // M9:bare map
+            return map_type_name(t.name) + "<" + sema_type_cpp(*t.key)
+                 + ", " + sema_type_cpp(t.elem()) + ">";
         default:
             return cpp_type_of(t);
         }

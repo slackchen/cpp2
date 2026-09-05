@@ -810,7 +810,7 @@ export compress: (data: span<const byte>) -> vector<byte> throws = {
 1. **legacy 名字默认模块内部**,不得出现在 `export` 签名中——公开 API 必须用 C++2 类型重新包裹。
 2. legacy 代码中的指针运算、可疑转换必须包在 `@unsafe` 块内(6.6 的审计因此覆盖互操作面)。
 3. 宏不会逃逸出桥接块;桥接单元是被审计、被隔离的"防波堤"。
-4. 标准库以 `std` 模块形式随工具链提供(优先映射到 C++ 标准库模块,缺省时由工具链自动生成的桥接垫片承担)。
+4. **标准库 = 自研 std 面(M9)**:`string`/`vector`/`map` 由工具链自有运行时承载(rt/cpp2/std,接口为 cpp2 风格:len/at/find(T? 取代 npos)/push/pop/get/insert/...;内部以私有 `rep_` 包 std 实现,可整体替换)。表示与接口冻结见 [abi-freeze](docs/abi-freeze.md) v3。直写 `std::...` 不经映射,**保留为互操作 escape hatch**(跨接 C++ 生态、legacy 块配套);`string_view`/`set`/`array`/`span` 等其余 std 名维持透传,后续里程碑逐个收编。
 
 ### 9.2 异常边界
 

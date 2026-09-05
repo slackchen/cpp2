@@ -1,6 +1,6 @@
-# cpp2 运行时 ABI 冻结文档 v2(P0)
+# cpp2 运行时 ABI 冻结文档 v3(P0)
 
-> 状态:**v2 冻结草案** | v1 2026-08-24,v2 2026-09-02(string 三槽,见 §6) | 关联 [native-backend-eval.md](native-backend-eval.md) P0
+> 状态:**v3 冻结草案** | v1 2026-08-24,v2 2026-09-02(string 三槽),v3 2026-09-05(自研 std 面,见 §6) | 关联 [native-backend-eval.md](native-backend-eval.md) P0
 > 本文定义任何原生后端(P1 直译后端起)必须保持的对外可见契约。
 > 冻结范围 = **转译模式下已隐式依赖的全部可观察行为**;未列出的 C++ 实现细节不属于 ABI。
 
@@ -12,9 +12,10 @@
 | `u8/u16/u32/u64` | 对应宽度无符号,LE | |
 | `float/double` | IEEE-754 单/双精度 | |
 | `bool/char/byte` | 1 字节 | `byte` = std::byte |
-| `string` | 转译模式:std::string(libstdc++/libc++ 布局);native(Win64):自有 `ptr+size+cap` 三槽(8B×3,二进制安全,`resize/data/size` 经槽访问) | **v2 变更**:native 自有表示取代"按不透明处理"(0667516);跨边界仅经 §5 运行时函数触碰的约束不变 |
-| `string_view` | ptr + len(16B) | |
-| `vector<T>/list<T>` | std::vector<T> | 同上,不透明 |
+| `string` | 转译模式:`cpp2::string`(rt/cpp2/std/string.hpp,私有 `rep_` = std::string;**v3 变更**);native(Win64):自有 `ptr+size+cap` 三槽(8B×3,二进制安全,`resize/data/size` 经槽访问) | v2 变更:native 自有表示取代"按不透明处理"(0667516);跨边界仅经 §5 运行时函数触碰的约束不变;`rep_` 私有,外部码不得依赖 std::string 布局细节以外的东西(互操作仅经隐式转换 `std::string const&` / `std::string_view`) |
+| `string_view` | ptr + len(16B) | 不包装,维持 std |
+| `vector<T>/list<T>` | 转译模式:`cpp2::vector<T>`(rt/cpp2/std/vector.hpp,私有 `rep_` = std::vector;**v3 变更**);native:自有堆块 `[count][elems]` | 互操作经隐式转换 `std::vector<T>&/const&` |
+| `map<K,V>` | 转译模式:`cpp2::map<K,V>`(rt/cpp2/std/map.hpp,有序,私有 `rep_` = std::map;**v3 新增**——v2 中 bare map 无映射属破损状态) | native:unsup(转译回退) |
 | `T?` | std::optional<T> | |
 | `unique<T>/shared<T>/weak<T>` | 对应 std 智能指针 | |
 | `arena_ptr<T>` | {T* p; arena* a;}(16B) | rt/cpp2/arena.hpp |
@@ -71,8 +72,9 @@ expected<T> ≈ { uint8 index; union { T value; error error; } }   // index: 0=v
 
 ## 6. 版本化
 
-- `CPP2_ABI_VERSION = 2`(本文)
+- `CPP2_ABI_VERSION = 3`(本文)
 - **v1 → v2(2026-09-02)**:native(Win64)string 表示从"std::string 不透明"改为自有 `ptr+size+cap` 三槽——破坏性变更,缓存全量失效
+- **v2 → v3(2026-09-05)**:转译模式 string/vector/list 载体从 std 类型改为 `cpp2::string`/`cpp2::vector`(rt/cpp2/std,内部仍包 std 实现),bare map 从破损透传改为 `cpp2::map`——接口面变更,缓存全量失效(kVersion 1→2);native 侧表示不变,string/vector 机器码布局与 v2 一致
 - 工具版本串(kVersion)混入缓存键:任何 ABI 破坏性变更必须提升版本 → 缓存全量失效
 - .c2i v1(SHA-256 接口哈希)独立演进;接口文本格式变更同样使缓存失效
 

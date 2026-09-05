@@ -595,6 +595,44 @@ else
     echo "FAIL m2e/c2if-magic"; fail=$((fail+1))
 fi
 
+# ── M9:自研 std 面(rt/cpp2/std:string/vector/map,接口 cpp2 风格)──
+# 内部 rep_ 包 std;cpp2 风格层(len/at/find/push/pop/get/insert/...)
+# 与 std 兼容层(size/push_back/[])双轨;map 无 m[k] 下标
+run_case tests/cases/stdown.cpp2 "S1: len=10 at4=true"                          ok
+run_case tests/cases/stdown.cpp2 "S2: sub=cpp2 starts=true"                     ok
+run_case tests/cases/stdown.cpp2 "S3: find=6"                                   ok
+run_case tests/cases/stdown.cpp2 "S4: none=true"                                ok
+run_case tests/cases/stdown.cpp2 "S5: hello cpp2!ok"                            ok
+run_case tests/cases/stdown.cpp2 "V1: len=4 at=3 first=3 last=9"                ok
+run_case tests/cases/stdown.cpp2 "V2: pop=9 len=3"                              ok
+run_case tests/cases/stdown.cpp2 "V3: sum=6"                                    ok
+run_case tests/cases/stdown.cpp2 "M1: get grace=45"                             ok
+run_case tests/cases/stdown.cpp2 "M2: none=true"                                ok
+run_case tests/cases/stdown.cpp2 "M3: contains ada=true knuth=false len=3"      ok
+run_case tests/cases/stdown.cpp2 "M4: after remove len=2 has alan=false"        ok
+run_case tests/cases/stdown.cpp2 "M5: ada=36,grace=45"                          ok
+run_case tests/cases/stdown.cpp2 "W: words=3"                                   ok
+run_case tests/cases/stdown.cpp2 "C1: size=6 eq=true"                           ok
+run_case tests/cases/stdown.cpp2 "C2: size=3 at2=3"                             ok
+
+# 负例:map 无 m[k] 下标(缺失键不许静默插入;取值走 get/at)
+cat > .cpp2build/mapsub.cpp2 <<'EOF'
+module mapsub;
+import std;
+main: () -> int = {
+    ages: map<string, int> := {};
+    ages.insert("ada", 36);
+    x := ages["ada"];
+    std::println("{0}", x);
+    return 0;
+}
+EOF
+if "$CPP2" transpile .cpp2build/mapsub.cpp2 2>&1 | grep -q "map does not support subscripting"; then
+    echo "PASS m9/map-no-subscript"; pass=$((pass+1))
+else
+    echo "FAIL m9/map-no-subscript"; fail=$((fail+1))
+fi
+
 # ── native 后端:examples 输出对拍(转译基线逐字节;native_cmp.sh 承担)──
 nlog=".cpp2build/native_cmp.log"
 if bash tools/native_cmp.sh > "$nlog" 2>&1; then

@@ -169,7 +169,7 @@ std::string text = *std::move(__c2_try_0);
 - **整程序模式**:全部声明进一个 `.cpp`;非导出声明进匿名命名空间(内部链接),导出声明置于 `cpp2mod::<module>` 命名空间供整程序内互见
 - **headers 模式(M3b,build 默认)**:每模块 `.h` = 导出类型定义(方法仅声明)+ `inline` 全局 + 函数原型(模板函数整定义进头);实现片段 = 匿名命名空间内部实体 + 线外方法/函数定义,按 TU 预算装箱(`--max-tu-size`,默认 1 MiB 生成码,横向实测选型见 M3b 记录)。导出名落全局命名空间(与桥接模式同款约定);part 间无编译依赖 → 全量并行
 - **模块模式(M3,opt-in)**:`module app.config;` → `export module app.config;` + 定义;`.c2i` 同时产出
-- `import std;` → 生成物顶部按需 `#include <...>` 标准头(**"无头文件"是对用户源码的保证,生成物是实现细节**);stdbridge 提供名字映射表,`std.c2i` 随工具链预置
+- `import std;` → 生成物顶部按需 `#include <...>` 标准头(**"无头文件"是对用户源码的保证,生成物是实现细节**);stdbridge 提供名字映射表,`std.c2i` 随工具链预置。**M9 起类型面落地为单表**:`tool/src/stdbridge/registry.hpp`(string/vector/list/map → rt/cpp2/std 自研类型,标量/智能指针等其余条目照旧;未注册名原样透传 = `std::` 直写 escape hatch),emit 查表发射;函数/builtin 面后续接入同一登记点
 
 ### 4.8 `cxx_legacy` 与 `param`
 
@@ -507,6 +507,14 @@ M1–M6 至此全部完成。剩余为 M7+(自举实验、原生后端评估,研
 - **验收接入回归/CI**:run.sh 增 native 段(契约 trap 用例 `run_case_native` ×3 + examples 输出对拍经 native_cmp.sh 汇总),回归 **111 用例全绿**;native_cmp.sh 默认列表平台化(Win64 全量 / SysV smoke 子集)+ 本机安全软件抖动双侧重试(native 文件实例重建 ×2 + 基线重生成);CI 增 native smoke 步骤。
 - **SysV 行为修复**:virtual/契约/不变量显式 unsup——此前 virtual 静默降级为静态分发(行为错误不报错)、契约静默丢弃;现均为干净失败。SysV 整体对齐(泛型/虚分发/GC/string 三槽等)记为挂账。
 - **vendored zlib 本机收口(2026-09-04)**:third_party/zlib-1.3.1 本地构建 libz.a(产物照旧不入库);run.sh zlib 探测增 vendored 兜底(系统 -lz 优先;vendored 以相对路径注入——cpp2 将 CPP2_LDFLAGS 原样拼给后端编译器,Git Bash 风格绝对路径在 Windows 宿主会失配;探测通过后保持导出,末尾 native 段基线同链)。**顺带修真实缺陷**:zlib_demo 打印压缩后字节数,而 native z_* shim 为 stored-block(60→60)与真 zlib deflate(60→71)本就不同——输出改为后端无关事实(rc/载荷/往返一致),对拍才可比。回归 111→**113 用例全绿**(+m6/zlib ×2),native 对拍 24→**25 例**全对;third_party/README.md 修复字节损坏并补自动探测说明。
+
+**M9 完成记录(2026-09-05)——自研 std 面:string / vector / map**:方向定为 **100% 自有接口**(内部以私有 `rep_` 包对应 std 实现,可整体替换;cpp2 源码自举需语言先补泛型类型/构造器/`operator[]`/引用返回,列为后续里程碑,rt 头文件为当前载体)。
+- **rt 层**(`rt/cpp2/std/{string,vector,map}.hpp` + 伞头 `std.hpp`):**双轨 API**——std 兼容层(size/push_back/operator[]/begin/end/隐式转换)使既有语料零迁移;cpp2 风格层(len/at(越界 trap)/find → `T?` 取代 npos/substr/push/pop→`T?`/first/last/insert/get→`T?`/at/contains/remove)。map 不做 `m[k]` 下标(缺失键不许静默插入,sema 层干净诊断);迭代经 rep_ 有序遍历(对拍确定性)。格式化双路接入:`std::formatter<cpp2::string>` 特化(vformat 路径)+ namespace cpp2 内 `fmt_to_string` 重载({N} 回退路径经 ADL 命中,置于嵌套 stdx 会失配——实测确认的 ADL 边界)。
+- **编译器接线**:emit `map_type_name` 改查 stdbridge 单表(`tool/src/stdbridge/registry.hpp`,类型面;stdbridge 目录规划自 M2,本轮落地首块);`sema_type_cpp` String 分支同步 + 新增 Map 分支;ListLit 硬编码 `std::vector{` → 表驱动 `cpp2::vector{`(CTAD deduction guide 承接);prelude 增 `#include "cpp2/std.hpp"`。sema 新增 `Type::Map`(键值独立 kind;`is_indexable` 排除 → 不走整数下标检查;UFCS base_key = "map");string/vector 保留 String/Container kind 不动(`+` 推断、下标、生存期 L1、UFCS 全部照旧)→ **native 后端按 kind 分派的面零波及**。native 侧 bare map 显式 unsup(precheck 扫形参 + 局部声明,两发射器共享基类),无降级实现、干净失败转译回退。
+- **互操作实测修复**:llvm-mingw libc++ 的 `path::value_type = wchar_t`(Win32 API 后端),其 `__is_pathable` 只认 basic_string/basic_string_view/字符数组本尊——"先转 std::string 再入 path" 属两次用户转换不可行。`cpp2::string` 增 `operator std::filesystem::path()` 直达转换(lifetime_runner/c2i_verify 的 ifstream/ofstream/directory_iterator 依赖此面)。
+- **ABI**:abi-freeze v2 → **v3**(§1 表:转译模式 string/vector/map = cpp2 包装类型;native 侧三槽 string/堆块 vector 不变)→ 缓存键 kVersion 1 → 2 全量失效(§6 版本化)。
+- **自举适配**:`tools/lifetime_runner.cpp2` 的 `find(...) != std::string::npos` 惯用法改 `.has_value()`/if + `*`——find 语义变更是**破坏性语言面变更**(npos → `T?`),偏差表挂账;bootstrap 工具率先迁移,恰为本里程碑"自研 std 面被自家工具采用"的实证。语料其余源码零改动。
+- **验收**:新增 `tests/cases/stdown.cpp2`(string/vector/map cpp2 风格全扫 + std 兼容层抽查,16 断言)+ `m9/map-no-subscript` 负例;回归 113 → **130 用例全绿**(语料 113 项无一改动全绿),native 对拍 **25 例全绿**(zlib_demo 依 run.sh 同款 CPP2_LDFLAGS vendored 注入)。
 
 ## 10. v0.x 明确不做
 

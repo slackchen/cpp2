@@ -59,21 +59,21 @@ main: () -> int = {
 
         src := read_all(p);
         marker := first_line(src);
-        want_ok := marker.find("expect-ok") != std::string::npos;
+        want_ok := marker.find("expect-ok").has_value();   // M9:find -> T?(无 npos)
         emsg: string := "";
         empos := marker.find("expect-error: ");
-        if empos != std::string::npos {
-            emsg = marker.substr(empos + 14);
+        if empos {
+            emsg = marker.substr(*empos + 14);
         }
 
         total += 1;
         // 逐文件调用工具的 check(快速语义检查)
         out := run_capture(tool + " check \"" + p + "\" 2>&1");
-        has_err := out.find("error") != std::string::npos;
+        has_err := out.find("error").has_value();
 
         ok := false;
         if want_ok      { ok = !has_err; }
-        else            { ok = has_err && (emsg.size() == 0 || out.find(emsg) != std::string::npos); }
+        else            { ok = has_err && (emsg.size() == 0 || out.find(emsg).has_value()); }
         if ok { caught += 1; std::println("PASS " + p); }
         else  { std::println("FAIL " + p); }
     }
