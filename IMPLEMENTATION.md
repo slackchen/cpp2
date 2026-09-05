@@ -60,8 +60,8 @@ cpp2/
   rt/cpp2/         # 运行时支持头(生成代码与工具共用)
   stdbridge/       # std 模块桥接描述 + 生成脚本
   examples/        # DESIGN.md 全部示例 = 验收用例
-  tests/           # cases/*.cpp2 + expected/*.txt + runner;bench_gen/bench_sweep 基准脚本
-  editors/vscode/  # VSCode 插件:语法分色 / cpp2 check 实时诊断 / 补全 / 大纲 / Run
+  tests/           # cases/*.cpp2 + expected/*.txt + runner;bench_gen/bench_sweep 基准脚本;vscode_ext_test.js = 插件补全单测(run.sh 末段接入)
+  editors/vscode/  # VSCode 插件:语法分色 / cpp2 check 实时诊断 / 上下文感知补全 / 大纲 / Run
 ```
 
 ---
@@ -515,6 +515,14 @@ M1–M6 至此全部完成。剩余为 M7+(自举实验、原生后端评估,研
 - **ABI**:abi-freeze v2 → **v3**(§1 表:转译模式 string/vector/map = cpp2 包装类型;native 侧三槽 string/堆块 vector 不变)→ 缓存键 kVersion 1 → 2 全量失效(§6 版本化)。
 - **自举适配**:`tools/lifetime_runner.cpp2` 的 `find(...) != std::string::npos` 惯用法改 `.has_value()`/if + `*`——find 语义变更是**破坏性语言面变更**(npos → `T?`),偏差表挂账;bootstrap 工具率先迁移,恰为本里程碑"自研 std 面被自家工具采用"的实证。语料其余源码零改动。
 - **验收**:新增 `tests/cases/stdown.cpp2`(string/vector/map cpp2 风格全扫 + std 兼容层抽查,16 断言)+ `m9/map-no-subscript` 负例;回归 113 → **130 用例全绿**(语料 113 项无一改动全绿),native 对拍 **25 例全绿**(zlib_demo 依 run.sh 同款 CPP2_LDFLAGS vendored 注入)。
+
+**M10 完成记录(2026-09-05)——固定长度数组 `T[N]`**:三设计决策定为 `T[N]` 后缀写法、`{1, 2, 3}` 字面量(复用 ListLit,`[1,2,3]` 保持 vector 语义)、native **直接实现**(非 M9 map 式 unsup 回退)。
+- **文法 + AST**(`parser.cpp`/`ast.hpp`):parse_type 在 `?`/`*` 之后追 `[N]` 后缀——`?`/`*` 修饰元素类型、`[N]` 修饰最外层(`int?[3]` = optional int 数组);`expr_ctx`(如 `as` 目标)禁用,避免吞后续运算符。`TypeUse` 增 `is_array/array_size`;`int[]`/非整字面量尺寸/≤0/多维均干净诊断(空尺寸指向 vector)。
+- **sema**(`sema.hpp/cpp`):`Type::Kind::Array` + `array_size`(`is_indexable` 纳入 → 下标类型检查/for-in 元素类型走既有路径;`display()` = `int[3]`);typed-ListLit 对数组声明目标做元素个数与逐元素类型核对(宽化/optional 包装规则同 vector 语料);字面量下标静态越界编译期拒绝,动态下标留给运行期 trap。
+- **转译**(`emit.cpp`):`T[N]` → `cpp2::array<ELEM, N>`(rt/cpp2/std/array.hpp,私有 `rep_` = `std::array`;cpp2 层 len/at/first/last,std 层 size/empty/fill/begin/end + operator==/!=);VarStmt/Assign/全局对数组目标的 ListLit 初始化发 `{…}` 聚合初始化,绕开 ListLit 默认的 `cpp2::vector{…}` CTAD;下标读经既有 `cpp2::index` 受检路径,零新增运行时函数。
+- **native 直接实现**(`emit_win64.cpp`/`emit_base.hpp`):栈上 N 连续 8B 槽(元素 k = base+k*8,base 为块内最低槽;scan_slots 预留 `#1..#N-1` 占位保证连续,同 struct 字段块布局);下标读/写静态 N 越界检查(`jae` → `.Lfmt_ix` trap exit 101,与 vector 同文本同码);for-in 静态计数循环;`len()/size()` = 编译期常量、`at(i)` 受检加载;整体拷贝/重赋值(名字与字面量)N 槽展开;整体 `==`/`!=` 逐元素展开。落地面 = 函数体局部声明:形参/返回类型/struct 字段/全局/string 元素(native 三槽布局)显式 unsup 转译回退(precheck 扫描,消息点名)。
+- **ABI/缓存**:abi-freeze v3 → **v4**(§1 增 `T[N]` 行,§6 增条目)→ 缓存 kVersion 2 → 3 全量失效。
+- **验收**:新增 `examples/arrays.cpp2`(int/double/char 全面走查:初始化/下标读写/for-in/len/at/整体拷贝/整体相等/重赋值)+ `tests/cases/array_oob_trap.cpp2`(动态下标 trap,消息与位置对齐转译)+ 负例 ×4(字面量个数/静态越界/空尺寸/多维);回归 130 → **143 用例全绿**,native 对拍 25 → **26 例全绿**(arrays 随 examples 全量进对拍,双后端逐字节一致)。插件 0.2.0 → **0.3.0**:`T[N]` 变量全类型记录、成员补全(len/at/first/last + std 层,T 替换进签名)、下标接收者推断(`a[1]` → 元素类型,顺带补齐 vector/string 下标链能力)、`arrd` 片段(vscode 单测 121 项全绿)。
 
 ## 10. v0.x 明确不做
 

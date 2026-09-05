@@ -8,5 +8,6 @@
 #include "cpp2/std/string.hpp"
 #include "cpp2/std/vector.hpp"
 #include "cpp2/std/map.hpp"
+#include "cpp2/std/array.hpp"
 
 #endif // CPP2_STD_HPP

@@ -633,6 +633,73 @@ else
     echo "FAIL m9/map-no-subscript"; fail=$((fail+1))
 fi
 
+# ── M10 固定长度数组:T[N](转译正例 + trap + 负例;native 侧经 native-cmp 对拍)──
+run_case examples/arrays.cpp2 "a = 1 20 3 len=3 total=24" ok
+run_case examples/arrays.cpp2 "b0=9 a0=1"                  ok
+run_case examples/arrays.cpp2 "eq=false ne=true"           ok
+run_case examples/arrays.cpp2 "at=3"                       ok
+run_case examples/arrays.cpp2 "z = 4 5"                    ok
+run_case examples/arrays.cpp2 "xyz len=3"                  ok
+run_case examples/arrays.cpp2 "1.5 2.5"                    ok
+run_case tests/cases/array_oob_trap.cpp2 "index out of bounds" trap "array_oob_trap.cpp2:6"
+
+cat > .cpp2build/arrcnt.cpp2 <<'EOF'
+module arrcnt;
+import std;
+main: () -> int = {
+    a: int[2] = {1, 2, 3};
+    return 0;
+}
+EOF
+if "$CPP2" transpile .cpp2build/arrcnt.cpp2 2>&1 | grep -q "array literal has 3 elements but 'int\[2\]' needs 2"; then
+    echo "PASS m10/array-literal-count"; pass=$((pass+1))
+else
+    echo "FAIL m10/array-literal-count"; fail=$((fail+1))
+fi
+
+cat > .cpp2build/arrooblit.cpp2 <<'EOF'
+module arrooblit;
+import std;
+main: () -> int = {
+    a: int[3] = {1, 2, 3};
+    x: int = a[5];
+    return 0;
+}
+EOF
+if "$CPP2" transpile .cpp2build/arrooblit.cpp2 2>&1 | grep -q "array index 5 out of bounds for 'int\[3\]'"; then
+    echo "PASS m10/array-static-oob"; pass=$((pass+1))
+else
+    echo "FAIL m10/array-static-oob"; fail=$((fail+1))
+fi
+
+cat > .cpp2build/arrnosz.cpp2 <<'EOF'
+module arrnosz;
+import std;
+main: () -> int = {
+    a: int[] = {1, 2, 3};
+    return 0;
+}
+EOF
+if "$CPP2" transpile .cpp2build/arrnosz.cpp2 2>&1 | grep -q "array needs a compile-time size"; then
+    echo "PASS m10/array-needs-size"; pass=$((pass+1))
+else
+    echo "FAIL m10/array-needs-size"; fail=$((fail+1))
+fi
+
+cat > .cpp2build/arrdim.cpp2 <<'EOF'
+module arrdim;
+import std;
+main: () -> int = {
+    a: int[2][2] = {{1, 2}, {3, 4}};
+    return 0;
+}
+EOF
+if "$CPP2" transpile .cpp2build/arrdim.cpp2 2>&1 | grep -q "multi-dimensional arrays are not supported"; then
+    echo "PASS m10/array-no-multidim"; pass=$((pass+1))
+else
+    echo "FAIL m10/array-no-multidim"; fail=$((fail+1))
+fi
+
 # ── native 后端:examples 输出对拍(转译基线逐字节;native_cmp.sh 承担)──
 nlog=".cpp2build/native_cmp.log"
 if bash tools/native_cmp.sh > "$nlog" 2>&1; then
@@ -644,6 +711,20 @@ else
     echo "FAIL native/examples-cmp"
     grep -E "^FAIL" "$nlog" | head -5
     fail=$((fail+1))
+fi
+
+# ── VSCode 插件:补全/解析纯函数 + 上下文分发单测(node,缺 node 跳过)──
+if command -v node >/dev/null 2>&1; then
+    if node tests/vscode_ext_test.js > .cpp2build/vscode_ext_test.log 2>&1; then
+        n=$(grep -c '^PASS' .cpp2build/vscode_ext_test.log)
+        echo "PASS vscode/ext-intellisense ($n 项)"; pass=$((pass+1))
+    else
+        echo "FAIL vscode/ext-intellisense"
+        grep '^FAIL' .cpp2build/vscode_ext_test.log | head -5
+        fail=$((fail+1))
+    fi
+else
+    echo "SKIP vscode/ext-intellisense (no node)"
 fi
 
 echo

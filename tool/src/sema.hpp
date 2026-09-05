@@ -28,14 +28,16 @@ struct Type {
         Generic,                          // 泛型类型参数 T(name 即参数名)
         NoneVal,                          // none 字面量 → std::nullopt
         Pointer,                          // T* 裸指针(M6;产生仅限 @unsafe,M5-L5)
-        ArenaPtr                          // arena_ptr<T>(M6;不得逃逸 arena 域,M5-L6)
+        ArenaPtr,                         // arena_ptr<T>(M6;不得逃逸 arena 域,M5-L6)
+        Array                             // T[N] 固定长度数组(M10;len 编译期常量,不衰减)
     };
 
     Kind kind = Unknown;
     std::string name;                     // 结构体/枚举/variant 名,或容器名
     std::shared_ptr<Type> pointee;        // SmartPtr 指向类型(间接:避免自包含)
-    std::shared_ptr<Type> element;        // Container 元素类型 / Map 值类型
+    std::shared_ptr<Type> element;        // Container/Array 元素类型 / Map 值类型
     std::shared_ptr<Type> key;            // Map 键类型(M9)
+    long long array_size = 0;             // Array 元素个数(M10)
     bool is_const = false;
     bool is_expected = false;             // 错误通道值:expected<value, error>(throws 调用结果)
     std::shared_ptr<Type> value;          // expected 的值类型(is_expected 时有效)
@@ -59,7 +61,7 @@ struct Type {
     bool is_indexable() const {
         // Pointer 不在此列:指针下标无长度概念,越界检查不适用
         // (sema.cpp Infer 已放行 p[i] = *(p+i);emit 走裸下标)
-        return kind == Container || kind == String || kind == StringView;
+        return kind == Container || kind == String || kind == StringView || kind == Array;
     }
     bool is_smart() const {
         return kind == SmartPtr;          // weak 也在此,成员访问按解引用处理
@@ -120,6 +122,7 @@ struct Type {
         case NoneVal: return "none";
         case Pointer: return deref().display() + "*";
         case ArenaPtr: return "arena_ptr<" + deref().display() + ">";
+        case Array: return elem().display() + "[" + std::to_string(array_size) + "]";
         }
         return "?";
     }

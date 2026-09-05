@@ -484,6 +484,21 @@ Ordered: concept = {
   ```
 - 用户自定义转换只能通过命名函数(`to_string` 风格)或类型内 `operator=`,不存在无痕隐式转换。
 
+### 5.8 固定长度数组 `T[N]`(M10)
+
+```cpp
+a: int[3] = {1, 2, 3};         // 类型后缀 [N],字面量 {…} 初始化
+a[1] = 20;                     // 下标读写:越界 trap(字面量下标编译期拒绝,动态下标运行期 trap)
+for x in a { ... }             // 遍历;x : int
+b: int[3] = a;                 // 整体拷贝 = 值语义
+a.len()                        // 编译期常量 N;at(i) 受检下标;first()/last() → T?
+```
+
+- **后缀次序**:`?`/`*` 先于 `[N]` 解析,即 `int?[3]` = "optional int 的数组"(`[N]` 修饰最外层)。
+- **不衰减**:数组就是数组,不作指针;长度是类型的一部分,`int[3]` 与 `int[4]` 是不同类型。
+- **动态长度用 `vector`**:`int[]` 非法,诊断直接指向 vector;多维数组 v0.x 不支持。
+- 转译模式载体 `cpp2::array<T, N>`(rt/cpp2/std,私有 `rep_` = `std::array`);native 模式栈上 N 连续槽直译。表示冻结见 [abi-freeze](docs/abi-freeze.md) v4。
+
 ---
 
 ## 6. 安全模型
@@ -810,7 +825,7 @@ export compress: (data: span<const byte>) -> vector<byte> throws = {
 1. **legacy 名字默认模块内部**,不得出现在 `export` 签名中——公开 API 必须用 C++2 类型重新包裹。
 2. legacy 代码中的指针运算、可疑转换必须包在 `@unsafe` 块内(6.6 的审计因此覆盖互操作面)。
 3. 宏不会逃逸出桥接块;桥接单元是被审计、被隔离的"防波堤"。
-4. **标准库 = 自研 std 面(M9)**:`string`/`vector`/`map` 由工具链自有运行时承载(rt/cpp2/std,接口为 cpp2 风格:len/at/find(T? 取代 npos)/push/pop/get/insert/...;内部以私有 `rep_` 包 std 实现,可整体替换)。表示与接口冻结见 [abi-freeze](docs/abi-freeze.md) v3。直写 `std::...` 不经映射,**保留为互操作 escape hatch**(跨接 C++ 生态、legacy 块配套);`string_view`/`set`/`array`/`span` 等其余 std 名维持透传,后续里程碑逐个收编。
+4. **标准库 = 自研 std 面(M9)**:`string`/`vector`/`map` 由工具链自有运行时承载(rt/cpp2/std,接口为 cpp2 风格:len/at/find(T? 取代 npos)/push/pop/get/insert/...;内部以私有 `rep_` 包 std 实现,可整体替换)。表示与接口冻结见 [abi-freeze](docs/abi-freeze.md) v4。直写 `std::...` 不经映射,**保留为互操作 escape hatch**(跨接 C++ 生态、legacy 块配套);`string_view`/`set`/`span` 等其余 std 名维持透传,后续里程碑逐个收编(固定长度数组由语言面 `T[N]` 承载,§5.8,不走 std 名)。
 
 ### 9.2 异常边界
 

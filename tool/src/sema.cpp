@@ -205,7 +205,15 @@ private:
     Type type_from_use(ast::TypeUse const& tu)
     {
         Type t = type_from_use_core(tu);
-        if (tu.is_optional) return as_wrapped(std::move(t), /*optional*/true);
+        if (tu.is_optional) t = as_wrapped(std::move(t), /*optional*/true);
+        if (tu.is_array) {                       // T[N](M10):?/* 修饰元素,[N] 最外层
+            Type a;
+            a.kind = Type::Array;
+            a.element = std::make_shared<Type>(std::move(t));
+            a.array_size = tu.array_size;
+            a.is_const = tu.is_const;
+            return a;
+        }
         return t;
     }
 
@@ -690,7 +698,30 @@ private:
             t.is_const = v.is_const;
             if (v.has_type && v.init && v.init->kind() == ast::Expr::ListLit) {
                 auto& lit = static_cast<ast::ListLitExpr&>(*v.init);
-                for (auto& el : lit.elements) infer(*el);
+                // M10:数组声明的字面量初始化 —— 数量与元素类型静态核对
+                if (t.kind == Type::Array) {
+                    long long n = (long long)lit.elements.size();
+                    if (n != t.array_size)
+                        err(v.line, v.col,
+                            "array literal has " + std::to_string(n) + " elements but '"
+                            + t.display() + "' needs " + std::to_string(t.array_size));
+                    Type et = t.elem();
+                    for (auto& el : lit.elements) {
+                        Type elt = infer(*el);
+                        if (!et.known() || !elt.known()) continue;
+                        if (et.display() == elt.display()) continue;
+                        if (elt.is_arith() && et.is_arith()
+                            && elt.is_widening_to(et)) continue;    // 字面量宽化
+                        if (et.is_optional
+                            && (elt.kind == Type::NoneVal
+                                || elt.display() == et.val().display())) continue;
+                        err(el->line, el->col,
+                            "array element type mismatch: expected '"
+                            + et.display() + "', got '" + elt.display() + "'");
+                    }
+                } else {
+                    for (auto& el : lit.elements) infer(*el);
+                }
             }
             declare(v.name, t, v.is_const, SymKind::Local, v.line, v.col);
             return;
@@ -747,7 +778,8 @@ private:
                 declare(f.var, Type::of(Type::Int), false, SymKind::Local, f.line, f.col);
             } else {
                 Type it = infer(*f.iterable);
-                Type elem = it.kind == Type::Container ? it.elem()
+                Type elem = it.kind == Type::Container || it.kind == Type::Array
+                                  ? it.elem()                   // M10:数组遍历出元素
                           : it.is_indexable() ? Type::of(Type::Char)
                           : Type{};
                 declare(f.var, elem, true, SymKind::Local, f.line, f.col);  // 只读迭代变量
@@ -1148,7 +1180,21 @@ private:
         case ast::Expr::Index: {
             auto& x = static_cast<ast::IndexExpr&>(e);
             Type b = infer(*x.base);
-            infer(*x.index);
+            Type it = infer(*x.index);
+            if (b.kind == Type::Array) {
+                // M10:字面量下标静态核对(越界在编译期拒绝;运行期由后端 trap 兜底)
+                if (it.is_int() && x.index->kind() == ast::Expr::Literal) {
+                    auto& lit = static_cast<ast::LiteralExpr&>(*x.index);
+                    if (lit.lit == ast::LitKind::Int) {
+                        long long v = std::stoll(lit.text);
+                        if (v < 0 || v >= b.array_size)
+                            err(x.line, x.col,
+                                "array index " + lit.text + " out of bounds for '"
+                                + b.display() + "'");
+                    }
+                }
+                return b.elem();
+            }
             if (b.kind == Type::Container) return b.elem();
             if (b.kind == Type::String || b.kind == Type::StringView)
                 return Type::of(Type::Char);

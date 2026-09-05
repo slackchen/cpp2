@@ -385,6 +385,13 @@ private:
     std::string type_str(ast::TypeUse const& t)
     {
         if (t.parts.empty()) return "void";
+        if (t.is_array) {   // T[N](M10):?/* 修饰元素类型,[N] 最外层 → cpp2::array
+            ast::TypeUse e = t;
+            e.is_array = false;
+            e.array_size = 0;
+            return "cpp2::array<" + type_str(e) + ", "
+                 + std::to_string(t.array_size) + ">";
+        }
         std::string s = map_type_name(t.parts[0]);
         for (size_t i = 1; i < t.parts.size(); ++i) s += "::" + t.parts[i];
         if (!t.args.empty()) {
@@ -557,6 +564,17 @@ private:
         }
         case ast::Expr::Assign: {
             auto& a = static_cast<ast::AssignExpr&>(e);
+            // M10:数组整体赋值 —— 字面量以聚合形式落(a = {1,2,3}),不落 vector CTAD
+            if (a.op == "=" && a.value->kind() == ast::Expr::ListLit
+                && type_of(*a.target).kind == sema::Type::Array) {
+                auto& l = static_cast<ast::ListLitExpr&>(*a.value);
+                std::string s = expr(*a.target) + " = {";
+                for (size_t i = 0; i < l.elements.size(); ++i) {
+                    if (i) s += ", ";
+                    s += expr(*l.elements[i]);
+                }
+                return s + "}";
+            }
             return expr(*a.target) + " " + a.op + " " + expr(*a.value);
         }
         case ast::Expr::Index: {
@@ -794,6 +812,18 @@ private:
                 // x := f()?; 机械展开(IMPL §4.3):求值 → 失败传播 → 解包绑定
                 std::string tmp = emit_try_core(static_cast<ast::TryExpr&>(*v.init));
                 out_ += pad() + type + " " + v.name + " = *std::move(" + tmp + ");\n";
+                break;
+            }
+            // M10:数组的字面量初始化直落聚合形式(type 已经是 cpp2::array<…>)
+            if (v.has_type && v.type.is_array
+                && v.init && v.init->kind() == ast::Expr::ListLit) {
+                auto& l = static_cast<ast::ListLitExpr&>(*v.init);
+                std::string s = "{";
+                for (size_t i = 0; i < l.elements.size(); ++i) {
+                    if (i) s += ", ";
+                    s += expr(*l.elements[i]);
+                }
+                out_ += pad() + type + " " + v.name + " = " + s + "};\n";
                 break;
             }
             out_ += pad() + type + " " + v.name + " = " + expr(*v.init) + ";\n";
@@ -1629,8 +1659,21 @@ private:
         sync_line(g.line);
         std::string type = g.has_type ? type_str(g.type)
                           : (g.is_const ? "auto const" : "auto");
-        out_ += prefix + type + " " + g.name
-              + (g.init ? " = " + expr(*g.init) : "") + ";\n";
+        // M10:数组的字面量初始化直落聚合形式(同 VarStmt;不落 vector CTAD)
+        std::string init;
+        if (g.init && g.has_type && g.type.is_array
+            && g.init->kind() == ast::Expr::ListLit) {
+            auto& l = static_cast<ast::ListLitExpr&>(*g.init);
+            init = " = {";
+            for (size_t i = 0; i < l.elements.size(); ++i) {
+                if (i) init += ", ";
+                init += expr(*l.elements[i]);
+            }
+            init += "}";
+        } else if (g.init) {
+            init = " = " + expr(*g.init);
+        }
+        out_ += prefix + type + " " + g.name + init + ";\n";
     }
 
     void emit_enum(ast::EnumDecl& e, std::string const& prefix = "")

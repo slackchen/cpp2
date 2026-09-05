@@ -219,11 +219,11 @@ std::optional<NativeMerged> merge_for_native(mods::Graph& g, fs::path const& roo
 }
 
 // ── .cpp2cache:.c2i 格式 v1(冻结,M2e)────────────────────────────
-// kVersion 随发射语义变更递增(M9:自研 std 面,string/vector/map 载体变更
-// → 旧缓存产物头文件/类型名失配,全量失效,abi-freeze §6)
+// kVersion 随发射语义变更递增(M10:T[N] 原生数组 → cpp2::array 载体,
+// 旧缓存不识别 [N] 类型文本,全量失效,abi-freeze §6)
 namespace {
 constexpr char kMagic[4] = {'C', '2', 'I', 'F'};
-constexpr std::uint32_t kVersion = 2;
+constexpr std::uint32_t kVersion = 3;
 
 void put_u32(std::string& o, std::uint32_t v)
 {

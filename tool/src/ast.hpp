@@ -22,6 +22,9 @@ struct TypeUse {
     bool is_const = false;
     bool is_optional = false;                // T? → std::optional<T>(M2d,DESIGN §6.4)
     bool is_pointer = false;                 // T* → 裸指针(M6,仅 @unsafe 内可产生)
+    bool is_array = false;                   // T[N] → cpp2::array<T, N>(M10,固定长度;
+                                             //   ?/* 先于 [N] 解析 = 修饰元素类型)
+    long long array_size = 0;                // is_array 时的元素个数(文法要求字面量)
     std::vector<std::string> parts;          // 限定名,如 {std, string}
     std::vector<TypeUse> args;               // 泛型实参
 

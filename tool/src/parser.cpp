@@ -684,6 +684,20 @@ private:
             t.is_pointer = true;                                 // T*(M6,L5)
             if (accept(lex::Tok::Star)) err("multi-level pointers are not supported (v0.x)");
         }
+        if (!expr_ctx && check(lex::Tok::LBracket)) {            // T[N] 原生数组(M10)
+            advance();
+            if (check(lex::Tok::RBracket))
+                err("array needs a compile-time size: write 'int[3]'; "
+                    "use vector for dynamic length");
+            if (!check(lex::Tok::IntLit))
+                err("array size must be an integer literal");
+            t.array_size = std::stoll(advance().text);
+            if (t.array_size <= 0) err("array size must be positive");
+            expect(lex::Tok::RBracket, "']' to close array size");
+            t.is_array = true;
+            if (check(lex::Tok::LBracket))
+                err("multi-dimensional arrays are not supported (v0.x)");
+        }
         return t;
     }
 

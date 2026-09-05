@@ -720,6 +720,14 @@ private:
         }
         case ast::Stmt::Var: {
             auto& v = static_cast<ast::VarStmt&>(*s);
+            // M10 原生数组:N 连续槽(元素 k 位于 base + k*8,base = 块内最低槽;
+            // #k 占位先分配保证连续,与 struct 字段块同布局)
+            if (v.has_type && v.type.is_array) {
+                for (long long k = v.type.array_size - 1; k >= 1; --k)
+                    slot_or_new(v.name + "#" + std::to_string(k));
+                slot_or_new(v.name);
+                break;
+            }
             // string 二进制安全:ptr + size + cap 三槽(与 arena 3槽同布局,便于 resize/data/size)
             if (is_string_var_decl(v)) {
                 slot_or_new(v.name + "#cap");
@@ -1064,6 +1072,33 @@ private:
             break;
         case ast::Stmt::Var: {
             auto& v = static_cast<ast::VarStmt&>(*s);
+            // M10 原生数组:N 连续栈槽,元素 k 位于 base + k*8(base = scan 预留的块内最低槽)
+            if (v.has_type && v.type.is_array) {
+                long long n = v.type.array_size;
+                int base_off = slot_or_new(v.name);
+                if (v.init && v.init->kind() == ast::Expr::ListLit) {
+                    auto& lit = static_cast<ast::ListLitExpr&>(*v.init);
+                    for (long long k = 0; k < (long long)lit.elements.size(); ++k) {
+                        eval(lit.elements[k].get());
+                        ins("mov QWORD PTR [rbp" + std::to_string(base_off + k * 8) + "], rax");
+                    }
+                } else if (v.init && v.init->kind() == ast::Expr::Name) {
+                    // 整体拷贝 b := a(值语义):N 槽展开
+                    auto& nm = static_cast<ast::NameExpr&>(*v.init);
+                    int src_off = slot_or_new(nm.parts[0]);
+                    for (long long k = 0; k < n; ++k) {
+                        ins("mov rax, QWORD PTR [rbp" + std::to_string(src_off + k * 8) + "]");
+                        ins("mov QWORD PTR [rbp" + std::to_string(base_off + k * 8) + "], rax");
+                    }
+                } else if (!(v.init && v.init->kind() == ast::Expr::Literal
+                             && static_cast<ast::LiteralExpr&>(*v.init).text == "_")) {
+                    // 无初始化:缺省零值(`= _` 才是未初始化,与标量一致)
+                    ins("xor eax, eax");
+                    for (long long k = 0; k < n; ++k)
+                        ins("mov QWORD PTR [rbp" + std::to_string(base_off + k * 8) + "], rax");
+                }
+                break;
+            }
             // arena 变量(M5-L6):[buf][off][live] 三连槽置零(init arena{} 无需求值)
             if (v.has_type && v.type.parts.size() == 1 && v.type.parts[0] == "arena") {
                 int aoff = slot_or_new(v.name);
@@ -1376,6 +1411,36 @@ private:
                             ins("mov rdx, QWORD PTR [rax+rcx+8]");
                             ins("mov QWORD PTR [rbp" + std::to_string(voff) + "], rdx");
                         }
+                        emit_stmt(fo.body.get());
+                        label(inc);
+                        ins("inc QWORD PTR [rbp" + std::to_string(ioff) + "]");
+                        ins("jmp " + top);
+                        label(fend);
+                        break_labels_.pop_back();
+                        continue_labels_.pop_back();
+                        break;
+                    }
+                    // M10 原生数组迭代:for x in arr → N 编译期已知,静态计数循环
+                    if (it_t.kind == sema::Type::Kind::Array) {
+                        int arr_off = slot_or_new(itn.parts[0]);
+                        int voff = slot_or_new(fo.var);
+                        int ioff = slot_or_new(fo.var + "#i");
+                        ins("xor eax, eax");
+                        ins("mov QWORD PTR [rbp" + std::to_string(ioff) + "], rax");
+                        std::string top = lbl("fortop"), inc = lbl("forinc"), fend = lbl("fend");
+                        label(top);
+                        ins("mov rax, QWORD PTR [rbp" + std::to_string(ioff) + "]");
+                        ins("cmp rax, " + std::to_string(it_t.array_size));
+                        ins("jge " + fend);
+                        break_labels_.push_back(fend);
+                        continue_labels_.push_back(inc);
+                        // var = arr[i](元素 k 位于 base + k*8)
+                        ins("mov rax, QWORD PTR [rbp" + std::to_string(ioff) + "]");
+                        ins("shl rax, 3");
+                        ins("lea rcx, QWORD PTR [rbp" + std::to_string(arr_off) + "]");
+                        ins("add rax, rcx");
+                        ins("mov rax, QWORD PTR [rax]");
+                        ins("mov QWORD PTR [rbp" + std::to_string(voff) + "], rax");
                         emit_stmt(fo.body.get());
                         label(inc);
                         ins("inc QWORD PTR [rbp" + std::to_string(ioff) + "]");
@@ -1854,6 +1919,33 @@ private:
             // 下标读:容器 = 堆块 [count][e0]...;越界 trap(M2 安全默认)
             auto& ix = static_cast<ast::IndexExpr&>(*e);
             if (ix.base->kind() != ast::Expr::Name) unsup("index base must be name");
+            // M10 原生数组:栈上 N 连续槽,N 编译期已知 → 静态尺寸越界检查
+            {
+                sema::Type bt = type_of(ix.base.get());
+                if (bt.kind == sema::Type::Kind::Array) {
+                    int arr_off = slot_or_new(
+                        static_cast<ast::NameExpr&>(*ix.base).parts[0]);
+                    std::string it_ = lbl("ixtrap"), id_ = lbl("ixdone");
+                    eval(ix.index.get());               // rax = 下标
+                    ins("cmp rax, " + std::to_string(bt.array_size));
+                    ins("jae " + it_);
+                    ins("mov rdx, rax");
+                    ins("shl rdx, 3");
+                    ins("add rdx, " + std::to_string(arr_off));
+                    ins("mov rax, QWORD PTR [rbp+rdx]");
+                    ins("jmp " + id_);
+                    label(it_);
+                    ins("lea rcx, .Lfmt_ix[rip]");
+                    ins("sub rsp, 32");
+                    ins("xor eax, eax");
+                    ins("call printf");
+                    ins("add rsp, 32");
+                    ins("mov rcx, 101");
+                    ins("call exit");
+                    label(id_);
+                    break;
+                }
+            }
             int ptr_off = slot_or_new("$ix_ptr");
             std::string it_ = lbl("ixtrap"), id_ = lbl("ixdone");
             eval(ix.base.get());                    // rax = 块指针
@@ -1975,6 +2067,66 @@ private:
                 --push_depth_;
                 ins("mov QWORD PTR [rcx], rax");
                 break;
+            }
+            // M10 原生数组下标赋值:a[i] = v(栈上 N 连续槽;越界 trap,与下标读同一 trap 文本)
+            if (a.target->kind() == ast::Expr::Index) {
+                auto& ix = static_cast<ast::IndexExpr&>(*a.target);
+                if (ix.base->kind() == ast::Expr::Name) {
+                    sema::Type bt = type_of(ix.base.get());
+                    if (bt.kind == sema::Type::Kind::Array) {
+                        if (a.op != "=") unsup("compound assign to array element");
+                        int arr_off = slot_or_new(
+                            static_cast<ast::NameExpr&>(*ix.base).parts[0]);
+                        int ix_off = slot_or_new("$ix_i");
+                        std::string it_ = lbl("ixtrap"), id_ = lbl("ixdone");
+                        eval(ix.index.get());           // 下标先行:越界时不求值右值
+                        ins("mov QWORD PTR [rbp" + std::to_string(ix_off) + "], rax");
+                        ins("cmp rax, " + std::to_string(bt.array_size));
+                        ins("jae " + it_);
+                        eval(a.value.get());            // rax = 右值
+                        ins("mov rcx, QWORD PTR [rbp" + std::to_string(ix_off) + "]");
+                        ins("mov rdx, rcx");
+                        ins("shl rdx, 3");
+                        ins("add rdx, " + std::to_string(arr_off));
+                        ins("mov QWORD PTR [rbp+rdx], rax");
+                        ins("jmp " + id_);
+                        label(it_);
+                        ins("lea rcx, .Lfmt_ix[rip]");
+                        ins("sub rsp, 32");
+                        ins("xor eax, eax");
+                        ins("call printf");
+                        ins("add rsp, 32");
+                        ins("mov rcx, 101");
+                        ins("call exit");
+                        label(id_);
+                        break;
+                    }
+                }
+            }
+            // M10 整体赋值 a = b / a = {…}(值语义):N 槽展开拷贝
+            if (a.target->kind() == ast::Expr::Name) {
+                sema::Type tt = type_of(a.target.get());
+                if (tt.kind == sema::Type::Kind::Array) {
+                    if (a.op != "=") unsup("compound assign to array");
+                    int d_off = slot_or_new(static_cast<ast::NameExpr&>(*a.target).parts[0]);
+                    if (a.value->kind() == ast::Expr::ListLit) {
+                        auto& lit = static_cast<ast::ListLitExpr&>(*a.value);
+                        for (long long k = 0; k < (long long)lit.elements.size(); ++k) {
+                            eval(lit.elements[k].get());
+                            ins("mov QWORD PTR [rbp" + std::to_string(d_off + k * 8) + "], rax");
+                        }
+                    } else if (a.value->kind() == ast::Expr::Name) {
+                        int s_off = slot_or_new(
+                            static_cast<ast::NameExpr&>(*a.value).parts[0]);
+                        for (long long k = 0; k < tt.array_size; ++k) {
+                            ins("mov rax, QWORD PTR [rbp" + std::to_string(s_off + k * 8) + "]");
+                            ins("mov QWORD PTR [rbp" + std::to_string(d_off + k * 8) + "], rax");
+                        }
+                    } else {
+                        unsup("array assignment value must be an array variable or literal");
+                    }
+                    break;
+                }
             }
             if (a.target->kind() != ast::Expr::Name) unsup("assignment form");
             auto& n = static_cast<ast::NameExpr&>(*a.target);
@@ -2515,6 +2667,42 @@ private:
                 }
             }
             if (!sd || !md) {
+                // M10 原生数组方法桥:len()/size() = 编译期常量 N;at(i) = 越界检查加载;
+                // 其余方法(first/last 返回 optional 等)显式 unsup → 转译回退
+                {
+                    auto btt = type_of(mem.base.get());
+                    if (btt.kind == sema::Type::Kind::Array) {
+                        if (mem.name == "len" || mem.name == "size") {
+                            ins("mov rax, " + std::to_string(btt.array_size));
+                            return;
+                        }
+                        if (mem.name == "at") {
+                            if (c.args.size() != 1) unsup("array.at needs exactly 1 argument");
+                            int arr_off = slot_or_new(base_name);
+                            std::string it_ = lbl("ixtrap"), id_ = lbl("ixdone");
+                            eval(c.args[0].get());              // rax = 下标
+                            ins("cmp rax, " + std::to_string(btt.array_size));
+                            ins("jae " + it_);
+                            ins("mov rdx, rax");
+                            ins("shl rdx, 3");
+                            ins("add rdx, " + std::to_string(arr_off));
+                            ins("mov rax, QWORD PTR [rbp+rdx]");
+                            ins("jmp " + id_);
+                            label(it_);
+                            ins("lea rcx, .Lfmt_ix[rip]");
+                            ins("sub rsp, 32");
+                            ins("xor eax, eax");
+                            ins("call printf");
+                            ins("add rsp, 32");
+                            ins("mov rcx, 101");
+                            ins("call exit");
+                            label(id_);
+                            return;
+                        }
+                        unsup("array method '" + mem.name
+                              + "' is not supported on the native backend");
+                    }
+                }
                 // 容器方法桥:vector 增长(push_back)
                 if (mem.name == "push_back") {
                     auto btt = type_of(mem.base.get());
@@ -3476,6 +3664,32 @@ private:
                 ins("test rax, rax");
                 ins("jne " + ne);
                 label(eq);
+                ins(b.op == "==" ? "mov rax, 1" : "xor eax, eax");
+                ins("jmp " + done);
+                label(ne);
+                ins(b.op == "==" ? "xor eax, eax" : "mov rax, 1");
+                label(done);
+                return;
+            }
+        }
+        // M10 原生数组整体相等:a == b / a != b → 逐元素展开比较
+        {
+            auto lt = type_of(b.lhs.get());
+            auto rt2 = type_of(b.rhs.get());
+            if (lt.kind == sema::Type::Kind::Array || rt2.kind == sema::Type::Kind::Array) {
+                if (!((b.op == "==" || b.op == "!=")
+                      && b.lhs->kind() == ast::Expr::Name && b.rhs->kind() == ast::Expr::Name))
+                    unsup("arrays support only whole-object ==/!= on the native backend");
+                int l_off = slot_or_new(static_cast<ast::NameExpr&>(*b.lhs).parts[0]);
+                int r_off = slot_or_new(static_cast<ast::NameExpr&>(*b.rhs).parts[0]);
+                long long n = lt.kind == sema::Type::Kind::Array ? lt.array_size
+                                                                 : rt2.array_size;
+                std::string ne = lbl("arrne"), done = lbl("arrdone");
+                for (long long k = 0; k < n; ++k) {
+                    ins("mov rax, QWORD PTR [rbp" + std::to_string(l_off + k * 8) + "]");
+                    ins("cmp rax, QWORD PTR [rbp" + std::to_string(r_off + k * 8) + "]");
+                    ins("jne " + ne);
+                }
                 ins(b.op == "==" ? "mov rax, 1" : "xor eax, eax");
                 ins("jmp " + done);
                 label(ne);

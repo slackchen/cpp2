@@ -145,6 +145,8 @@ protected:
 
     void check_global(ast::GlobalVar& g)
     {
+        if (g.type.is_array)
+            unsup("array globals are not supported on the native backend: '" + g.name + "'");
         auto k = scalar_kind(g.type);
         if (g.type.parts.size() != 1 || !is_int_kind(k))
             unsup("global '" + g.name + "' must be an explicitly-typed integer");
@@ -196,6 +198,59 @@ protected:
         if (f.has_block_body) walk(f.block_body.get());
     }
 
+    // M10:原生数组在 native 的落地面 = 函数体内局部声明/下标/遍历/整体拷贝/len/at;
+    // 形参、返回类型、struct 字段、全局 —— 越过 8B 槽模型的部分显式 unsup。
+    // 元素类型须为单 8B 槽标量;string 元素在 native 是 3 槽布局,不落槽模型 → 转译回退。
+    bool native_array_elem_ok(ast::TypeUse const& t)
+    {
+        if (t.parts.size() != 1) return false;
+        std::string const& n = t.parts[0];
+        if (n == "double" || n == "char") return true;
+        return is_int_kind(scalar_kind(t));
+    }
+
+    void check_native_no_array(ast::FuncDecl& f)
+    {
+        auto arr = [](ast::TypeUse const& t) { return t.is_array; };
+        for (auto& p : f.params)
+            if (arr(p.type))
+                unsup("array parameters are not supported on the native backend: '" + f.name + "'");
+        if (f.ret && arr(*f.ret))
+            unsup("array return types are not supported on the native backend: '" + f.name + "'");
+        std::function<void(ast::Stmt*)> walk = [&](ast::Stmt* s) {
+            if (!s) return;
+            switch (s->kind()) {
+            case ast::Stmt::Block:
+                for (auto& st : static_cast<ast::BlockStmt*>(s)->stmts) walk(st.get());
+                break;
+            case ast::Stmt::Var: {
+                auto& v = static_cast<ast::VarStmt&>(*s);
+                if (v.has_type && arr(v.type) && !native_array_elem_ok(v.type))
+                    unsup("native array elements must be int-family/bool/double/char: '"
+                          + v.name + "'");
+                break;
+            }
+            case ast::Stmt::If: {
+                auto& i = static_cast<ast::IfStmt&>(*s);
+                walk(i.then_block.get());
+                walk(i.else_block.get());
+                break;
+            }
+            case ast::Stmt::While:
+                walk(static_cast<ast::WhileStmt&>(*s).body.get());
+                break;
+            case ast::Stmt::For:
+                walk(static_cast<ast::ForStmt&>(*s).body.get());
+                break;
+            case ast::Stmt::Match:
+                for (auto& arm : static_cast<ast::MatchStmt&>(*s).arms) walk(arm.body.get());
+                break;
+            default: break;
+            }
+        };
+        if (f.has_block_body) walk(f.block_body.get());
+    }
+
     void precheck()
     {
         std::cerr << "[native] precheck structs " << m_->structs.size() << " funcs " << m_->funcs.size() << std::endl;
@@ -211,6 +266,9 @@ protected:
         check_legacy_blocks();               // 钩子:Win64 mini-C 解析;默认不支持
         for (auto& s : m_->structs) {
             for (auto& f : s.fields) {
+                if (f.type.is_array)
+                    unsup("struct field '" + f.name + "': array fields are not supported "
+                          "on the native backend");
                 auto k = scalar_kind(f.type);
                 bool ok = is_int_kind(k);
                 // string/double 字段:8B 槽存指针/位模式(v0 值语义)
@@ -222,7 +280,7 @@ protected:
         // enum 允许：底层 int，成员按 0..n-1 分配（与 C++ enum class 一致）
         // variant 允许：候选均为 int struct（如 Circle/Rect），match 穷尽
         // concept 允许：纯声明无代码形态，约束检查在 sema 完成，发射期直接略过
-        for (auto& f : m_->funcs) { check_func(f); check_native_no_map(f); }
+        for (auto& f : m_->funcs) { check_func(f); check_native_no_map(f); check_native_no_array(f); }
         for (auto& g : m_->globals) check_global(g);
     }
 

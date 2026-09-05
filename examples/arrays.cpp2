@@ -1,0 +1,32 @@
+module arrays;
+import std;
+
+main: () -> int = {
+    // M10 固定长度数组:T[N],字面量 {…} 初始化;len 编译期常量,不衰减
+    a: int[3] = {1, 2, 3};
+    a[1] = 20;                                  // 下标写
+    total: int = 0;
+    for x in a { total += x; }                  // for-in 遍历
+    std::print("a = {0} {1} {2} len={3} total={4}\n", a[0], a[1], a[2], a.len(), total);
+
+    b: int[3] = a;                              // 整体拷贝(值语义)
+    b[0] = 9;
+    std::print("b0={0} a0={1}\n", b[0], a[0]);
+
+    c: int[3] = {1, 2, 4};
+    std::print("eq={0} ne={1}\n", a == b, c != a);   // 整体相等/不等
+
+    i: int = 2;
+    std::print("at={0}\n", a.at(i));            // 受检下标
+
+    z: int[2] = {7, 8};
+    z = {4, 5};                                 // 重新赋字面量
+    std::print("z = {0} {1}\n", z[0], z[1]);
+
+    w: char[3] = {'x', 'y', 'z'};
+    std::print("{0}{1}{2} len={3}\n", w[0], w[1], w[2], w.len());
+
+    d: double[2] = {1.5, 2.5};
+    std::print("{0} {1}\n", d[0], d[1]);
+    return 0;
+}

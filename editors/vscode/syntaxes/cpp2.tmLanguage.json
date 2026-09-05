@@ -192,6 +192,18 @@
           "match": "\\b(const|mutates|throws|inout|out|move|copy|forward|in)\\b"
         },
         {
+          "name": "keyword.operator.conversion.cpp2",
+          "match": "\\bas\\b"
+        },
+        {
+          "name": "keyword.control.contract.cpp2",
+          "match": "\\b(pre|post|invariant)\\b(?=\\s*:)"
+        },
+        {
+          "name": "keyword.declaration.cpp2",
+          "match": "\\b(virtual|requires)\\b"
+        },
+        {
           "name": "constant.language.cpp2",
           "match": "\\b(true|false|none|some|self|_)\\b"
         },

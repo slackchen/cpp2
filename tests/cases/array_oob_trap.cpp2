@@ -1,0 +1,8 @@
+module array_oob_trap;
+import std;
+main: () -> int = {
+    a: int[3] = {1, 2, 3};
+    i: int = 5;
+    std::println("{0}", a[i]);
+    return 0;
+}

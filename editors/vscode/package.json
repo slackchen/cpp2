@@ -2,7 +2,7 @@
   "name": "cpp2-lang",
   "displayName": "C++2 (cpp2)",
   "description": "C++2 language support: syntax highlighting, diagnostics via cpp2 check, completions, outline, run/build commands",
-  "version": "0.1.0",
+  "version": "0.3.0",
   "publisher": "cpp2",
   "license": "MIT",
   "engines": {
