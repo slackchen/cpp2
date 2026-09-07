@@ -700,6 +700,48 @@ else
     echo "FAIL m10/array-no-multidim"; fail=$((fail+1))
 fi
 
+# ── M11 混动转义连接:native 后端 cxx_legacy 卸载(仅 Win64 发射器)──
+# mini-C 解析不了的 legacy C++ → <module>_legacy.dll(-shared)→ PE 导入表直连;
+# 无 cxx_legacy 的程序 native 零外部依赖不受影响(见零依赖断言)
+run_case examples/legacy_hybrid.cpp2 "fib(30) = 832040"    ok     # 转译基线(跨平台)
+run_case examples/legacy_hybrid.cpp2 "mix+ = 110"          ok
+run_case examples/legacy_hybrid.cpp2 "mix- = 93"           ok
+
+case "$(uname -s)" in
+    MINGW*|MSYS*|CYGWIN*)
+        # 全链路对拍:native 混动产物输出与转译基线逐字一致
+        if bash tools/native_cmp.sh legacy_hybrid > .cpp2build/legacy_hybrid_cmp.log 2>&1; then
+            echo "PASS m11/hybrid-native-cmp"; pass=$((pass+1))
+        else
+            echo "FAIL m11/hybrid-native-cmp"
+            grep -E "^(FAIL|SKIP)" .cpp2build/legacy_hybrid_cmp.log | head -3
+            fail=$((fail+1))
+        fi
+
+        # §9.2 桥边界(首步):legacy 异常 → stderr 说明 + exit 101(不穿越边界)
+        run_case_native tests/cases/legacy_hybrid_throw.cpp2 "legacy exception" "cls_boom"
+
+        # 零依赖约定:无 C++ 编译器时纯 native(无 cxx_legacy)仍须全链路可跑
+        # (转译后端在同样环境下必然失败,通过即证未走 C++ 工具链)
+        zdexe=$(CPP2_CXX=definitely-not-a-compiler.exe "$CPP2" build examples/loops.cpp2 --backend=native 2>/dev/null | grep -E '\.exe$' | tail -1)
+        if [[ -n "$zdexe" && -f "$zdexe" ]]; then
+            echo "PASS m11/native-zero-dep"; pass=$((pass+1))
+        else
+            echo "FAIL m11/native-zero-dep"; fail=$((fail+1))
+        fi
+
+        # 边界负例:string 形参越 v1 边界 → 构建期干净拒绝并指回转译
+        if "$CPP2" build tests/cases/legacy_hybrid_bad.cpp2 --backend=native 2>&1 | grep -q "hybrid legacy boundary"; then
+            echo "PASS m11/hybrid-boundary-diag"; pass=$((pass+1))
+        else
+            echo "FAIL m11/hybrid-boundary-diag"; fail=$((fail+1))
+        fi
+        ;;
+    *)
+        echo "SKIP m11/hybrid (Win64 发射器限定)"
+        ;;
+esac
+
 # ── native 后端:examples 输出对拍(转译基线逐字节;native_cmp.sh 承担)──
 nlog=".cpp2build/native_cmp.log"
 if bash tools/native_cmp.sh > "$nlog" 2>&1; then

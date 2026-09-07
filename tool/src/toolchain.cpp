@@ -152,4 +152,21 @@ std::string link_command(std::string const& cxx, Family f,
     return {};
 }
 
+std::string shared_link_command(std::string const& cxx, Family f,
+                                std::vector<std::string> const& objs, std::string const& out)
+{
+    std::string all;
+    for (auto const& o : objs) all += " \"" + o + "\"";
+
+    switch (f) {
+    case Family::Clang:
+    case Family::Gcc:
+        return cxx + " -shared" + all
+             + " -static-libstdc++ -static-libgcc -o \"" + out + "\"";
+    case Family::Msvc:
+        return cxx + " /nologo /LD" + all + " /Fe:\"" + out + "\"";
+    }
+    return {};
+}
+
 } // namespace cpp2::toolchain

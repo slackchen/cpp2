@@ -1,0 +1,15 @@
+// legacy_hybrid_bad.cpp2 — M11 边界负例:
+// string 形参越混动边界 v1(按值整型标量)→ native 构建期干净拒绝并
+// 指回转译模式,而非漏到 C++ 编译期或产出错误代码。
+module legacy_hybrid_bad;
+import std;
+
+cxx_legacy {
+    int cls_len(std::string s) { return (int)s.size(); }
+}
+
+cls_len: (s: string) -> int;
+
+main: () -> int = {
+    return 0;
+}

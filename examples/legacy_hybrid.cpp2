@@ -1,0 +1,36 @@
+// legacy_hybrid.cpp2 — M11 混动转义连接:native 后端的 cxx_legacy 卸载
+// 块内 C++ 含 if/循环/局部变量等 mini-C 子集外构造 → 与无体声明配对的函数
+// 整体转译出 C++ TU 编成 legacy_hybrid_legacy.dll(g++ -shared),native PE
+// 经静态导入表直连 cpp2leg_<name> 转发器;转发器 try/catch = §9.2 桥边界。
+// 注意:无 cxx_legacy 的程序 native 模式零外部依赖不变;本例仅在构建时
+// 惰性要求 C++ 编译器(运行时 DLL 与 exe 同目录,随产物分发)。
+module legacy_hybrid;
+import std;
+
+cxx_legacy {
+    // 循环 + 局部变量:mini-C 仅认 int fn(int..) { return EXPR; } → 触发卸载
+    int cls_fib(int n)
+    {
+        if (n < 2) return n;
+        int a = 0, b = 1;
+        for (int i = 2; i <= n; ++i) { int t = a + b; a = b; b = t; }
+        return b;
+    }
+
+    // 宽度混合 + bool:转发器统一 long long 槽,体内按声明类型逐参窄化
+    long long cls_mix(int w, long long x, unsigned char u, bool pick)
+    {
+        return pick ? (x + w) : (x - (long long)u);
+    }
+}
+
+// 无体声明(M6):外部符号;native 混动下经 cpp2leg_* 导入表直连
+cls_fib: (n: i32) -> i64;
+cls_mix: (w: i32, x: i64, u: u8, pick: bool) -> i64;
+
+main: () -> int = {
+    std::println("fib(30) = {0}", cls_fib(30));
+    std::println("mix+ = {0}", cls_mix(10 as i32, 100 as i64, 7 as u8, true));
+    std::println("mix- = {0}", cls_mix(10 as i32, 100 as i64, 7 as u8, false));
+    return 0;
+}

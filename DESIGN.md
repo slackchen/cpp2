@@ -831,6 +831,7 @@ export compress: (data: span<const byte>) -> vector<byte> throws = {
 
 - Cpp1 代码抛出的异常穿过 C++2 函数 → 在最近的桥接边界捕获,转换为 `error`(`legacy_exception` 类别)沿错误通道传播。
 - C++2 的错误值进入 Cpp1 侧 → 桥接包装层选择:转异常、转错误码,由包裹函数决定(见 9.3 的生成物)。
+- 已落地首步(M11):native 混动边界的 DLL 转发器以 `try/catch(...)` 包裹每次 legacy 调用,异常逃逸 → stderr 说明 + `exit(101)`(与契约 trap 同形),异常不穿越进 native 代码(原生后端无异常机制)。`legacy_exception` 错误类别化仍在挂账(需要边界类型面扩展,见 9.5)。
 
 ### 9.3 `export-headers`:反向生成 `.h`
 
@@ -848,6 +849,20 @@ $ cpp2 export-headers app/config.cpp2 -o bridge/
 
 - 同一程序可自由混链 Cpp1 `.cpp` 与 C++2 `.cpp2` 目标文件(同 ABI)。
 - 推荐迁移节奏:**新代码直接用 C++2 → 高风险旧模块逐步包裹桥接 → 按模块逐文件重写**。任何阶段程序都可构建、可发布。
+
+### 9.5 native 后端:混动转义连接(M11)
+
+原生后端没有 C++ 编译器,`cxx_legacy` 原文如何落地?两级方案,快路径优先:
+
+1. **mini-C 内联(零依赖快路径)**:块内全部是 `int fn(int…) { return EXPR; }` 纯整型函数 → 直译为 native 机器码,符号即原名,与无体声明配对。此路径与 C++ 工具链完全无关。
+2. **混动卸载**:mini-C 解析不了的块(真实 C++:语句、模板、std 类型)→ 把 legacy 原文转译出自包含 C++ TU,`-shared` 编成 `<模块>_legacy.dll` 与 exe 同目录;调用点改名为 `cpp2leg_<name>`,经 PE 静态导入表直连 DLL 里的 `extern "C"` 转发器。可解析与不可解析的块可混居,逐函数分流。
+
+约定:
+
+- **零依赖不受污染**:无 `cxx_legacy` 兼容段的程序,native 构建仍然只要 `cpp2.exe` 单体(不需要 C++ 编译器与 `rt/`,构建期惰性探测);只有出现卸载时才惰性要求 C++ 工具链。
+- **边界 v1 = 按值整型标量**(`int`/`i8..i64`/`u8..u64`/`bool`/`char`):转发器签名统一 `long long` 槽(Win64 调用约定),体内按声明类型窄化转发、结果加宽回槽。越界签名(指针/引用/`inout`/string/`throws`)构建期干净拒绝并指回转译模式——**跨 DLL 边界不允许出现需要共享分配器或异常 ABI 的类型**,这是正确性约束而非能力缺口。
+- **异常在边界被拦**(§9.2 首步):转发器 `try/catch(...)` → stderr 说明 + `exit(101)`。
+- 产物面:DLL 为构建产物(每次 native 构建重生成),不手写、不入库;分发时与 exe 同目录携带。
 
 ---
 

@@ -8,6 +8,7 @@
 #pragma once
 
 #include "ast.hpp"
+#include "hybrid.hpp"
 #include "sema.hpp"
 
 #include <stdexcept>
@@ -30,11 +31,14 @@ struct Unsupported : std::runtime_error {
 
 // 单模块 → x86-64 汇编(AT&T/GAS,intel_syntax noprefix)。
 // 抛 Unsupported 表示含子集外构造(调用方回退转译)。
-std::string emit_asm(ast::Module& m, sema::Result const& r, std::string const& src_path = {});
+// hybrid_out 非空时带回 cxx_legacy 混动卸载计划(M11;未卸载则 needed=false)。
+std::string emit_asm(ast::Module& m, sema::Result const& r, std::string const& src_path = {},
+                     hybrid::Plan* hybrid_out = nullptr);
 // Windows 直出 PE（不经 g++），仅 hello 等最小子集
 std::vector<uint8_t> emit_pe(ast::Module& m, sema::Result const& r);
 // 通用 native: .s 文本 → asm64 汇编 → PE/ELF 字节(零外部工具)
-// 抛 Unsupported 表示含不支持构造
-std::vector<uint8_t> emit_native(const std::string& asm_text);
+// 抛 Unsupported 表示含不支持构造;hybrid 非空时其中导出符号按计划 DLL 归类导入
+std::vector<uint8_t> emit_native(const std::string& asm_text,
+                                 hybrid::Plan const* hybrid = nullptr);
 
 } // namespace cpp2::native

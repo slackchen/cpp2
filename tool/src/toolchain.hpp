@@ -37,4 +37,10 @@ std::string plain_compile_command(std::string const& cxx, Family f,
 std::string link_command(std::string const& cxx, Family f,
                          std::vector<std::string> const& objs, std::string const& exe);
 
+// 动态库链接命令(objs → dll/so;M11 混动 legacy DLL)。
+// gcc/clang 家族静态连 libstdc++/libgcc,使 DLL 不拖编译器安装的运行时 DLL
+// (自身仍依赖系统 msvcrt,所有 Windows 自带)。
+std::string shared_link_command(std::string const& cxx, Family f,
+                                std::vector<std::string> const& objs, std::string const& out);
+
 } // namespace cpp2::toolchain

@@ -63,6 +63,8 @@ public:
         return out_.str();
     }
 
+    hybrid::Plan const& hybrid_plan() const { return plan_; }   // 混动卸载计划(M11)
+
 private:
     // 闭包(λ)v0 状态:显式按值捕获,env = [fn_ptr][cap0][cap1]...
     struct LambdaInfo { std::string label; std::vector<std::string> caps; };
@@ -238,21 +240,98 @@ private:
         return has_vtable(sd) ? 8 : 0;
     }
 
-    // ── cxx_legacy 块(M6):mini-C 解析 ──
-    // 仅支持 int fn(int a, int b) { return EXPR; } 形态(表达式含 + - * / % 括号
-    // 一元负号、int 字面量、参数名);复杂原文(zlib 的 char*/引用 shim)不支持,
-    // 解析失败 → unsup,与基类默认行为一致
+    // ── cxx_legacy 块(M6/M11):mini-C 解析 + 混动转义连接 ──
+    // 两档:块内全部是 int fn(int..) { return EXPR; } → mini-C 内联直译
+    // (零依赖快路径,不变);解析不了的块 → 与无体声明配对的函数"混动卸载":
+    // 转译出 C++ TU 编成 <module>_legacy.dll,调用点改名 cpp2leg_<name> 经
+    // PE 导入表直连。边界 v1 = 按值整型标量(见 hybrid.hpp),越界干净拒绝。
     struct LegacyFunc { std::vector<std::string> params; std::string expr; };
     std::map<std::string, LegacyFunc> legacy_funcs_;
+    hybrid::Plan plan_;                                  // 卸载计划(emit_asm 取出)
+    bool offloaded(std::string const& n) const
+    {
+        for (auto& ex : plan_.exports) if (ex.name == n) return true;
+        return false;
+    }
 
     void check_legacy_blocks() override
     {
         if (m_->name == "zlib_demo") return; // 复杂 shim 由运行时 z_* wrapper 提供,无需 mini-C 解析
+        std::map<std::string, LegacyFunc> parsed;
+        std::vector<size_t> failed;
+        for (size_t bi = 0; bi < m_->legacy_blocks.size(); ++bi) {
+            std::map<std::string, LegacyFunc> one;
+            if (parse_legacy_block(m_->legacy_blocks[bi].code, one))
+                for (auto& [n, lf] : one) parsed[n] = lf;
+            else
+                failed.push_back(bi);
+        }
+        legacy_funcs_ = parsed;                          // 可解析块保持内联快路径
+        if (failed.empty()) return;
+
+        // 混动卸载:失败块内定义(按 名字+'(' 归属)且有无体声明配对的函数
+        for (auto& f : m_->funcs) {
+            if (!f.is_extern || parsed.count(f.name)) continue;
+            bool defined = false;
+            for (size_t bi : failed)
+                if (mentions_fn(m_->legacy_blocks[bi].code, f.name)) { defined = true; break; }
+            if (!defined) continue;                      // 系统 DLL 导入等,与 legacy 无关
+            plan_.exports.push_back(export_of(f));       // 越 v1 边界在此 unsup
+        }
+        if (plan_.exports.empty())
+            unsup("cxx_legacy blocks (mini-C 仅支持 int fn(int..) { return EXPR; },"
+                  " 且无可配对卸载的 legacy 函数)");
+        plan_.needed = true;
+        plan_.module_name = m_->name;
+        plan_.dll_name = m_->name + "_legacy.dll";
+        for (auto& c : plan_.dll_name)
+            if (!isalnum((unsigned char)c) && c != '_' && c != '.') c = '_';
+        plan_.src_path = src_path_;
         for (auto& lb : m_->legacy_blocks)
-            parse_legacy_block(lb.code);
+            plan_.blocks.push_back({lb.line, lb.code});
+        std::cerr << "[native] hybrid: " << plan_.exports.size()
+                  << " legacy fn(s) offloaded to " << plan_.dll_name << std::endl;
     }
 
-    void parse_legacy_block(std::string const& code)
+    // 块内是否以 名字+'(' 形态提到某函数(粗糙归属;注释内误报只会让 DLL
+    // 转发器在 C++ 编译期报缺失,不产生错误代码)
+    static bool mentions_fn(std::string const& code, std::string const& name)
+    {
+        for (size_t i = 0; i + name.size() <= code.size(); ++i) {
+            if (code.compare(i, name.size(), name) != 0) continue;
+            bool lb = (i == 0) || !(isalnum((unsigned char)code[i - 1]) || code[i - 1] == '_');
+            if (!lb) continue;
+            size_t j = i + name.size();
+            while (j < code.size() && isspace((unsigned char)code[j])) ++j;
+            if (j < code.size() && code[j] == '(') return true;
+        }
+        return false;
+    }
+
+    // 无体声明 → 卸载导出;签名越 v1 边界(按值整型标量)→ 干净拒绝指回转译
+    hybrid::Export export_of(ast::FuncDecl& f)
+    {
+        auto bad = [&](std::string const& what) {
+            unsup("hybrid legacy boundary v1 supports by-value integer scalars only ("
+                  + f.name + ": " + what + "; use --backend=headers for the full C++ surface)");
+        };
+        hybrid::Export e;
+        e.name = f.name;
+        for (auto& p : f.params) {
+            if (p.mode != ast::ParamMode::In) bad("param '" + p.name + "' is in/out/inout");
+            std::string c = hybrid::scalar_c_type(p.type);
+            if (c.empty()) bad("param '" + p.name + "' type");
+            e.param_c.push_back(c);
+        }
+        if (f.throws) bad("throws is not supported across the hybrid boundary");
+        if (f.ret) {
+            e.ret_c = hybrid::scalar_c_type(*f.ret);
+            if (e.ret_c.empty()) bad("return type");
+        }
+        return e;
+    }
+
+    bool parse_legacy_block(std::string const& code, std::map<std::string, LegacyFunc>& out)
     {
         size_t i = 0;
         auto ws = [&]() {
@@ -296,33 +375,44 @@ private:
         for (;;) {
             ws();
             if (i >= code.size()) break;
-            if (!word("int")) unsup("cxx_legacy blocks (mini-C 仅支持 int fn(int..) { return EXPR; })");
+            if (!word("int")) return false;
             std::string name;
-            if (!ident(name)) unsup("cxx_legacy blocks (期望函数名)");
-            if (!ch('(')) unsup("cxx_legacy blocks (期望 '(')");
+            if (!ident(name)) return false;
+            if (!ch('(')) return false;
             LegacyFunc lf;
             if (!ch(')')) {
                 for (;;) {
-                    if (!word("int")) unsup("cxx_legacy blocks (参数须为 int)");
+                    if (!word("int")) return false;
                     std::string pn;
-                    if (!ident(pn)) unsup("cxx_legacy blocks (期望参数名)");
+                    if (!ident(pn)) return false;
                     lf.params.push_back(pn);
                     if (ch(',')) continue;
                     if (ch(')')) break;
-                    unsup("cxx_legacy blocks (期望 ',' 或 ')')");
+                    return false;
                 }
             }
-            if (!ch('{')) unsup("cxx_legacy blocks (期望 '{')");
-            if (!word("return")) unsup("cxx_legacy blocks (函数体仅支持 return EXPR;)");
+            if (!ch('{')) return false;
+            if (!word("return")) return false;
             ws();
             size_t e0 = i;
             while (i < code.size() && code[i] != ';') ++i;
-            if (i >= code.size()) unsup("cxx_legacy blocks (缺少 ';')");
+            if (i >= code.size()) return false;
             lf.expr = code.substr(e0, i - e0);
             ++i;
-            if (!ch('}')) unsup("cxx_legacy blocks (期望 '}')");
-            legacy_funcs_[name] = lf;
+            if (!ch('}')) return false;
+            // 表达式 dry-run(不落汇编):mini-C 文法外的表达式(函数调用、
+            // 三元等)在此判负 → 整块走混动卸载,不拖到发射期才炸
+            try {
+                std::map<std::string, int> pslots;
+                for (size_t k = 0; k < lf.params.size(); ++k)
+                    pslots[lf.params[k]] = -(8 * ((int)k + 1));
+                c_expr(lf.expr, pslots, /*dry*/true);
+            } catch (Unsupported const&) {
+                return false;
+            }
+            out[name] = lf;
         }
+        return true;
     }
 
     // mini-C 函数发射:Win64 序言 + 参数槽 + 表达式求值;符号 = 原名
@@ -351,18 +441,23 @@ private:
         }
     }
 
-    // mini-C 表达式递归下降:rax = 结果;除法 C 语义(除零 UB,不做检查)
+    // mini-C 表达式递归下降:rax = 结果;除法 C 语义(除零 UB,不做检查)。
+    // dry = 解析期校验(只判文法,不落汇编),供 mini-C 解析失败判定与混动卸载
     std::string csrc_;
     size_t cpos_ = 0;
     std::map<std::string, int> cslots_;
-    void c_expr(std::string const& src, std::map<std::string, int> const& slots)
+    bool cdry_ = false;
+    void cins(std::string const& s) { if (!cdry_) ins(s); }
+    void c_expr(std::string const& src, std::map<std::string, int> const& slots, bool dry = false)
     {
         csrc_ = src;
         cpos_ = 0;
         cslots_ = slots;
+        cdry_ = dry;
         c_add();
         cws();
         if (cpos_ != csrc_.size()) unsup("cxx_legacy blocks (表达式尾部多余字符)");
+        cdry_ = false;
     }
     void cws() { while (cpos_ < csrc_.size() && isspace((unsigned char)csrc_[cpos_])) ++cpos_; }
     bool cch(char c) { cws(); if (cpos_ < csrc_.size() && csrc_[cpos_] == c) { ++cpos_; return true; } return false; }
@@ -370,8 +465,8 @@ private:
     {
         c_mul();
         for (;;) {
-            if (cch('+')) { ins("mov rcx, rax"); c_mul(); ins("add rax, rcx"); }
-            else if (cch('-')) { ins("mov rcx, rax"); c_mul(); ins("sub rax, rcx"); }
+            if (cch('+')) { cins("mov rcx, rax"); c_mul(); cins("add rax, rcx"); }
+            else if (cch('-')) { cins("mov rcx, rax"); c_mul(); cins("sub rax, rcx"); }
             else break;
         }
     }
@@ -379,25 +474,25 @@ private:
     {
         c_unary();
         for (;;) {
-            if (cch('*')) { ins("mov rcx, rax"); c_unary(); ins("imul rax, rcx"); }
+            if (cch('*')) { cins("mov rcx, rax"); c_unary(); cins("imul rax, rcx"); }
             else if (cch('/') || cch('%')) {
                 char op = csrc_[cpos_ - 1];
-                ins("push rax");                    // 左值暂存(idiv 用 rax/rcx)
+                cins("push rax");                   // 左值暂存(idiv 用 rax/rcx)
                 ++push_depth_;
                 c_unary();
-                ins("mov rcx, rax");
-                ins("pop rax");
+                cins("mov rcx, rax");
+                cins("pop rax");
                 --push_depth_;
-                ins("cqo");
-                ins("idiv rcx");
-                if (op == '%') ins("mov rax, rdx"); // 余数在 rdx
+                cins("cqo");
+                cins("idiv rcx");
+                if (op == '%') cins("mov rax, rdx"); // 余数在 rdx
             }
             else break;
         }
     }
     void c_unary()
     {
-        if (cch('-')) { c_unary(); ins("neg rax"); return; }
+        if (cch('-')) { c_unary(); cins("neg rax"); return; }
         c_atom();
     }
     void c_atom()
@@ -411,7 +506,7 @@ private:
         size_t j = cpos_;
         if (j < csrc_.size() && isdigit((unsigned char)csrc_[j])) {
             while (j < csrc_.size() && isdigit((unsigned char)csrc_[j])) ++j;
-            ins("mov rax, " + csrc_.substr(cpos_, j - cpos_));
+            cins("mov rax, " + csrc_.substr(cpos_, j - cpos_));
             cpos_ = j;
             return;
         }
@@ -421,7 +516,7 @@ private:
             auto it = cslots_.find(nm);
             if (it == cslots_.end()) unsup("cxx_legacy blocks (未知标识符 '" + nm + "')");
             cpos_ = j;
-            ins("mov rax, QWORD PTR [rbp" + std::to_string(it->second) + "]");
+            cins("mov rax, QWORD PTR [rbp" + std::to_string(it->second) + "]");
             return;
         }
         unsup("cxx_legacy blocks (表达式解析失败)");
@@ -3348,6 +3443,9 @@ private:
                     || c.args[ai]->kind() == ast::Expr::StructLit)
                     mono_struct_arg[ai] = 1;
         }
+        // ── 混动转义连接(M11):卸载的 legacy 函数 → cpp2leg_<name> 导入符号
+        //    (DLL 侧同名 extern "C" 转发器承接;泛型实例名不会进入卸载集)──
+        if (offloaded(call_sym)) call_sym = hybrid::import_symbol(call_sym);
         if (!nm.qualified()) {
             auto lv = lambda_vars_.find(nm.parts[0]);
             if (lv != lambda_vars_.end()) {
@@ -3890,10 +3988,13 @@ private:
     }
 };
 
-std::string emit_asm(ast::Module& m, sema::Result const& r, std::string const& src_path)
+std::string emit_asm(ast::Module& m, sema::Result const& r, std::string const& src_path,
+                     hybrid::Plan* hybrid_out)
 {
     NativeEmitter em;
-    return em.emit(m, r, src_path);
+    std::string out = em.emit(m, r, src_path);
+    if (hybrid_out) *hybrid_out = em.hybrid_plan();
+    return out;
 }
 
 std::vector<uint8_t> emit_pe(ast::Module& m, sema::Result const& r)
@@ -4000,7 +4101,7 @@ std::vector<uint8_t> emit_pe(ast::Module& m, sema::Result const& r)
 }
 
 // ── 通用 native: .s 文本 → asm64 汇编 → PE 字节(零外部工具)────────
-std::vector<uint8_t> emit_native(const std::string& asm_text)
+std::vector<uint8_t> emit_native(const std::string& asm_text, hybrid::Plan const* hybrid)
 {
     // 追加最小运行时(零 CRT):cpp2_write/sys_exit/... 直接走 kernel32 系统调用
     // 注意: 本运行时导入的是 msvcrt.dll(legacy CRT)。其 printf 家族按"varargs 全部
@@ -4598,7 +4699,12 @@ cpp2_gc_collect:
             text_labels.push_back({name, off});
     }
 
-    // 动态导入表:把外部符号按 DLL 归类
+    // 动态导入表:把外部符号按 DLL 归类;混动卸载(M11)的 cpp2leg_* 符号
+    // 按计划指向 <module>_legacy.dll(生成期置顶,先于 dll_for 白名单)
+    std::map<std::string, std::string> hybrid_dll;
+    if (hybrid)
+        for (auto& ex : hybrid->exports)
+            hybrid_dll[hybrid::import_symbol(ex.name)] = hybrid->dll_name;
     std::map<std::string, std::vector<std::string>> imports_map;
     auto dll_for = [](std::string const& s) -> std::string {
         if (s == "printf" || s == "scanf" || s == "strlen" || s == "memcpy" || s == "memcmp" || s == "memset" ||
@@ -4614,6 +4720,11 @@ cpp2_gc_collect:
         if (e == "cpp2_write" || e == "cpp2_exit" || e == "sys_exit" ||
             e == "cpp2_alloc" || e == "cpp2_free" || e == "cpp2_strcat")
             continue;  // 由内联运行时提供
+        auto it = hybrid_dll.find(e);
+        if (it != hybrid_dll.end()) {
+            imports_map[it->second].push_back(e);
+            continue;
+        }
         imports_map[dll_for(e)].push_back(e);
     }
     std::vector<std::pair<std::string, std::vector<std::string>>> imports(

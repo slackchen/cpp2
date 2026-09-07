@@ -1,14 +1,14 @@
 # cpp2 — 演进式 C++ 2.0
 
 与 C++ 生态 100% 互操作、零开销、重写语法与编译模型的"下一代 C++"。
-**M1–M10 完成**(转译器全链路 + 生存期安全 + 区域/保守 GC 内存层 + 原生后端:Win64 零 CRT 直出 PE、契约落地、多模块摊平;**自研 std 面**:string/vector/map 接口 cpp2 风格、rt/cpp2/std 承载;**固定长度数组** `T[N]`:双后端直译、越界 trap),回归 **143 用例全绿**,examples 于 native 模式 **26 例全对拍**。
+**M1–M11 完成**(转译器全链路 + 生存期安全 + 区域/保守 GC 内存层 + 原生后端:Win64 零 CRT 直出 PE、契约落地、多模块摊平;**自研 std 面**:string/vector/map 接口 cpp2 风格、rt/cpp2/std 承载;**固定长度数组** `T[N]`:双后端直译、越界 trap;**混动转义连接**:native cxx_legacy 卸载为 C++ DLL 导入表直连,纯 native 零外部依赖),回归 **150 用例全绿**,examples 于 native 模式 **27 例全对拍**。
 
 ## 快速上手
 
 ```bash
 bash build.sh                       # 构建 cpp2 工具(llvm-mingw / gcc / clang,C++23)
 ./.cpp2build/cpp2.exe run examples/showcase.cpp2    # 全特性一览:编译 + 运行(Linux/macOS 产物无 .exe 后缀)
-bash tests/run.sh                   # 全量回归 143 项(末段含 native 对拍与插件补全单测)
+bash tests/run.sh                   # 全量回归 150 项(末段含 native 对拍与插件补全单测)
 ```
 
 编辑器:`editors/vscode` 插件(语法分色 / `cpp2 check` 实时诊断 / 上下文感知补全:std 双轨 API·数组·链式推断·import 模块 / 大纲 / Run),
@@ -48,7 +48,7 @@ main: () -> int = {
 }
 ```
 
-## 特性矩阵(M1–M10)
+## 特性矩阵(M1–M11)
 
 | 域 | 内容 |
 |---|---|
@@ -61,7 +61,8 @@ main: () -> int = {
 | 互操作 | cxx_legacy 原文块、无体声明、zlib 双向(vendored 库本机实测 + CI 矩阵);export-headers 供纯 Cpp1 消费 |
 | 内存 | unique/shared/weak、arena(+arena_ptr 逃逸检查)、可选保守式 gc |
 | 工具 | run/check/build/transpile/export-headers/audit/fuzz;千单元压测(24.7s 全量 / 1.8s no-op);`.c2i` v1(SHA-256) |
-| 原生后端 | Win64 零 CRT 直出 PE(examples 26 例对拍)+ SysV 整数核心 smoke(CI);契约 pre/post/invariant/old()/result 出入口检查;泛型单态化、虚分发、保守 GC、string 三槽、vector v0、**T[N] 栈上 N 连续槽直译(M10)**、cxx_legacy mini-C + unsafe 指针、zlib;多模块整程序摊平;map 显式 unsup(转译回退) |
+| 原生后端 | Win64 零 CRT 直出 PE(examples 27 例对拍)+ SysV 整数核心 smoke(CI);契约 pre/post/invariant/old()/result 出入口检查;泛型单态化、虚分发、保守 GC、string 三槽、vector v0、**T[N] 栈上 N 连续槽直译(M10)**、unsafe 指针、zlib;多模块整程序摊平;map 显式 unsup(转译回退) |
+| **混动连接(M11)** | native 后端 cxx_legacy 两级落地:mini-C 纯整型函数内联直译(零依赖);解析不了的 legacy 转译出 `<模块>_legacy.dll` 经 PE 导入表直连(`cpp2leg_*` 转发器,§9.2 桥边界 try/catch → exit 101)。**无兼容段的程序 native 只需 cpp2.exe 单体**(不需要 C++ 编译器/rt/);边界 v1 = 按值整型标量,越界签名干净拒绝指回转译 |
 
 ## 文档
 

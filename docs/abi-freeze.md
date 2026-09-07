@@ -54,6 +54,7 @@ expected<T> ≈ { uint8 index; union { T value; error error; } }   // index: 0=v
 - 函数签名:C++ 普通函数(Itanium mangling 随编译器);`main` 特例:`int main()`
 - 无体声明 = 外部符号,按声明原型解析(M6)
 - 内部实体:匿名命名空间(内部链接)
+- **native 混动导出符号(M11,v4 追加)**:卸载的 cxx_legacy 函数以 `extern "C"` 符号 `cpp2leg_<名>` 承接,位于 `<模块>_legacy.dll`;签名冻结为 `long long cpp2leg_<名>(long long p0, …)`(Win64 调用约定,体内按声明类型窄化)——仅 `cpp2leg_` 前缀、DLL 命名与槽宽冻结,DLL 内部实现不冻结
 
 ## 5. 运行时入口(rt/cpp2)
 
@@ -77,6 +78,7 @@ expected<T> ≈ { uint8 index; union { T value; error error; } }   // index: 0=v
 - **v1 → v2(2026-09-02)**:native(Win64)string 表示从"std::string 不透明"改为自有 `ptr+size+cap` 三槽——破坏性变更,缓存全量失效
 - **v2 → v3(2026-09-05)**:转译模式 string/vector/list 载体从 std 类型改为 `cpp2::string`/`cpp2::vector`(rt/cpp2/std,内部仍包 std 实现),bare map 从破损透传改为 `cpp2::map`——接口面变更,缓存全量失效(kVersion 1→2);native 侧表示不变,string/vector 机器码布局与 v2 一致
 - **v3 → v4(2026-09-05)**:M10 新增 `T[N]` 固定长度数组,转译模式载体 `cpp2::array<T, N>`(rt/cpp2/std/array.hpp)——新类型面,缓存全量失效(kVersion 2→3);native 侧为栈上 N 连续槽直译(新能力,无旧表示冲突)
+- **v4 追加(2026-09-07,M11)**:native 混动导出面(`cpp2leg_<名>` / `<模块>_legacy.dll` / long long 槽转发器签名,§4)——纯追加,既有冻结面零改动,native 后端无缓存层故不涉 kVersion
 - 工具版本串(kVersion)混入缓存键:任何 ABI 破坏性变更必须提升版本 → 缓存全量失效
 - .c2i v1(SHA-256 接口哈希)独立演进;接口文本格式变更同样使缓存失效
 

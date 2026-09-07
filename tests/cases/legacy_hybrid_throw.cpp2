@@ -1,0 +1,23 @@
+// legacy_hybrid_throw.cpp2 — M11 桥边界(DESIGN §9.2 首步):
+// legacy C++ 异常不再穿越边界:DLL 转发器 catch (...) → stderr 说明 +
+// exit(101)(与契约 trap 同形)。native 模式验收;转译模式异常直接
+// 穿透 main,语义不同,故不入对拍。
+module legacy_hybrid_throw;
+import std;
+
+cxx_legacy {
+    #include <stdexcept>
+    int cls_boom(int n)
+    {
+        if (n > 0) throw std::runtime_error("cls_boom exploded");
+        return -n;
+    }
+}
+
+cls_boom: (n: i32) -> i32;
+
+main: () -> int = {
+    std::println("calm = {0}", cls_boom(0));
+    cls_boom(1);   // 越界抛出 → 桥边界拦截
+    return 0;
+}

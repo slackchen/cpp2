@@ -49,6 +49,10 @@ for f in "${files[@]}"; do
   fi
   runexe="$tmp/${name}.acc.exe"
   rm -f "$runexe"; cp "$exe" "$runexe"
+  # 混动 legacy DLL(M11):exe 依赖 <module>_legacy.dll,随产物拷到同目录
+  for d in "$(dirname "$exe")"/*_legacy.dll; do
+    [[ -f "$d" ]] && cp -f "$d" "$tmp/"
+  done
   # 先取真实退出码(管道会掩盖崩潰),再归一 \r
   "$runexe" > "$tmp/${name}.out" 2>/dev/null; nrc=$?
   nat=$(tr -d '\r' < "$tmp/${name}.out")

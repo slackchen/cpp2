@@ -2,6 +2,7 @@
 #pragma once
 
 #include "ast.hpp"
+#include "hybrid.hpp"
 #include "sema.hpp"
 
 #include <string>
@@ -34,5 +35,12 @@ std::pair<std::string, std::string> emit_bridge(std::vector<ModuleEntry> const& 
 // 实现片段由构建层按 TU 大小预算装箱合并(平衡 TU 数量与单 TU 编译时间),
 // 片段自带 #include 自身 .h,拼接即自包含。
 std::pair<std::string, std::string> emit_headers(ModuleEntry const& e, bool release = false);
+
+// 混动转义连接(M11):native 后端卸载的 cxx_legacy → 自包含 DLL 翻译单元。
+// legacy 块原文(#line 映射指回 .cpp2)+ 每个卸载函数一个 extern "C"
+// __declspec(dllexport) 转发器:签名统一 long long 槽(Win64 调用约定),
+// 体内按声明类型窄化转发;try/catch 包裹 = §9.2 桥边界(legacy 异常逃逸
+// → stderr 说明 + exit 101,与契约 trap 同形)。
+std::string emit_legacy_dll(hybrid::Plan const& plan);
 
 } // namespace cpp2::emit

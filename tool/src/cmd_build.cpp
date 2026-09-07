@@ -32,6 +32,7 @@ namespace util  = cpp2::util;
 namespace sha256 = cpp2::sha256;
 namespace diagfilter = cpp2::diagfilter;
 namespace tc    = cpp2::toolchain;
+namespace hybrid = cpp2::hybrid;
 
 using cpp2::app::CacheRec;
 using cpp2::app::read_cache;
@@ -84,16 +85,9 @@ int cmd_build(std::vector<std::string> const& args)
         return 1;
     }
 
-    std::string cxx = cpp2::app::find_compiler();
-    if (cxx.empty()) {
-        std::cerr << "error: no C++ compiler found (set CPP2_CXX)\n";
-        return 2;
-    }
-    auto rt = cpp2::app::find_rt_dir(in);
-    if (!rt) {
-        std::cerr << "error: cannot locate rt/ directory (set CPP2_RT)\n";
-        return 2;
-    }
+    // C++ 编译器 / rt/ 按需惰性探测(M11 零依赖约定):
+    //   Win64 native 纯路径(无 cxx_legacy 兼容段)不需要任何外部工具链,
+    //   cpp2.exe 单体即可全量编译运行;仅混动卸载(或转译后端)才要求。
     auto p = cpp2::app::prepare(in);
     if (!p) return 1;
 
@@ -130,11 +124,61 @@ int cmd_build(std::vector<std::string> const& args)
                 {
                     std::string src_norm = in.string();
                     for (auto& ch : src_norm) if (ch == '\\') ch = '/';   // 位置后缀与转译模式同格式
-                    std::string asm_text = cpp2::native::emit_asm(emit_mod, emit_sr, src_norm);
+                    hybrid::Plan plan;             // cxx_legacy 混动卸载计划(M11)
+                    std::string asm_text = cpp2::native::emit_asm(emit_mod, emit_sr, src_norm, &plan);
                     // build_dir 已含 backend 子目录(.cpp2build/native),不再叠加 "native"
                     fs::path exe = build_dir / (in.stem().string() + ".exe");
                     write_file(build_dir / (in.stem().string() + ".s"), asm_text);
-                    auto pe_bytes = cpp2::native::emit_native(asm_text);
+
+                    // ── 混动转义连接(M11):mini-C 解析不了的 cxx_legacy →
+                    //    转译出 C++ TU → -shared 编成 <module>_legacy.dll,
+                    //    与 exe 同目录(PE 静态导入表按名直连 cpp2leg_*)──
+                    if (plan.needed) {
+                        std::string cxx = cpp2::app::find_compiler();
+                        if (cxx.empty()) {
+                            std::cerr << "error: cxx_legacy 混动模式需要 C++ 编译器(set CPP2_CXX);"
+                                         "无 cxx_legacy 兼容段的 native 构建不需要\n";
+                            return 2;
+                        }
+                        auto rt = cpp2::app::find_rt_dir(in);
+                        if (!rt) {
+                            std::cerr << "error: cannot locate rt/ directory (set CPP2_RT)\n";
+                            return 2;
+                        }
+                        tc::Family fam = tc::detect(cxx);
+                        fs::path legacy_dir = build_dir / "legacy";
+                        fs::create_directories(legacy_dir);
+                        std::string base = util::safe_name(plan.module_name);
+                        fs::path dll_cpp = legacy_dir / (base + "_legacy.cpp");
+                        fs::path dll_obj = legacy_dir / (base + "_legacy.o");
+                        fs::path dll     = build_dir / plan.dll_name;
+                        write_file(dll_cpp, emit::emit_legacy_dll(plan));
+
+                        std::string cc = tc::plain_compile_command(
+                            cxx, fam, native(*rt), native(dll_cpp), native(dll_obj));
+                        std::cerr << "[cpp2] " << cc << "\n";
+                        auto cr = run_capture(cc);
+                        if (!cr.ok) {
+                            std::cerr << diagfilter::banner;
+                            std::string flt = diagfilter::filter(cr.output, native(build_dir));
+                            std::cerr << (flt.empty() ? cr.output : flt);
+                            throw std::runtime_error("legacy DLL compile failed (" + plan.dll_name + ")");
+                        }
+                        std::string lk = tc::shared_link_command(
+                            cxx, fam, {native(dll_obj)}, native(dll));
+                        std::cerr << "[cpp2] " << lk << "\n";
+                        auto lr = run_capture(lk);
+                        if (!lr.ok) {
+                            std::cerr << diagfilter::banner;
+                            std::string flt = diagfilter::filter(lr.output, native(build_dir));
+                            std::cerr << (flt.empty() ? lr.output : flt);
+                            throw std::runtime_error("legacy DLL link failed (" + plan.dll_name + ")");
+                        }
+                        std::cerr << "[cpp2] native hybrid: " << plan.exports.size()
+                                  << " legacy fn(s) -> " << native(dll) << "\n";
+                    }
+
+                    auto pe_bytes = cpp2::native::emit_native(asm_text, &plan);
                     std::ofstream out(native(exe), std::ios::binary);
                     out.write(reinterpret_cast<char const*>(pe_bytes.data()), pe_bytes.size());
                     out.close();
@@ -143,6 +187,16 @@ int cmd_build(std::vector<std::string> const& args)
                     return 0;
                 }
 #else
+                std::string cxx = cpp2::app::find_compiler();
+                if (cxx.empty()) {
+                    std::cerr << "error: no C++ compiler found (set CPP2_CXX)\n";
+                    return 2;
+                }
+                auto rt = cpp2::app::find_rt_dir(in);
+                if (!rt) {
+                    std::cerr << "error: cannot locate rt/ directory (set CPP2_RT)\n";
+                    return 2;
+                }
                 std::string asm_text =
                     cpp2::native::emit_asm(emit_mod, emit_sr);
                 fs::create_directories(build_dir);
@@ -181,6 +235,18 @@ int cmd_build(std::vector<std::string> const& args)
                 return 1;
             }
         }
+    }
+
+    // ── 转译后端:C++ 编译器 / rt/ 必需(此处起才探测)─────────────────
+    std::string cxx = cpp2::app::find_compiler();
+    if (cxx.empty()) {
+        std::cerr << "error: no C++ compiler found (set CPP2_CXX)\n";
+        return 2;
+    }
+    auto rt = cpp2::app::find_rt_dir(in);
+    if (!rt) {
+        std::cerr << "error: cannot locate rt/ directory (set CPP2_RT)\n";
+        return 2;
     }
 
     // ── 转译(内容寻址落盘)+ 哈希缓存 ──────────────────────────────
