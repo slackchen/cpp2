@@ -533,6 +533,14 @@ M1–M6 至此全部完成。剩余为 M7+(自举实验、原生后端评估,研
 - **验收**:新增 `examples/legacy_hybrid.cpp2`(if/循环/宽度混合 + bool 的 legacy C++,mini-C 不可解析;转译基线 ×3 断言 + native 对拍逐字一致)+ `tests/cases/legacy_hybrid_throw.cpp2`(桥边界拦截,rc=101,消息含函数名)+ `tests/cases/legacy_hybrid_bad.cpp2`(string 形参越界负例,干净诊断);`tools/native_cmp.sh` 拷贝同目录 `*_legacy.dll` 到对拍执行目录;run.sh 增 m11 段(全链路对拍 / 桥边界 trap / 零依赖断言——`CPP2_CXX=坏值` 下纯 native 必须成功 / 边界负例)。回归 143 → **150 用例全绿**,native 对拍 26 → **27 例全绿**。
 - **偏差表**:① 混动边界 v1 仅按值整型标量——跨 DLL 共享分配器/异常 ABI 的类型面挂账(转译模式仍承载完整 C++ 面,native 侧为正确性约束);② llvm-mingw libunwind 在异常展开经过无 unwind info 的 exe 帧时打一行 `pc not in table` 提示(运行时噪声,拦截语义与退出码不受影响);③ DLL 每次构建重生成(native 后端无增量缓存层,自然不涉及);④ zlib_demo 维持手写 asm + zlib1.dll 特判路径(DLL 化需 DLL 链接 zlib,涉探测面,单独立项);⑤ SysV 发射器不接混动(ELF 需 PLT/GOT 动态链接支持,维持 cxx_legacy unsup 转译回退)。
 
+**混动编译器发现跨机器兼容(2026-09-07 追记,M11 缺口修补)**:M11 首步的编译器发现复用 `find_compiler`(PATH 首个 `--version` 可答者),在其未覆盖的一类环境上产出**运行期才崩**的 DLL:Cygwin 宿主 g++(`-dumpmachine` = `x86_64-pc-cygwin`,如 Cygwin 装机 + MinGW/MSYS 多重环境)编出的 DLL 拖 `cygwin1.dll`,被 LoadLibrary 进纯 native PE 进程后普通整型调用侥幸通过(`legacy_hybrid` 对拍绿,静默陷阱),异常一展开即段错误——`legacy_hybrid_throw` 桥拦截验收在此类环境不可达,且错误形态(无输出崩进程)与构建期干净诊断的项目约定相悖。
+
+- **`find_native_compiler`**(`app_core.cpp`/`app.hpp`,仅 native 混动 DLL 使用;转译路径 `find_compiler` 行为不变,Cygwin g++ 仍是合法转译宿主):只接受**原生 Windows x64 目标**编译器,gcc/clang 家族以 `-dumpmachine` 自报三元组为准(编译器自述目标,跨机器通用、零硬编码)——拒 Cygwin 宿主(上述根因)、拒非 x86-64 目标(32 位 DLL 装不进 Win64 进程)、拒 MSVC 目标的 clang(gcc 式链接旗标不适用);发现顺序 `CPP2_CXX`(显式指定,目标不合规则记原因顺延不硬失败)→ PATH `g++` → PATH `clang++` → PATH `cl`(横幅自证)→ **vswhere**(`%ProgramFiles(x86)%` 官方发现接口,`-latest -products "*" -requires VC.Tools.x86.x64 -property installationPath`,VS 版本/盘符自适应;`*` 必须带引号——popen 外壳为 POSIX sh 时会通配展开成工作目录列表致 vswhere 静默空返回)→ 取 `vcvars64.bat`。
+- **MSVC 无 dev-prompt 的命令包装 `wrap_msvc_env`**:真命令写临时 `.bat`(`call vcvars64` 后执行)经 `cmd.exe /d /c` 单引号参数运行——内层引号只存在于文件内容,免疫工具 popen 外壳(sh 或 cmd)的引号规则差异;`windows_paths` 把命令串里 `/cygdrive/e/`、`/mnt/e/`、MSYS `/e/` 三种 POSIX 挂载路径改写为 `E:/`(盘符后须紧跟分隔符 + 裸挂载仅认参数边界,不伤 `/c`、`/Fo`、`/std:` 旗标形参)。
+- **`toolchain.cpp` Msvc 旗标对齐 `build_msvc.bat` 实测组合**:`plain_compile_command` 升 `/std:c++latest /Zc:__cplusplus /utf-8 /EHsc /MT /W3`——`/utf-8` 防生成 TU 的非 ASCII 注释被按本地码页误读,`/EHsc` 是桥转发器 `try/catch` 的生命线,`/MT` 与 gcc 侧 `-static-libstdc++/-static-libgcc` 同策(DLL 自含 CRT)。
+- **无可用原生编译器 → 构建期干净诊断**,列各候选落选原因,不再静默产出崩溃 DLL。
+- **验收**(Cygwin g++ + MSVC 目标 clang++ + VS2022 Community 并存环境):`legacy_hybrid_throw` 由段错误修复为 `calm = 0` + 桥拦截 `exit 101`;候选排查逐项命中(cygwin 拒 / clang msvc 目标拒 / cl 不在 PATH / vswhere 命中);回归 149/149 全绿(本机计入口径,upstream 150 含 Linux 段),native 对拍 28 例一致。
+
 ## 10. v0.x 明确不做
 
 完整 borrow checker、反射、async/并发模型、跨编译器 BMI 共享、调试器专有扩展(DWARF/PDB 经 `#line` 已基本可用)。

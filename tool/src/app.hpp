@@ -102,6 +102,32 @@ CmdResult run_capture(std::string const& cmd);          // 合并 stderr 捕获
 std::string find_compiler();
 std::optional<fs::path> find_rt_dir(fs::path const& input);
 
+// ── native 混动 legacy DLL 的编译器选择(M11;跨机器环境兼容)─────
+// 与 find_compiler(通用,转译路径)不同:legacy DLL 会被 LoadLibrary 进
+// 纯 native PE 进程,只接受「原生 Windows x64 目标」编译器:
+//   - gcc/clang 家族以 -dumpmachine 自报三元组为准 —— 拒 Cygwin 宿主
+//     (其 DLL 依赖 cygwin1.dll,纯 native 进程内 SEH 异常展开必崩,
+//     普通整型调用侥幸能过,属静默陷阱)、拒非 x86-64 目标(exe 固定
+//     Win64)、拒 MSVC 目标的 clang(gcc 式链接旗标不适用);
+//   - MSVC 家族原生即合规。
+// 发现顺序:CPP2_CXX(显式指定;目标不合规则记原因顺延,不硬失败)→
+// PATH g++ → PATH clang++ → PATH cl → vswhere 定位 VS 安装(读
+// vcvars64.bat,随 VS 版本/盘符自适应,不硬编码路径)。
+// cxx 为空 ⇒ 环境内无可用原生编译器;rejected 汇总各候选落选原因供诊断。
+struct NativeCxx {
+    std::string cxx;        // 编译器命令名(调用时按 PATH 解析)
+    std::string vcvars;     // 非空 = 每条命令前需先 call 该 bat(vcvars64)
+    std::string rejected;   // 候选落选原因(多行,诊断用)
+};
+NativeCxx find_native_compiler();
+
+// MSVC 无 dev-prompt 环境时的命令包装:vcvars 非空时把真命令写进临时
+// .bat(call vcvars64 后执行),以 cmd.exe /d /c 单引号参数执行 ——
+// 内层引号只存在于文件内容,免疫外层 sh/cmd 引号规则差异;vcvars 为空
+// 时原样返回 cmd(已配好环境的 dev-prompt 直接走 PATH)。
+std::string wrap_msvc_env(std::string const& vcvars, std::string const& cmd,
+                          fs::path const& bat_out);
+
 // ── 模块图 + 全模块语义检查(--quick 仅根模块)───────────────────
 struct Prepared {
     mods::Graph graph;

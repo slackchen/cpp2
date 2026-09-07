@@ -134,18 +134,26 @@ int cmd_build(std::vector<std::string> const& args)
                     //    转译出 C++ TU → -shared 编成 <module>_legacy.dll,
                     //    与 exe 同目录(PE 静态导入表按名直连 cpp2leg_*)──
                     if (plan.needed) {
-                        std::string cxx = cpp2::app::find_compiler();
-                        if (cxx.empty()) {
-                            std::cerr << "error: cxx_legacy 混动模式需要 C++ 编译器(set CPP2_CXX);"
-                                         "无 cxx_legacy 兼容段的 native 构建不需要\n";
+                        cpp2::app::NativeCxx nc = cpp2::app::find_native_compiler();
+                        if (nc.cxx.empty()) {
+                            std::cerr << "error: cxx_legacy 混动模式需要「原生 Windows x64 目标」"
+                                         "C++ 编译器(MinGW-w64 g++/clang++ 或 MSVC)。"
+                                         "Cygwin 宿主编译器的 DLL 拖 cygwin1.dll,无法进纯 native "
+                                         "进程;无 cxx_legacy 兼容段的 native 构建不需要任何编译器;"
+                                         "也可 set CPP2_CXX 显式指定\n";
+                            if (!nc.rejected.empty())
+                                std::cerr << "候选排查:\n" << nc.rejected << "\n";
                             return 2;
                         }
+                        std::cerr << "[cpp2] native hybrid cxx: " << nc.cxx
+                                  << (nc.vcvars.empty() ? "" : " (via vcvars64)")
+                                  << "\n";
                         auto rt = cpp2::app::find_rt_dir(in);
                         if (!rt) {
                             std::cerr << "error: cannot locate rt/ directory (set CPP2_RT)\n";
                             return 2;
                         }
-                        tc::Family fam = tc::detect(cxx);
+                        tc::Family fam = tc::detect(nc.cxx);
                         fs::path legacy_dir = build_dir / "legacy";
                         fs::create_directories(legacy_dir);
                         std::string base = util::safe_name(plan.module_name);
@@ -154,10 +162,15 @@ int cmd_build(std::vector<std::string> const& args)
                         fs::path dll     = build_dir / plan.dll_name;
                         write_file(dll_cpp, emit::emit_legacy_dll(plan));
 
+                        // vcvars 非空(MSVC 无 dev-prompt)时命令经临时 .bat 包装
+                        auto run_dll_cmd = [&](std::string const& cmd, char const* bat_name) {
+                            return run_capture(cpp2::app::wrap_msvc_env(
+                                nc.vcvars, cmd, legacy_dir / bat_name));
+                        };
                         std::string cc = tc::plain_compile_command(
-                            cxx, fam, native(*rt), native(dll_cpp), native(dll_obj));
+                            nc.cxx, fam, native(*rt), native(dll_cpp), native(dll_obj));
                         std::cerr << "[cpp2] " << cc << "\n";
-                        auto cr = run_capture(cc);
+                        auto cr = run_dll_cmd(cc, "compile_legacy.bat");
                         if (!cr.ok) {
                             std::cerr << diagfilter::banner;
                             std::string flt = diagfilter::filter(cr.output, native(build_dir));
@@ -165,9 +178,9 @@ int cmd_build(std::vector<std::string> const& args)
                             throw std::runtime_error("legacy DLL compile failed (" + plan.dll_name + ")");
                         }
                         std::string lk = tc::shared_link_command(
-                            cxx, fam, {native(dll_obj)}, native(dll));
+                            nc.cxx, fam, {native(dll_obj)}, native(dll));
                         std::cerr << "[cpp2] " << lk << "\n";
-                        auto lr = run_capture(lk);
+                        auto lr = run_dll_cmd(lk, "link_legacy.bat");
                         if (!lr.ok) {
                             std::cerr << diagfilter::banner;
                             std::string flt = diagfilter::filter(lr.output, native(build_dir));

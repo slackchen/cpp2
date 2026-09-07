@@ -128,8 +128,11 @@ std::string plain_compile_command(std::string const& cxx, Family f,
     auto q = [](std::string const& s) { return "\"" + s + "\""; };
     switch (f) {
     case Family::Msvc:
-        return cxx + " /nologo /std:c++23 /EHsc /I" + q(rt_include)
-             + " /c " + q(gen) + " /Fo" + q(obj);
+        // 旗标对齐 build_msvc.bat 实测组合:/utf-8(生成 TU 含非 ASCII 注释,
+        // 不加则 MSVC 按本地码页误读)/EHsc(M11 桥转发器 try/catch 依赖)/
+        // /MT(DLL 自含 CRT,与 gcc 侧 -static-libstdc++/-static-libgcc 同策)
+        return cxx + " /nologo /std:c++latest /Zc:__cplusplus /utf-8 /EHsc /MT /W3 /I"
+             + q(rt_include) + " /c " + q(gen) + " /Fo" + q(obj);
     default:  // clang / gcc
         return cxx + " -std=c++23 -O1 -I" + q(rt_include)
              + " -c " + q(gen) + " -o " + q(obj);

@@ -59,6 +59,176 @@ std::string find_compiler()
     return "";
 }
 
+// ── native 混动 legacy DLL 的编译器选择(M11)────────────────────────
+// 探测只看输出不挑 rc:-dumpmachine/--version 的非零退出不代表探测失败
+namespace {
+
+std::string probe_output(std::string const& cmd)
+{
+    if (FILE* p = CPP2_POPEN((cmd + " 2>&1").c_str(), "r")) {
+        std::string out;
+        char buf[4096];
+        size_t n;
+        while ((n = fread(buf, 1, sizeof buf, p)) > 0) out.append(buf, n);
+        CPP2_PCLOSE(p);
+        return out;
+    }
+    return "";
+}
+
+std::string trim_copy(std::string s)
+{
+    auto not_space = [](unsigned char c) { return c != ' ' && c != '\t'
+                                         && c != '\r' && c != '\n'; };
+    while (!s.empty() && !not_space(s.back())) s.pop_back();
+    size_t i = 0;
+    while (i < s.size() && !not_space(s[i])) ++i;
+    return s.substr(i);
+}
+
+std::string lower_copy(std::string s)
+{
+    for (auto& c : s)
+        if (c >= 'A' && c <= 'Z') c = static_cast<char>(c - 'A' + 'a');
+    return s;
+}
+
+// -dumpmachine 自报目标三元组(编译器对自己目标的自述,跨机器通用)
+std::string gcc_target(std::string const& cxx)
+{
+    return lower_copy(trim_copy(probe_output("\"" + cxx + "\" -dumpmachine")));
+}
+
+bool contains(std::string const& hay, char const* needle)
+{
+    return hay.find(needle) != std::string::npos;
+}
+
+// gcc/clang 家族可用性:三元组须为「原生 Windows x64 + GNU/MinGW ABI」。
+// 三条拒绝各有明确的运行期故障形态,不是口味问题:
+//   cygwin 宿主  → DLL 拖 cygwin1.dll,纯 native 进程内 SEH 展开必崩;
+//   非 x86-64    → 32 位 DLL 无法装入 Win64 进程;
+//   msvc 目标    → shared_link_command 发 gcc 式旗标(-static-libstdc++),
+//                  msvc 目标驱动不识别,交由 MSVC 家族分支处理。
+bool gnuish_x64_target(std::string const& t, std::string& why)
+{
+    if (t.empty())                { why = "未报目标三元组"; return false; }
+    if (contains(t, "cygwin"))    { why = "Cygwin 宿主编译器(其 DLL 依赖 cygwin1.dll,"
+                                          "纯 native 进程内异常展开不可用)"; return false; }
+    if (!contains(t, "x86_64") && !contains(t, "amd64"))
+                                  { why = "非 x86-64 目标 '" + t + "'(native exe 固定 Win64)"; return false; }
+    if (!contains(t, "mingw") && !contains(t, "gnu"))
+                                  { why = "MSVC 目标 '" + t + "'(gcc 式链接旗标不适用)"; return false; }
+    return true;
+}
+
+// cmd.exe/cl 只认 Windows 路径,而工具的文件系统视角是 POSIX 宿主给的:
+// cygwin 挂载 /cygdrive/e/...、MSYS 裸挂载 /e/...、WSL /mnt/e/...。
+// 把命令串里这三种形式的绝对路径改写为「E:/...」;盘符后必须紧跟分隔符,
+// 裸挂载形式另要求参数边界(串首/空白/引号/等号),避免误伤 /c、/Fo、
+// /std: 这类旗标形参
+std::string windows_paths(std::string s)
+{
+    auto is_drive = [](char c) { return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z'); };
+    auto is_sep   = [](char c) { return c == '/' || c == '\\'; };
+    auto upper    = [](char c) { return (c >= 'a' && c <= 'z') ? char(c - 'a' + 'A') : c; };
+
+    for (char const* prefix : { "/cygdrive/", "/mnt/" }) {
+        size_t plen = std::strlen(prefix);
+        size_t at = 0;
+        while ((at = s.find(prefix, at)) != std::string::npos) {
+            if (at + plen + 2 < s.size() && is_drive(s[at + plen]) && is_sep(s[at + plen + 1])) {
+                s.replace(at, plen + 1, std::string(1, upper(s[at + plen])) + ":");
+                at += 2;
+            } else {
+                at += plen;
+            }
+        }
+    }
+    for (size_t at = 0; at + 2 < s.size(); ++at) {
+        if (s[at] == '/' && is_drive(s[at + 1]) && is_sep(s[at + 2])
+            && (at == 0 || s[at - 1] == ' ' || s[at - 1] == '\"' || s[at - 1] == '=')) {
+            s.replace(at, 2, std::string(1, upper(s[at + 1])) + ":");
+            ++at;
+        }
+    }
+    return s;
+}
+
+} // namespace
+
+NativeCxx find_native_compiler()
+{
+    NativeCxx r;
+    auto note = [&r](std::string const& who, std::string const& why) {
+        if (!r.rejected.empty()) r.rejected += "\n";
+        r.rejected += "  " + who + ": " + why;
+    };
+
+    if (char const* env = std::getenv("CPP2_CXX")) {
+        std::string cxx = env;
+        if (tc::detect(cxx) == tc::Family::Msvc) return { cxx, "", std::move(r.rejected) };
+        std::string why;
+        if (gnuish_x64_target(gcc_target(cxx), why)) return { cxx, "", std::move(r.rejected) };
+        note("CPP2_CXX=" + cxx, why);
+    }
+    for (char const* cxx : {"g++", "clang++"}) {
+        std::string why;
+        if (gnuish_x64_target(gcc_target(cxx), why)) return { cxx, "", std::move(r.rejected) };
+        note(std::string(cxx) + "(PATH)", why);
+    }
+
+    // cl 已在 PATH(dev-prompt 环境):横幅自证身份(无 cl 时各 shell 的
+    // "command not found" 文案均不含 "Microsoft")
+    {
+        std::string banner = probe_output("\"cl\" \"/?\"");
+        if (contains(banner, "Microsoft")) return { "cl", "", std::move(r.rejected) };
+        note("cl(PATH)", "未找到");
+    }
+
+    // vswhere 定位 VS/BuildTools(VS 官方发现接口;盘符/版本随机器自适应)
+    if (char const* pf86 = std::getenv("ProgramFiles(x86)")) {
+        fs::path vswhere = fs::path(pf86) / "Microsoft Visual Studio" / "Installer"
+                                      / "vswhere.exe";
+        if (fs::exists(vswhere)) {
+            // `-products "*"` 必须带引号:popen 外壳可能是 POSIX sh,* 会被
+            // 通配展开成工作目录文件列表,vswhere 收到垃圾参数后静默空返回
+            std::string out = probe_output("\"" + native(vswhere) + "\" -latest -products \"*\""
+                " -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64"
+                " -property installationPath");
+            std::string install = trim_copy(out);
+            size_t nl = install.find_first_of("\r\n");
+            if (nl != std::string::npos) install.resize(nl);
+            if (!install.empty()) {
+                fs::path vcvars = fs::path(install) / "VC" / "Auxiliary" / "Build"
+                                             / "vcvars64.bat";
+                if (fs::exists(vcvars)) return { "cl", vcvars.string(), std::move(r.rejected) };
+                note("vswhere " + install, "未找到 vcvars64.bat(缺 VC 工具集?)");
+            } else {
+                note("vswhere", "无启用 VC 工具集的 VS 实例");
+            }
+        } else {
+            note("vswhere", "未安装(" + native(vswhere) + " 不存在)");
+        }
+    }
+    return r;                                           // cxx 空 ⇒ 无可用原生编译器
+}
+
+std::string wrap_msvc_env(std::string const& vcvars, std::string const& cmd,
+                          fs::path const& bat_out)
+{
+    if (vcvars.empty()) return cmd;
+    // 命令与 bat 路径都改写为 cmd.exe 可消费的 Windows 路径(见 windows_paths);
+    // 引号全落在文件内容里;bat 路径整体加引号,sh 与 cmd 两种 popen 外壳下
+    // 均为单参数;/d 跳过 AutoRun,防用户脚本污染环境
+    std::string bat = "@echo off\r\ncall \"" + vcvars + "\" >nul 2>&1\r\n"
+                    + windows_paths(cmd) + "\r\n";
+    write_file(bat_out, bat);
+    std::string p = windows_paths(native(bat_out));
+    for (auto& ch : p) if (ch == '/') ch = '\\';
+    return "cmd.exe /d /c \"" + p + "\"";
+}
+
 std::optional<fs::path> find_rt_dir(fs::path const& input)
 {
     std::vector<fs::path> candidates;
